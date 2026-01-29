@@ -132,7 +132,11 @@ state.json
 .agents/
 output
 bd_test
-
 # Claude temp files
 tmpclaude-*
 nul
+
+# Beads export state (local only)
+.beads/export-state/
+.beads/issues.jsonl
+.beads/beads.db

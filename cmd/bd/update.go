@@ -78,9 +78,16 @@ create, update, show, or close operation).`,
 			design, _ := cmd.Flags().GetString("design")
 			updates["design"] = design
 		}
+		if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
+			FatalErrorRespectJSON("cannot specify both --notes and --append-notes")
+		}
 		if cmd.Flags().Changed("notes") {
 			notes, _ := cmd.Flags().GetString("notes")
 			updates["notes"] = notes
+		}
+		if cmd.Flags().Changed("append-notes") {
+			appendNotes, _ := cmd.Flags().GetString("append-notes")
+			updates["append_notes"] = appendNotes
 		}
 		if cmd.Flags().Changed("acceptance") || cmd.Flags().Changed("acceptance-criteria") {
 			var acceptanceCriteria string
@@ -106,8 +113,18 @@ create, update, show, or close operation).`,
 			issueType, _ := cmd.Flags().GetString("type")
 			// Normalize aliases (e.g., "enhancement" -> "feature") before validating
 			issueType = util.NormalizeIssueType(issueType)
-			if !types.IssueType(issueType).IsValid() {
-				FatalErrorRespectJSON("invalid issue type %q. Valid types: bug, feature, task, epic, chore, merge-request, molecule, gate, agent, role, rig, convoy, event, slot", issueType)
+			var customTypes []string
+			if store != nil {
+				if ct, err := store.GetCustomTypes(cmd.Context()); err == nil {
+					customTypes = ct
+				}
+			}
+			if !types.IssueType(issueType).IsValidWithCustom(customTypes) {
+				validTypes := "bug, feature, task, epic, chore"
+				if len(customTypes) > 0 {
+					validTypes += ", " + joinStrings(customTypes, ", ")
+				}
+				FatalErrorRespectJSON("invalid issue type %q. Valid types: %s", issueType, validTypes)
 			}
 			updates["issue_type"] = issueType
 		}
@@ -164,6 +181,19 @@ create, update, show, or close operation).`,
 				}
 				updates["defer_until"] = t
 			}
+		}
+		// Ephemeral/persistent flags
+		// Note: storage layer uses "wisp" field name, maps to "ephemeral" column
+		ephemeralChanged := cmd.Flags().Changed("ephemeral")
+		persistentChanged := cmd.Flags().Changed("persistent")
+		if ephemeralChanged && persistentChanged {
+			FatalErrorRespectJSON("cannot specify both --ephemeral and --persistent flags")
+		}
+		if ephemeralChanged {
+			updates["wisp"] = true
+		}
+		if persistentChanged {
+			updates["wisp"] = false
 		}
 
 		// Get claim flag
@@ -230,6 +260,22 @@ create, update, show, or close operation).`,
 				if notes, ok := updates["notes"].(string); ok {
 					updateArgs.Notes = &notes
 				}
+				if appendNotes, ok := updates["append_notes"].(string); ok {
+					// Fetch existing issue to get current notes
+					showArgs := &rpc.ShowArgs{ID: id}
+					resp, err := daemonClient.Show(showArgs)
+					if err == nil {
+						var existingIssue types.Issue
+						if err := json.Unmarshal(resp.Data, &existingIssue); err == nil {
+							combined := existingIssue.Notes
+							if combined != "" {
+								combined += "\n"
+							}
+							combined += appendNotes
+							updateArgs.Notes = &combined
+						}
+					}
+				}
 				if acceptanceCriteria, ok := updates["acceptance_criteria"].(string); ok {
 					updateArgs.AcceptanceCriteria = &acceptanceCriteria
 				}
@@ -277,6 +323,10 @@ create, update, show, or close operation).`,
 					// Explicit clear
 					empty := ""
 					updateArgs.DeferUntil = &empty
+				}
+				// Ephemeral/persistent
+				if wisp, ok := updates["wisp"].(bool); ok {
+					updateArgs.Ephemeral = &wisp
 				}
 
 				// Set claim flag for atomic claim operation
@@ -355,9 +405,18 @@ create, update, show, or close operation).`,
 				// Apply regular field updates if any
 				regularUpdates := make(map[string]interface{})
 				for k, v := range updates {
-					if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" {
+					if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
 						regularUpdates[k] = v
 					}
+				}
+				// Handle append_notes: combine existing notes with new content
+				if appendNotes, ok := updates["append_notes"].(string); ok {
+					combined := issue.Notes
+					if combined != "" {
+						combined += "\n"
+					}
+					combined += appendNotes
+					regularUpdates["notes"] = combined
 				}
 				if len(regularUpdates) > 0 {
 					if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
@@ -469,9 +528,18 @@ create, update, show, or close operation).`,
 			// Apply regular field updates if any
 			regularUpdates := make(map[string]interface{})
 			for k, v := range updates {
-				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" {
+				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
 					regularUpdates[k] = v
 				}
+			}
+			// Handle append_notes: combine existing notes with new content
+			if appendNotes, ok := updates["append_notes"].(string); ok {
+				combined := issue.Notes
+				if combined != "" {
+					combined += "\n"
+				}
+				combined += appendNotes
+				regularUpdates["notes"] = combined
 			}
 			if len(regularUpdates) > 0 {
 				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
@@ -613,6 +681,9 @@ func init() {
 	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then")
 	// Gate fields (bd-z6kw)
 	updateCmd.Flags().String("await-id", "", "Set gate await_id (e.g., GitHub run ID for gh:run gates)")
+	// Ephemeral/persistent flags
+	updateCmd.Flags().Bool("ephemeral", false, "Mark issue as ephemeral (wisp) - not exported to JSONL")
+	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

@@ -31,7 +31,12 @@ func syncBranchCommitAndPushWithOptions(ctx context.Context, store storage.Stora
 	if !hasGitRemote(ctx) {
 		return true, nil // Skip sync branch commit/push in local-only mode
 	}
-	
+
+	// Guard: Skip if sync-branch == current-branch (GH#1258)
+	if shouldSkipDueToSameBranch(ctx, store, "sync-branch commit", log) {
+		return false, nil
+	}
+
 	// Get sync branch configuration (supports BEADS_SYNC_BRANCH override)
 	syncBranch, err := syncbranch.Get(ctx, store)
 	if err != nil {
@@ -42,7 +47,13 @@ func syncBranchCommitAndPushWithOptions(ctx context.Context, store storage.Stora
 	if syncBranch == "" {
 		return false, nil
 	}
-	
+
+	// Skip JSONL sync branch operations in dolt-native mode (bd-ats9.3.1)
+	// Dolt handles sync through its own Push/Pull methods, not JSONL
+	if !ShouldExportJSONL(ctx, store) {
+		return true, nil // Signal "handled" to prevent fallback to regular git commit
+	}
+
 	log.log("Using sync branch: %s", syncBranch)
 	
 	// Get main repo root (for worktrees, this is the main repo, not worktree)
@@ -74,7 +85,7 @@ func syncBranchCommitAndPushWithOptions(ctx context.Context, store storage.Stora
 	// Get the actual JSONL path
 	jsonlPath := findJSONLPath()
 	if jsonlPath == "" {
-		return false, fmt.Errorf("JSONL path not found")
+		return false, fmt.Errorf("beads storage file not found")
 	}
 	
 	// Convert absolute path to relative path from repo root
@@ -252,7 +263,12 @@ func syncBranchPull(ctx context.Context, store storage.Storage, log daemonLogger
 	if !hasGitRemote(ctx) {
 		return true, nil // Skip sync branch pull in local-only mode
 	}
-	
+
+	// Guard: Skip if sync-branch == current-branch (GH#1258)
+	if shouldSkipDueToSameBranch(ctx, store, "sync-branch pull", log) {
+		return false, nil
+	}
+
 	// Get sync branch configuration (supports BEADS_SYNC_BRANCH override)
 	syncBranch, err := syncbranch.Get(ctx, store)
 	if err != nil {
@@ -263,7 +279,13 @@ func syncBranchPull(ctx context.Context, store storage.Storage, log daemonLogger
 	if syncBranch == "" {
 		return false, nil
 	}
-	
+
+	// Skip JSONL sync branch operations in dolt-native mode (bd-ats9.3.1)
+	// Dolt handles sync through its own Push/Pull methods, not JSONL
+	if !ShouldExportJSONL(ctx, store) {
+		return true, nil // Signal "handled" to prevent fallback to regular git pull
+	}
+
 	// Get main repo root (for worktrees, this is the main repo, not worktree)
 	repoRoot, err := git.GetMainRepoRoot()
 	if err != nil {
@@ -313,7 +335,7 @@ func syncBranchPull(ctx context.Context, store storage.Storage, log daemonLogger
 	// Get the actual JSONL path
 	jsonlPath := findJSONLPath()
 	if jsonlPath == "" {
-		return false, fmt.Errorf("JSONL path not found")
+		return false, fmt.Errorf("beads storage file not found")
 	}
 	
 	// Convert to relative path

@@ -14,16 +14,63 @@ import (
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
+// warnIfSyncBranchMisconfigured logs a warning at daemon startup if sync-branch
+// equals the current branch. This is a one-time warning to alert users about
+// the misconfiguration. The daemon continues to start (warn only, don't block).
+// Returns true if misconfigured (warning was logged), false otherwise.
+// GH#1258: Prevents silent failure when sync-branch == current-branch.
+func warnIfSyncBranchMisconfigured(ctx context.Context, store storage.Storage, log daemonLogger) bool {
+	syncBranch, err := syncbranch.Get(ctx, store)
+	if err != nil || syncBranch == "" {
+		return false // No sync branch configured, not misconfigured
+	}
+
+	if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranch) {
+		log.Warn("sync-branch misconfiguration detected",
+			"sync_branch", syncBranch,
+			"message", "sync-branch is your current branch; daemon sync operations will be skipped; configure a dedicated sync branch (e.g., 'beads-sync') to enable sync")
+		return true
+	}
+
+	return false
+}
+
+// shouldSkipDueToSameBranch checks if operation should be skipped because
+// sync-branch == current-branch. Returns true if should skip, logs reason.
+// Uses fail-open pattern: if branch detection fails, allows operation to proceed.
+func shouldSkipDueToSameBranch(ctx context.Context, store storage.Storage, operation string, log daemonLogger) bool {
+	syncBranch, err := syncbranch.Get(ctx, store)
+	if err != nil || syncBranch == "" {
+		return false // No sync branch configured, allow
+	}
+
+	if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranch) {
+		log.log("Skipping %s: sync-branch '%s' is your current branch. Use a dedicated sync branch.", operation, syncBranch)
+		return true
+	}
+
+	return false
+}
+
 // exportToJSONLWithStore exports issues to JSONL using the provided store.
 // If multi-repo mode is configured, routes issues to their respective JSONL files.
 // Otherwise, exports to a single JSONL file.
+// Respects sync mode: skips JSONL export in dolt-native mode (bd-u9yv).
 func exportToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPath string) error {
+	// Check sync mode before JSONL export (bd-u9yv: dolt-native mode should skip JSONL)
+	if !ShouldExportJSONL(ctx, store) {
+		debug.Logf("skipping JSONL export (dolt-native mode)")
+		return nil
+	}
+
 	// Try multi-repo export first
 	sqliteStore, ok := store.(*sqlite.SQLiteStorage)
 	if ok {
@@ -137,6 +184,17 @@ func exportToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPat
 	if writeErr = utils.DefaultRenameRetry(tempPath, jsonlPath); writeErr != nil {
 		writeErr = fmt.Errorf("failed to rename temp file: %w", writeErr)
 		return writeErr
+	}
+
+	// Update export_hashes for all exported issues (GH#1278)
+	// This ensures child issues created with --parent are properly registered
+	for _, issue := range issues {
+		if issue.ContentHash != "" {
+			if err := store.SetExportHash(ctx, issue.ID, issue.ContentHash); err != nil {
+				// Non-fatal warning - continue with other issues
+				fmt.Fprintf(os.Stderr, "Warning: failed to set export hash for %s: %v\n", issue.ID, err)
+			}
+		}
 	}
 
 	return nil
@@ -427,11 +485,18 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 		if skipGit {
 			mode = "local export"
 		}
+
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(exportCtx, store, mode, log) {
+			return
+		}
+
 		log.log("Starting %s...", mode)
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.log("Error: beads storage file not found")
 			return
 		}
 
@@ -483,8 +548,10 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 			// This prevents validatePreExport from incorrectly blocking on next export
 			// with "JSONL is newer than database" after daemon auto-export
 			// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
-			if _, ok := store.(*sqlite.SQLiteStorage); ok {
-				dbPath := filepath.Join(beadsDir, "beads.db")
+			// Use store.Path() to get the actual database location, not the JSONL directory,
+			// since sync-branch exports write JSONL to a worktree but the DB stays in the main repo.
+			if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+				dbPath := sqliteStore.Path()
 				if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
 					log.log("Warning: failed to update database mtime: %v", err)
 				}
@@ -577,6 +644,12 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 			mode = "local auto-import"
 		}
 
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(importCtx, store, mode, log) {
+			return
+		}
+
 		// Check backoff before attempting sync (skip for local mode)
 		if !skipGit {
 			jsonlPath := findJSONLPath()
@@ -593,7 +666,7 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.log("Error: beads storage file not found")
 			return
 		}
 
@@ -715,11 +788,18 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if skipGit {
 			mode = "local sync cycle"
 		}
+
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(syncCtx, store, mode, log) {
+			return
+		}
+
 		log.log("Starting %s...", mode)
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.log("Error: beads storage file not found")
 			return
 		}
 
@@ -768,7 +848,6 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 
 		// GH#885: Defer metadata updates until AFTER git commit succeeds.
 		// Define helper to finalize after git operations.
-		dbPath := filepath.Join(beadsDir, "beads.db")
 		finalizeExportMetadata := func() {
 			// Update export metadata for multi-repo support with stable keys
 			if multiRepoPaths != nil {
@@ -785,7 +864,10 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			// Update database mtime to be >= JSONL mtime
 			// This prevents validatePreExport from incorrectly blocking on next export
 			// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
-			if _, ok := store.(*sqlite.SQLiteStorage); ok {
+			// Use store.Path() to get the actual database location, not the JSONL directory,
+			// since sync-branch exports write JSONL to a worktree but the DB stays in the main repo.
+			if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+				dbPath := sqliteStore.Path()
 				if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
 					log.log("Warning: failed to update database mtime: %v", err)
 				}
@@ -905,7 +987,10 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		// Update database mtime after import (fixes #278, #301, #321)
 		// Sync branch import can update JSONL timestamp, so ensure DB >= JSONL
 		// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
-		if _, ok := store.(*sqlite.SQLiteStorage); ok {
+		// Use store.Path() to get the actual database location, not the JSONL directory,
+		// since sync-branch imports read JSONL from a worktree but the DB stays in the main repo.
+		if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+			dbPath := sqliteStore.Path()
 			if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
 				log.log("Warning: failed to update database mtime: %v", err)
 			}

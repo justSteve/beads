@@ -111,6 +111,11 @@ func Initialize() error {
 	v.SetDefault("identity", "")
 	v.SetDefault("remote-sync-interval", "30s")
 
+	// Dolt configuration defaults
+	// Controls whether beads should automatically create Dolt commits after write commands.
+	// Values: off | on
+	v.SetDefault("dolt.auto-commit", "on")
+
 	// Routing configuration defaults
 	v.SetDefault("routing.mode", "")
 	v.SetDefault("routing.default", ".")
@@ -122,16 +127,16 @@ func Initialize() error {
 
 	// Sync mode configuration (hq-ew1mbr.3)
 	// See docs/CONFIG.md for detailed documentation
-	v.SetDefault("sync.mode", SyncModeGitPortable)      // git-portable | realtime | dolt-native | belt-and-suspenders
-	v.SetDefault("sync.export_on", SyncTriggerPush)     // push | change
-	v.SetDefault("sync.import_on", SyncTriggerPull)     // pull | change
+	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | realtime | dolt-native | belt-and-suspenders
+	v.SetDefault("sync.export_on", SyncTriggerPush) // push | change
+	v.SetDefault("sync.import_on", SyncTriggerPull) // pull | change
 
 	// Conflict resolution configuration
 	v.SetDefault("conflict.strategy", ConflictStrategyNewest) // newest | ours | theirs | manual
 
 	// Federation configuration (optional Dolt remote)
-	v.SetDefault("federation.remote", "")       // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
-	v.SetDefault("federation.sovereignty", "")  // T1 | T2 | T3 | T4 (empty = no restriction)
+	v.SetDefault("federation.remote", "")      // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
+	v.SetDefault("federation.sovereignty", "") // T1 | T2 | T3 | T4 (empty = no restriction)
 
 	// Push configuration defaults
 	v.SetDefault("no-push", false)
@@ -709,17 +714,53 @@ func NeedsJSONL() bool {
 // (e.g., during bd init auto-import before the database is fully configured).
 // Returns nil if no custom types are configured in config.yaml.
 func GetCustomTypesFromYAML() []string {
+	return getConfigList("types.custom")
+}
+
+// GetCustomStatusesFromYAML retrieves custom statuses from config.yaml.
+// This is used as a fallback when the database doesn't have status.custom set yet
+// or when the database connection is temporarily unavailable.
+// Returns nil if no custom statuses are configured in config.yaml.
+func GetCustomStatusesFromYAML() []string {
+	return getConfigList("status.custom")
+}
+
+// ===== Agent Role Configuration =====
+// These functions return agent role types from config.yaml for agent ID parsing.
+// Each role category has different parsing semantics:
+//   - Town-level: <prefix>-<role> (singleton, no rig)
+//   - Rig-level: <prefix>-<rig>-<role> (singleton per rig)
+//   - Named: <prefix>-<rig>-<role>-<name> (multiple per rig)
+
+// GetTownLevelRoles returns roles that are town-level singletons.
+// These roles have no rig association and appear as: <prefix>-<role>
+func GetTownLevelRoles() []string {
+	return getConfigList("agent_roles.town_level")
+}
+
+// GetRigLevelRoles returns roles that are rig-level singletons.
+// These roles have one instance per rig: <prefix>-<rig>-<role>
+func GetRigLevelRoles() []string {
+	return getConfigList("agent_roles.rig_level")
+}
+
+// GetNamedRoles returns roles that can have multiple named instances per rig.
+// These roles include a name suffix: <prefix>-<rig>-<role>-<name>
+func GetNamedRoles() []string {
+	return getConfigList("agent_roles.named")
+}
+
+// getConfigList is a helper that retrieves a comma-separated list from config.yaml.
+func getConfigList(key string) []string {
 	if v == nil {
 		return nil
 	}
 
-	// Try to get types.custom from viper (config.yaml or env var)
-	value := v.GetString("types.custom")
+	value := v.GetString(key)
 	if value == "" {
 		return nil
 	}
 
-	// Parse comma-separated list
 	parts := strings.Split(value, ",")
 	result := make([]string, 0, len(parts))
 	for _, p := range parts {

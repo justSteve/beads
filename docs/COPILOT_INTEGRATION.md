@@ -1,152 +1,262 @@
-# Copilot Integration Design
+# GitHub Copilot Integration Guide
 
-Design decisions for GitHub Copilot integration with beads.
+This guide explains how to use beads with GitHub Copilot in VS Code.
 
-## Integration Approach
+## Overview
 
-**Recommended: CLI + VS Code Tasks**
+Beads provides a persistent, structured memory for coding agents through the MCP (Model Context Protocol) server. With Copilot, you can use natural language to create, update, and track issues without leaving your editor.
 
-Beads uses a universal CLI approach that works across all AI assistants:
-- `.github/copilot-instructions.md` for auto-loaded context
-- VS Code tasks for session automation
-- Direct CLI commands with `--json` flags
+**Important:** Beads is a system-wide CLI tool. You install it once and use it in any project. Do NOT clone the beads repository into your project.
 
-This approach is identical to Claude Code integration, ensuring consistent behavior across assistants.
+## Prerequisites
 
-## Why CLI Over Custom Extensions?
+- VS Code 1.96+ with GitHub Copilot extension
+- GitHub Copilot subscription (Individual, Business, or Enterprise)
+- beads CLI installed (`brew install beads` or `npm install -g @beads/bd`)
+- Python 3.10+ OR uv package manager
 
-1. **Universal** - Same workflow for Copilot, Claude, Cursor, Windsurf, etc.
-2. **Maintainable** - One codebase, not per-platform plugins
-3. **Debuggable** - Shell commands are transparent and testable
-4. **Context-efficient** - ~1-2k tokens vs large extension schemas
+## Quick Setup
 
-## VS Code Task Integration
+### Step 1: Install beads-mcp
 
-Beads provides VS Code tasks in `.vscode/tasks.json`:
+```bash
+# Using uv (recommended)
+uv tool install beads-mcp
+
+# Or using pip
+pip install beads-mcp
+
+# Or using pipx
+pipx install beads-mcp
+```
+
+### Step 2: Configure VS Code MCP
+
+Create or edit `.vscode/mcp.json` in your project:
 
 ```json
 {
-  "label": "Beads: Session Startup",
-  "type": "shell",
-  "command": "bd prime",
-  "runOptions": { "runOn": "folderOpen" }
-},
-{
-  "label": "Beads: Ready",
-  "type": "shell", 
-  "command": "bd ready"
-},
-{
-  "label": "Beads: Sync",
-  "type": "shell",
-  "command": "bd sync && git status"
+  "servers": {
+    "beads": {
+      "command": "beads-mcp"
+    }
+  }
 }
 ```
 
-These tasks:
-- Auto-run on folder open (session startup)
-- Provide quick access to common operations
-- Work with any AI assistant in VS Code
+**For all projects:** Add to VS Code user-level MCP config:
 
-## Instruction File Strategy
+| Platform | Path |
+|----------|------|
+| macOS | `~/Library/Application Support/Code/User/mcp.json` |
+| Linux | `~/.config/Code/User/mcp.json` |
+| Windows | `%APPDATA%\Code\User\mcp.json` |
 
-### What goes in `.github/copilot-instructions.md`:
-- Project overview (what beads is)
-- Critical rules (use bd, not TODO lists)
-- Essential commands (ready, create, close, sync)
-- Tech stack summary
-- Link to detailed docs
-
-### What stays in separate docs:
-- Architecture details → `docs/COPILOT.md`
-- Integration design → `docs/COPILOT_INTEGRATION.md`
-- Full workflows → `AGENTS.md`
-- CLI reference → `docs/CLI_REFERENCE.md`
-
-**Rationale**: Copilot context windows vary by model. Keep instructions concise; let the agent read detailed docs when needed.
-
-## Copilot-Specific Considerations
-
-### Context Window Management
-
-Optimize instructions for smaller context windows:
-- Concise instructions (avoid verbose explanations)
-- Code examples over prose
-- Links to detailed docs rather than inline content
-
-### No MCP Equivalent
-
-Copilot doesn't have MCP protocol. For "tool-like" behavior:
-- Use `run_in_terminal` tool with `bd` commands
-- Let Copilot read `--json` output and act on it
-- VS Code tasks for common operations
-
-### When to Use bd vs Other Tracking
-
-**Use bd when:**
-- Work spans multiple sessions
-- Tasks have dependencies or blockers
-- Need to resume work after days/weeks
-
-**Don't need bd for:**
-- Single-session, linear tasks
-- Simple checklists that complete immediately
-
-**When in doubt**: Use bd. Better to have persistent context.
-
-## Comparison with Claude Integration
-
-| Feature | Claude | Copilot |
-|---------|--------|---------|
-| Auto-loaded file | `CLAUDE.md` | `.github/copilot-instructions.md` |
-| Tool protocol | MCP | Terminal commands |
-| Session hooks | SessionStart | VS Code tasks |
-| Skills system | `.claude/skills/` | Not available |
-
-Despite these differences, the **workflow is identical**:
-1. `bd ready` - find work
-2. `bd update` - claim work
-3. Implement changes
-4. `bd close` - complete work
-5. `bd sync` - persist to git
-
-## File Organization
-
-```
-beads/
-├── .github/
-│   └── copilot-instructions.md  # Auto-loaded by Copilot
-├── docs/
-│   ├── COPILOT.md               # Architecture guide
-│   ├── COPILOT_INTEGRATION.md   # This file
-│   ├── CLAUDE.md                # Claude architecture guide
-│   └── CLAUDE_INTEGRATION.md    # Claude design decisions
-├── CLAUDE.md                    # Claude auto-loaded (repo root)
-└── AGENTS.md                    # Universal workflow (both use this)
+```json
+{
+  "servers": {
+    "beads": {
+      "command": "beads-mcp",
+      "args": []
+    }
+  }
+}
 ```
 
-## Testing Integration
-
-Verify the integration works:
+### Step 3: Initialize beads in your project
 
 ```bash
-# 1. Open repo in VS Code with Copilot
-# 2. Check that session startup task ran
-# 3. Ask Copilot: "What issues are ready to work on?"
-# 4. Verify it runs `bd ready --json`
-# 5. Ask Copilot to create an issue
-# 6. Verify it uses bd create with --description
+cd your-project
+bd init --quiet
 ```
 
-## Future Considerations
+This creates a `.beads/` directory with the issue database. The init wizard will ask about git hooks—these are optional and you can skip them if unfamiliar.
 
-### Copilot Prompt Files
-When Copilot supports `.github/prompts/*.md`, consider:
-- Moving workflow guidance to prompt files
-- Creating task-specific prompts (debugging, testing, etc.)
+### Step 4: Add Copilot instructions (optional but recommended)
 
-### Copilot Extensions
-When Copilot Extensions mature:
-- Evaluate native tool integration
-- Compare context efficiency vs CLI approach
-- Maintain CLI as fallback for universality
+Create `.github/copilot-instructions.md`:
+
+```markdown
+## Issue Tracking
+
+This project uses **bd (beads)** for issue tracking.
+Run `bd prime` for workflow context.
+
+**Quick reference:**
+- `bd ready` - Find unblocked work
+- `bd create "Title" --type task --priority 2` - Create issue
+- `bd close <id>` - Complete work
+- `bd sync` - Sync with git (run at session end)
+```
+
+### Step 5: Restart VS Code
+
+Reload the VS Code window for MCP configuration to take effect.
+
+## Using Beads with Copilot
+
+### Natural Language Commands
+
+With MCP configured, ask Copilot Chat:
+
+| You say | Copilot does |
+|---------|--------------|
+| "What issues are ready to work on?" | Calls `beads_ready` |
+| "Create a bug for the login timeout" | Calls `beads_create` with type=bug |
+| "Show me issue bd-42" | Calls `beads_show` |
+| "Mark bd-42 as complete" | Calls `beads_close` |
+| "What's blocking bd-15?" | Calls `beads_dep_tree` |
+
+### MCP Tools Reference
+
+| Tool | Description | Example |
+|------|-------------|---------|
+| `beads_ready` | List unblocked issues | "What can I work on?" |
+| `beads_list` | List issues with filters | "Show all open bugs" |
+| `beads_create` | Create new issue | "Create a task for refactoring" |
+| `beads_show` | Show issue details | "Show bd-42 details" |
+| `beads_update` | Update issue fields | "Set bd-42 to in progress" |
+| `beads_close` | Close an issue | "Complete bd-42" |
+| `beads_sync` | Sync to git | "Sync my changes" |
+| `beads_dep_add` | Add dependency | "bd-99 blocks bd-42" |
+| `beads_dep_tree` | Show dependency tree | "What depends on bd-42?" |
+
+### Example Workflow
+
+```
+You: What issues are ready to work on?
+
+Copilot: [Calls beads_ready]
+There are 3 issues ready:
+1. [P1] bd-42: Fix authentication timeout
+2. [P2] bd-99: Add password reset flow
+3. [P3] bd-17: Update API documentation
+
+You: Let me work on bd-42. Mark it as in progress.
+
+Copilot: [Calls beads_update]
+Updated bd-42 status to in_progress.
+
+You: [... work on the code ...]
+
+You: I found a related bug - the session token isn't being refreshed.
+     Create a bug for that, linked to bd-42.
+
+Copilot: [Calls beads_create]
+Created bd-103: Session token not refreshed
+Linked as discovered-from bd-42.
+
+You: Done with bd-42. Close it with reason "Fixed timeout handling"
+
+Copilot: [Calls beads_close]
+Closed bd-42: Fixed timeout handling
+
+You: Sync everything to git
+
+Copilot: [Calls beads_sync]
+Synced: 2 issues updated, committed to git.
+```
+
+## CLI vs MCP: When to Use Each
+
+| Approach | Best For | Trade-offs |
+|----------|----------|------------|
+| **MCP (Copilot Chat)** | Natural language, discovery | Higher token overhead |
+| **CLI (Terminal)** | Scripting, precision, speed | Requires terminal context |
+
+You can use both! MCP for conversational work, CLI for quick commands.
+
+## Troubleshooting
+
+### MCP tools not appearing in Copilot
+
+1. **Check VS Code version** - MCP requires VS Code 1.96+
+2. **Verify mcp.json syntax** - JSON must be valid
+3. **Check beads-mcp is installed:**
+   ```bash
+   which beads-mcp
+   beads-mcp --version
+   ```
+4. **Reload VS Code** - MCP config requires window reload
+5. **Check Output panel** - Look for MCP-related errors
+
+### "beads-mcp: command not found"
+
+The MCP server isn't in your PATH:
+
+```bash
+# If installed with uv
+export PATH="$HOME/.local/bin:$PATH"
+
+# If installed with pip, find it
+pip show beads-mcp | grep Location
+
+# Reinstall if needed
+uv tool install beads-mcp --force
+```
+
+### "No beads database found"
+
+Initialize beads in your project:
+
+```bash
+cd your-project
+bd init --quiet
+```
+
+### Changes not persisting
+
+Run sync at end of session:
+
+```bash
+bd sync
+```
+
+Or ask Copilot: "Sync my beads changes to git"
+
+### Organization policies blocking MCP
+
+For Copilot Enterprise, your organization must enable "MCP servers in Copilot" policy. Contact your admin if MCP tools don't appear.
+
+## FAQ
+
+### Do I need to clone the beads repository?
+
+**No.** Beads is a system-wide CLI tool. You install it once (via Homebrew, npm, or pip) and use it in any project. The `.beads/` directory in your project only contains the issue database, not beads itself.
+
+### What are the git hooks and are they safe?
+
+When you run `bd init`, beads can install git hooks that:
+- **post-merge**: Import issues when you pull
+- **pre-push**: Sync issues before you push
+
+These hooks are safe—they only read/write the `.beads/` directory and never modify your code. You can opt out with `bd init --no-hooks` or skip them during the interactive setup.
+
+### Can I use beads without Copilot?
+
+Yes! Beads works with:
+- Terminal (direct CLI)
+- Claude Code
+- Cursor
+- Aider
+- Any editor with MCP or shell access
+
+### MCP vs CLI - which should I use?
+
+Use **MCP** when you want natural language interaction through Copilot Chat.
+Use **CLI** when you want speed, scripting, or precise control.
+
+Both approaches work with the same database—use whichever fits your workflow.
+
+### Does this work with Copilot in other editors?
+
+This guide is for VS Code. For other editors:
+- **JetBrains IDEs**: Check if MCP is supported, config may differ
+- **Neovim**: Use CLI integration instead
+
+## See Also
+
+- [MCP Server Documentation](../website/docs/integrations/mcp-server.md)
+- [CLI Reference](QUICKSTART.md)
+- [Installation Guide](INSTALLING.md)
+- [Agent Instructions](../AGENT_INSTRUCTIONS.md)

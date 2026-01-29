@@ -42,10 +42,7 @@ Notes:
 - SQLite backend stores data in `.beads/beads.db`.
 - Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
 - Dolt backend runs **single-process-only**; daemon mode is disabled.
-
-Notes:
-- SQLite backend stores data in `.beads/beads.db`.
-- Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
+- Dolt backend **auto-commits** after each successful write command by default (`dolt.auto-commit: on`). Disable with `bd --dolt-auto-commit off ...` or config.
 
 ## Your First Issues
 
@@ -60,6 +57,15 @@ Notes:
 ```
 
 **Note:** Issue IDs are hash-based (e.g., `bd-a1b2`, `bd-f14c`) to prevent collisions when multiple agents/branches work concurrently.
+
+**Dependency visibility:** When issues have blocking dependencies, `bd list` shows them inline:
+```
+○ bd-a1b2 [P1] [task] - Set up database
+○ bd-f14c [P2] [feature] - Create API (blocked by: bd-a1b2)
+○ bd-g25d [P2] [feature] - Add authentication (blocked by: bd-f14c)
+```
+
+This makes dependencies unmissable when reviewing epic subtasks.
 
 ## Hierarchical Issues (Epics)
 
