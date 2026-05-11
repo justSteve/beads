@@ -253,8 +253,11 @@ func (c *Config) IsDoltServerMode() bool {
 	if c.GetBackend() != BackendDolt {
 		return false
 	}
-	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
+	switch os.Getenv("BEADS_DOLT_SERVER_MODE") {
+	case "1":
 		return true
+	case "0":
+		return false
 	}
 	// Shared-server mode implies server-backed storage. Check env var
 	// directly to avoid circular import with doltserver package.

@@ -24,10 +24,14 @@ const (
 	HookOnClose  = "on_close"
 )
 
+// maxConcurrentHooks caps parallel hook goroutines to prevent process floods.
+const maxConcurrentHooks = 4
+
 // Runner handles hook execution
 type Runner struct {
 	hooksDir string
 	timeout  time.Duration
+	sem      chan struct{}
 }
 
 // NewRunner creates a new hook runner.
@@ -35,7 +39,8 @@ type Runner struct {
 func NewRunner(hooksDir string) *Runner {
 	return &Runner{
 		hooksDir: hooksDir,
-		timeout:  10 * time.Second,
+		timeout:  30 * time.Second,
+		sem:      make(chan struct{}, maxConcurrentHooks),
 	}
 }
 
@@ -65,9 +70,10 @@ func (r *Runner) Run(event string, issue *types.Issue) {
 		return // Not executable, skip
 	}
 
-	// Run asynchronously (ignore error as this is fire-and-forget)
+	r.sem <- struct{}{}
 	go func() {
-		_ = r.runHook(hookPath, event, issue) // Best effort: hook failures should not block the triggering operation
+		defer func() { <-r.sem }()
+		_ = r.runHook(hookPath, event, issue)
 	}()
 }
 
