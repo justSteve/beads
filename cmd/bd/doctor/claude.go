@@ -12,12 +12,16 @@ import (
 	"time"
 )
 
-// CheckClaude returns Claude integration verification as a DoctorCheck
-func CheckClaude() DoctorCheck {
+var latestPyPIVersionFetcher = fetchLatestPyPIVersion
+
+// CheckClaude returns Claude integration verification as a DoctorCheck.
+// repoPath is the project root directory.
+func CheckClaude(repoPath string) DoctorCheck {
 	// Check what's installed
-	hasPlugin := isBeadsPluginInstalled()
-	hasMCP := isMCPServerInstalled()
-	hasHooks := hasClaudeHooks()
+	hasPlugin := isBeadsPluginInstalled(repoPath)
+	hasMCP := isMCPServerInstalled(repoPath)
+	hasHooks := hasClaudeHooks(repoPath)
+	inClaudeCode := os.Getenv("CLAUDECODE") == "1"
 
 	// Plugin now provides hooks directly via plugin.json, so if plugin is installed
 	// we consider hooks to be available (plugin hooks + any user-configured hooks)
@@ -50,7 +54,7 @@ func CheckClaude() DoctorCheck {
 			Detail: "MCP-only mode: relies on tools for every query (~10.5k tokens)\n" +
 				"  bd prime hooks provide much better token efficiency",
 			Fix: "Add bd prime hooks for better token efficiency:\n" +
-				"  1. Run 'bd setup claude' to add SessionStart/PreCompact hooks\n" +
+				"  1. Run 'bd setup claude' to add SessionStart hooks\n" +
 				"\n" +
 				"Benefits:\n" +
 				"  • MCP mode: ~50 tokens vs ~10.5k for full tool scan (99% reduction)\n" +
@@ -59,7 +63,17 @@ func CheckClaude() DoctorCheck {
 				"\n" +
 				"See: bd setup claude --help",
 		}
+	} else if !inClaudeCode || !isClaudePresent() {
+		// Not in Claude Code, or CLAUDECODE=1 was set by another AI tool but
+		// Claude CLI/~/.claude/ are absent — skip plugin suggestion.
+		return DoctorCheck{
+			Name:    "Claude Integration",
+			Status:  "ok",
+			Message: "CLI-only mode",
+			Detail:  "To enable Claude integration, run bd setup claude",
+		}
 	} else {
+		// In Claude Code but plugin not installed
 		return DoctorCheck{
 			Name:    "Claude Integration",
 			Status:  "warning",
@@ -71,7 +85,7 @@ func CheckClaude() DoctorCheck {
 				"    • See: https://github.com/steveyegge/beads/blob/main/docs/PLUGIN.md\n" +
 				"\n" +
 				"  Option 2: CLI-only mode\n" +
-				"    • Run 'bd setup claude' to add SessionStart/PreCompact hooks\n" +
+				"    • Run 'bd setup claude' to add SessionStart hooks\n" +
 				"    • No slash commands, but hooks provide workflow context\n" +
 				"\n" +
 				"Benefits:\n" +
@@ -84,7 +98,8 @@ func CheckClaude() DoctorCheck {
 // isBeadsPluginInstalled checks if beads plugin is enabled in Claude Code.
 // It checks user-level (~/.claude/settings.json) and project-level settings
 // (.claude/settings.json and .claude/settings.local.json).
-func isBeadsPluginInstalled() bool {
+// repoPath is the project root directory.
+func isBeadsPluginInstalled(repoPath string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
@@ -97,13 +112,13 @@ func isBeadsPluginInstalled() bool {
 	}
 
 	// Check project-level settings
-	projectSettings := filepath.Join(".claude", "settings.json")
+	projectSettings := filepath.Join(repoPath, ".claude", "settings.json")
 	if checkPluginInSettings(projectSettings) {
 		return true
 	}
 
 	// Check project-level local settings (gitignored)
-	projectLocalSettings := filepath.Join(".claude", "settings.local.json")
+	projectLocalSettings := filepath.Join(repoPath, ".claude", "settings.local.json")
 	if checkPluginInSettings(projectLocalSettings) {
 		return true
 	}
@@ -145,7 +160,8 @@ func checkPluginInSettings(settingsPath string) bool {
 // isMCPServerInstalled checks if MCP server is configured.
 // It checks user-level (~/.claude/settings.json) and project-level settings
 // (.claude/settings.json and .claude/settings.local.json).
-func isMCPServerInstalled() bool {
+// repoPath is the project root directory.
+func isMCPServerInstalled(repoPath string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
@@ -158,13 +174,13 @@ func isMCPServerInstalled() bool {
 	}
 
 	// Check project-level settings
-	projectSettings := filepath.Join(".claude", "settings.json")
+	projectSettings := filepath.Join(repoPath, ".claude", "settings.json")
 	if checkMCPInSettings(projectSettings) {
 		return true
 	}
 
 	// Check project-level local settings (gitignored)
-	projectLocalSettings := filepath.Join(".claude", "settings.local.json")
+	projectLocalSettings := filepath.Join(repoPath, ".claude", "settings.local.json")
 	if checkMCPInSettings(projectLocalSettings) {
 		return true
 	}
@@ -200,16 +216,17 @@ func checkMCPInSettings(settingsPath string) bool {
 	return false
 }
 
-// hasClaudeHooks checks if Claude hooks are installed
-func hasClaudeHooks() bool {
+// hasClaudeHooks checks if Claude hooks are installed.
+// repoPath is the project root directory.
+func hasClaudeHooks(repoPath string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
 
 	globalSettings := filepath.Join(home, ".claude", "settings.json")
-	projectSettings := filepath.Join(".claude", "settings.json")
-	projectLocalSettings := filepath.Join(".claude", "settings.local.json")
+	projectSettings := filepath.Join(repoPath, ".claude", "settings.json")
+	projectLocalSettings := filepath.Join(repoPath, ".claude", "settings.local.json")
 
 	return hasBeadsHooks(globalSettings) || hasBeadsHooks(projectSettings) || hasBeadsHooks(projectLocalSettings)
 }
@@ -252,7 +269,10 @@ func hasBeadsHooks(settingsPath string) bool {
 				if !ok {
 					continue
 				}
-				if cmdMap["command"] == "bd prime" {
+				cmdStr, _ := cmdMap["command"].(string)
+				switch cmdStr {
+				case "bd prime", "bd prime --stealth",
+					"bd prime --hook-json", "bd prime --stealth --hook-json":
 					return true
 				}
 			}
@@ -262,9 +282,9 @@ func hasBeadsHooks(settingsPath string) bool {
 	return false
 }
 
-// verifyPrimeOutput checks if bd prime command works and adapts correctly
-// Returns a check result
-func VerifyPrimeOutput() DoctorCheck {
+// VerifyPrimeOutput checks if bd prime command works and adapts correctly.
+// repoPath is the project root directory.
+func VerifyPrimeOutput(repoPath string) DoctorCheck {
 	cmd := exec.Command("bd", "prime")
 	output, err := cmd.CombinedOutput()
 
@@ -287,7 +307,7 @@ func VerifyPrimeOutput() DoctorCheck {
 	}
 
 	// Check if output adapts to MCP mode
-	hasMCP := isMCPServerInstalled()
+	hasMCP := isMCPServerInstalled(repoPath)
 	outputStr := string(output)
 
 	if hasMCP && strings.Contains(outputStr, "mcp__plugin_beads_beads__") {
@@ -325,7 +345,7 @@ func CheckBdInPath() DoctorCheck {
 			Detail:  "Claude hooks execute 'bd prime' and won't work without bd in PATH",
 			Fix: "Install bd globally:\n" +
 				"  • Homebrew: brew install beads\n" +
-				"  • Script: curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash\n" +
+				"  • Script: " + installScriptCommand + "\n" +
 				"  • Or add bd to your PATH",
 		}
 	}
@@ -337,19 +357,12 @@ func CheckBdInPath() DoctorCheck {
 	}
 }
 
-// CheckDocumentationBdPrimeReference checks if AGENTS.md or CLAUDE.md reference 'bd prime'
+// CheckDocumentationBdPrimeReference checks if the agents file or CLAUDE.md reference 'bd prime'
 // and verifies the command exists. This helps catch version mismatches where docs
 // reference features not available in the installed version.
 // Also supports local-only variants (claude.local.md) that are gitignored.
 func CheckDocumentationBdPrimeReference(repoPath string) DoctorCheck {
-	docFiles := []string{
-		filepath.Join(repoPath, "AGENTS.md"),
-		filepath.Join(repoPath, "CLAUDE.md"),
-		filepath.Join(repoPath, ".claude", "CLAUDE.md"),
-		// Local-only variants (not committed to repo)
-		filepath.Join(repoPath, "claude.local.md"),
-		filepath.Join(repoPath, ".claude", "claude.local.md"),
-	}
+	docFiles := agentDocFiles(repoPath)
 
 	var filesWithBdPrime []string
 	for _, docFile := range docFiles {
@@ -381,8 +394,8 @@ func CheckDocumentationBdPrimeReference(repoPath string) DoctorCheck {
 			Message: "Documentation references 'bd prime' but command not found",
 			Detail:  "Files: " + strings.Join(filesWithBdPrime, ", "),
 			Fix: "Upgrade bd to get the 'bd prime' command:\n" +
-				"  • Homebrew: brew upgrade bd\n" +
-				"  • Script: curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash\n" +
+				"  • Homebrew: brew upgrade beads\n" +
+				"  • Script: " + installScriptCommand + "\n" +
 				"  Or remove 'bd prime' references from documentation if using older version",
 		}
 	}
@@ -395,10 +408,28 @@ func CheckDocumentationBdPrimeReference(repoPath string) DoctorCheck {
 	}
 }
 
+// isClaudePresent returns true when the Claude CLI binary exists in PATH or the
+// ~/.claude/ directory is present.  CLAUDECODE=1 can be set by AI coding tools
+// other than Claude Code itself, so checking for actual Claude artifacts prevents
+// spurious warnings for users who never installed Claude Code.
+func isClaudePresent() bool {
+	if _, err := exec.LookPath("claude"); err == nil {
+		return true
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(home, ".claude"))
+	return err == nil && info.IsDir()
+}
+
 // CheckClaudePlugin checks if the beads Claude Code plugin is installed and up to date.
 func CheckClaudePlugin() DoctorCheck {
-	// Check if running in Claude Code
-	if os.Getenv("CLAUDECODE") != "1" {
+	// Check if running in Claude Code.
+	// CLAUDECODE=1 may be set by AI tools other than Claude Code, so also verify
+	// that the claude CLI or ~/.claude/ directory actually exists.
+	if os.Getenv("CLAUDECODE") != "1" || !isClaudePresent() {
 		return DoctorCheck{
 			Name:    "Claude Plugin",
 			Status:  StatusOK,
@@ -422,12 +453,12 @@ func CheckClaudePlugin() DoctorCheck {
 			Name:    "Claude Plugin",
 			Status:  StatusWarning,
 			Message: "beads plugin not installed",
-			Fix:     "Install plugin: /plugin install beads@beads-marketplace",
+			Fix:     "Install plugin: /plugin marketplace add steveyegge/beads && /plugin install beads (see docs/PLUGIN.md)",
 		}
 	}
 
 	// Query PyPI for latest MCP version
-	latestMCPVersion, err := fetchLatestPyPIVersion("beads-mcp")
+	latestMCPVersion, err := latestPyPIVersionFetcher("beads-mcp")
 	if err != nil {
 		// Network error - don't fail
 		return DoctorCheck{
@@ -459,6 +490,43 @@ func CheckClaudePlugin() DoctorCheck {
 		Name:    "Claude Plugin",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("version %s", pluginVersion),
+	}
+}
+
+// CheckClaudePluginLocalOnly validates local Claude plugin presence/version
+// without contacting PyPI.
+func CheckClaudePluginLocalOnly() DoctorCheck {
+	if os.Getenv("CLAUDECODE") != "1" || !isClaudePresent() {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusOK,
+			Message: "N/A (not running in Claude Code)",
+		}
+	}
+
+	pluginVersion, pluginInstalled, err := GetClaudePluginVersion()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusWarning,
+			Message: "Unable to check plugin version",
+			Detail:  err.Error(),
+		}
+	}
+
+	if !pluginInstalled {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusWarning,
+			Message: "beads plugin not installed",
+			Fix:     "Install plugin: /plugin marketplace add steveyegge/beads && /plugin install beads (see docs/PLUGIN.md)",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Claude Plugin",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("version %s (update check skipped in non-interactive mode)", pluginVersion),
 	}
 }
 
@@ -569,4 +637,176 @@ func fetchLatestPyPIVersion(packageName string) (string, error) {
 	}
 
 	return data.Info.Version, nil
+}
+
+// CheckClaudeSettingsHealth validates that Claude Code settings files are well-formed JSON.
+// Malformed settings silently break hooks and plugin detection.
+// repoPath is the project root directory.
+func CheckClaudeSettingsHealth(repoPath string) DoctorCheck {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Claude Settings Health",
+			Status:  StatusOK,
+			Message: "N/A (unable to determine home directory)",
+		}
+	}
+
+	settingsFiles := []struct {
+		path  string
+		label string
+	}{
+		{filepath.Join(home, ".claude", "settings.json"), "~/.claude/settings.json"},
+		{filepath.Join(repoPath, ".claude", "settings.json"), ".claude/settings.json"},
+		{filepath.Join(repoPath, ".claude", "settings.local.json"), ".claude/settings.local.json"},
+	}
+
+	var malformed []string
+	var checked int
+	for _, sf := range settingsFiles {
+		data, err := os.ReadFile(sf.path) // #nosec G304 -- paths are constructed from known safe locations
+		if err != nil {
+			continue // File doesn't exist, skip
+		}
+		checked++
+		var parsed map[string]interface{}
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			malformed = append(malformed, fmt.Sprintf("%s: %v", sf.label, err))
+		}
+	}
+
+	if checked == 0 {
+		return DoctorCheck{
+			Name:    "Claude Settings Health",
+			Status:  StatusOK,
+			Message: "No Claude Code settings files found",
+		}
+	}
+
+	if len(malformed) > 0 {
+		return DoctorCheck{
+			Name:    "Claude Settings Health",
+			Status:  StatusError,
+			Message: fmt.Sprintf("%d malformed settings file(s)", len(malformed)),
+			Detail:  strings.Join(malformed, "\n"),
+			Fix:     "Fix the JSON syntax in the listed file(s). Malformed settings break hooks and plugin detection.",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Claude Settings Health",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("%d settings file(s) valid", checked),
+	}
+}
+
+// CheckClaudeHookCompleteness verifies that when hooks are installed,
+// SessionStart is covered. Claude Code fires SessionStart on startup, resume,
+// clear, and after compaction, so current bd prime context injection only needs
+// SessionStart.
+// repoPath is the project root directory.
+func CheckClaudeHookCompleteness(repoPath string) DoctorCheck {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Claude Hook Completeness",
+			Status:  StatusOK,
+			Message: "N/A (unable to determine home directory)",
+		}
+	}
+
+	settingsFiles := []string{
+		filepath.Join(home, ".claude", "settings.json"),
+		filepath.Join(repoPath, ".claude", "settings.json"),
+		filepath.Join(repoPath, ".claude", "settings.local.json"),
+	}
+
+	var hasAnyHook bool
+	var hasSessionStart bool
+
+	for _, sf := range settingsFiles {
+		ss, pc := checkHookEvents(sf)
+		if ss || pc {
+			hasAnyHook = true
+		}
+		if ss {
+			hasSessionStart = true
+		}
+	}
+
+	if !hasAnyHook {
+		// No hooks installed at all - CheckClaude already reports this
+		return DoctorCheck{
+			Name:    "Claude Hook Completeness",
+			Status:  StatusOK,
+			Message: "N/A (no hooks installed)",
+		}
+	}
+
+	if hasSessionStart {
+		return DoctorCheck{
+			Name:    "Claude Hook Completeness",
+			Status:  StatusOK,
+			Message: "SessionStart hook present",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Claude Hook Completeness",
+		Status:  StatusWarning,
+		Message: "Missing hook event(s): SessionStart",
+		Detail:  "SessionStart injects context on new sessions and after compaction.",
+		Fix: "Run 'bd setup claude' to install hooks, or\n" +
+			"install the beads plugin which includes hooks automatically.",
+	}
+}
+
+// checkHookEvents returns which bd-prime hook events are present in a settings file.
+func checkHookEvents(settingsPath string) (hasSessionStart, hasPreCompact bool) {
+	data, err := os.ReadFile(settingsPath) // #nosec G304 -- paths are constructed from known safe locations
+	if err != nil {
+		return false, false
+	}
+
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false, false
+	}
+
+	hooks, ok := settings["hooks"].(map[string]interface{})
+	if !ok {
+		return false, false
+	}
+
+	checkEvent := func(eventName string) bool {
+		eventHooks, ok := hooks[eventName].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, hook := range eventHooks {
+			hookMap, ok := hook.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			commands, ok := hookMap["hooks"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, cmd := range commands {
+				cmdMap, ok := cmd.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				cmdStr, _ := cmdMap["command"].(string)
+				switch cmdStr {
+				case "bd prime", "bd prime --stealth",
+					"bd prime --hook-json", "bd prime --stealth --hook-json":
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	return checkEvent("SessionStart"), checkEvent("PreCompact")
 }

@@ -2,14 +2,15 @@
 
 ## Overview
 
-The beads project has a comprehensive test suite with **~41,000 lines of code** across **205 files** in `cmd/bd` alone.
+The beads project uses Go tests plus repository wrapper scripts. Prefer the
+wrapper scripts for local validation because they apply the same skip and
+timeout policy as CI.
 
 ## Test Performance
 
-- **Total test time:** ~3 minutes (excluding broken tests)
-- **Package count:** 20+ packages with tests
-- **Compilation overhead:** ~180 seconds (most of the total time)
-- **Individual test time:** Only ~3.8 seconds combined for all 313 tests in cmd/bd
+- Go compilation dominates full-suite runtime.
+- Target package/test runs are usually the fastest way to validate focused changes.
+- Docker-backed Dolt integration tests auto-detect prerequisites and skip when unavailable.
 
 ## Running Tests
 
@@ -21,6 +22,9 @@ make test
 
 # Or directly:
 ./scripts/test.sh
+
+# Run opt-in ICU regex path tests (maintainer-only, not normal validation)
+make test-icu-path
 
 # Run specific package
 ./scripts/test.sh ./cmd/bd/...
@@ -45,6 +49,51 @@ TEST_VERBOSE=1 ./scripts/test.sh
 TEST_RUN=TestCreate ./scripts/test.sh
 ```
 
+### Docker (Dolt Integration Tests)
+
+Dolt integration tests require Docker with the exact Dolt image cached locally.
+Tests auto-detect the environment and skip gracefully — no manual configuration
+needed.
+
+#### Readiness states
+
+```csv
+State,Condition,Behavior
+doltSkipped,BEADS_TEST_SKIP contains "dolt",Silent skip (no warning)
+doltNoDocker,Docker daemon not reachable,WARN + skip
+doltNoImage,No Dolt image at all,WARN + skip with pull instruction
+doltWrongVersion,Image repo cached but wrong tag,WARN + skip with pull instruction
+doltReady,Exact image cached and Docker running,Run tests
+```
+
+States are checked once per test binary and cached. Order of evaluation:
+`BEADS_TEST_SKIP` → Docker availability → exact image → any image version.
+
+#### Skipping Dolt tests explicitly
+
+Set `BEADS_TEST_SKIP` to opt out without Docker overhead (~1s `docker info`):
+
+```bash
+# Skip Dolt tests silently
+BEADS_TEST_SKIP=dolt ./scripts/test.sh
+
+# Skip multiple services (comma-separated)
+BEADS_TEST_SKIP=dolt,slow ./scripts/test.sh
+```
+
+#### Enabling Dolt tests
+
+```bash
+# Pull the exact Dolt image to enable integration tests
+docker pull dolthub/dolt-sql-server:1.43.0
+
+# Point tests at an existing Dolt server (skips container startup)
+BEADS_DOLT_PORT=3308 ./scripts/test.sh
+```
+
+`BEADS_DOLT_PORT` — when set, tests reuse the server at that port instead of
+starting a container. Port 3307 is hardcoded as production and always rejected.
+
 ### Advanced Usage
 
 ```bash
@@ -60,12 +109,12 @@ TEST_RUN=TestCreate ./scripts/test.sh
 
 ## Known Broken Tests
 
-Tests in `.test-skip` are automatically skipped. Current broken tests:
+Tests in `.test-skip` are automatically skipped by `scripts/test.sh`.
 
-1. **TestFallbackToDirectModeEnablesFlush** (GH #355)
-   - Location: `cmd/bd/direct_mode_test.go:14`
-   - Issue: Database deadlock, hangs for 5 minutes
-   - Impact: Makes test suite extremely slow
+At the time of this review, `.test-skip` contains only comments and no active
+test-name patterns. Treat any new skip as a temporary exception: file the
+upstream issue first, record it in `.test-skip`, and remove the skip when the
+test is fixed.
 
 ## For Claude Code / AI Agents
 
@@ -77,6 +126,7 @@ When running tests during development:
    - Automatically skips known broken tests
    - Uses appropriate timeouts
    - Consistent with CI/CD
+   - Only if intentionally exercising the ICU regex path, use `./scripts/test-icu-path.sh` (or deprecated `make test-full-cgo`)
 
 2. **Target specific tests when possible:**
    ```bash

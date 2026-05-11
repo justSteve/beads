@@ -18,7 +18,7 @@ The beads integration for Aider:
 
 ```bash
 # Install beads CLI
-go install github.com/steveyegge/beads/cmd/bd@latest
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
 # Initialize in your project
 cd your-project
@@ -77,7 +77,7 @@ pipx install aider-chat
    You: Let's work on bd-42
 
    Aider: Great choice! To claim it, run:
-   /run bd update bd-42 --status in_progress
+   /run bd update bd-42 --claim
    ```
 
 ### During Development
@@ -114,7 +114,7 @@ Aider: Great! Mark it complete by running:
 /run bd close bd-42 --reason "Implemented login fix and added tests"
 
 Then sync to git:
-/run bd sync
+/run bd dolt push
 ```
 
 ## Configuration
@@ -128,7 +128,7 @@ The config file contains instructions for the AI:
 # 1. Track ALL work in bd (never use markdown TODOs)
 # 2. Suggest 'bd ready' to find available work
 # 3. Suggest 'bd create' for new issues/tasks/bugs
-# 4. Suggest 'bd sync' at end of session
+# 4. Suggest 'bd dolt push' at end of session
 # 5. ALWAYS suggest commands - user will run them via /run
 ```
 
@@ -155,7 +155,7 @@ You can customize this file to add project-specific instructions.
 /run bd ready
 
 # Claim an issue
-/run bd update bd-abc --status in_progress
+/run bd update bd-abc --claim
 ```
 
 ### Discovering Work
@@ -175,7 +175,7 @@ You can customize this file to add project-specific instructions.
 /run bd close bd-abc --reason "Implemented and tested"
 
 # Sync to git
-/run bd sync
+/run bd dolt push
 ```
 
 ### Checking Status
@@ -225,7 +225,7 @@ The AI knows the bd workflow and will suggest appropriate commands:
 ```
 You: I'm starting work on the login feature
 Aider: First, let's claim it. Run:
-/run bd update bd-xyz --status in_progress
+/run bd update bd-xyz --claim
 ```
 
 ### 3. Use bd prime for Context
@@ -243,7 +243,7 @@ Add to your shell config for faster commands:
 ```bash
 alias bdr='/run bd ready'
 alias bdc='/run bd create'
-alias bds='/run bd sync'
+alias bds='/run bd dolt push'
 ```
 
 Then in aider:
@@ -312,18 +312,18 @@ You: Add the auth files to context and check for related issues
 Run multiple bd commands in sequence:
 ```bash
 # In your shell (not aider)
-bd ready && bd show bd-42 && bd update bd-42 --status in_progress
+bd ready && bd show bd-42 && bd update bd-42 --claim
 ```
 
 ### Integration with Git
 
 Aider handles git commits. bd tracks issues. They work together:
 
-1. Claim issue: `/run bd update bd-42 --status in_progress`
+1. Claim issue: `/run bd update bd-42 --claim`
 2. Make changes with aider
 3. Aider commits changes
 4. Complete issue: `/run bd close bd-42`
-5. Sync issues: `/run bd sync`
+5. Sync issues: `/run bd dolt push`
 
 ## Example Session
 
@@ -343,7 +343,7 @@ Aider: Let me check. Run:
 You: Let's work on bd-42
 
 Aider: Great! First claim it:
-/run bd update bd-42 --status in_progress
+/run bd update bd-42 --claim
 
 You: Can you show me the details?
 
@@ -366,12 +366,12 @@ Aider: Run:
 /run bd close bd-42 --reason "Fixed login bug - added input validation"
 
 Then sync:
-/run bd sync
+/run bd dolt push
 ```
 
 ## References
 
 - [Aider Documentation](https://aider.chat/docs/)
-- [Beads Documentation](https://github.com/steveyegge/beads)
+- [Beads Documentation](https://github.com/gastownhall/beads)
 - [AGENTS.md](../AGENTS.md) - Complete bd workflow guide
 - [QUICKSTART.md](QUICKSTART.md) - Quick start guide

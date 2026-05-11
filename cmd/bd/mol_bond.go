@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -45,14 +44,14 @@ Phase control:
 
   Override with:
   --pour  Force spawn as liquid (persistent, Ephemeral=false)
-  --ephemeral  Force spawn as vapor (ephemeral, Ephemeral=true, excluded from JSONL export)
+  --ephemeral  Force spawn as vapor (ephemeral, Ephemeral=true, excluded from Dolt sync via dolt_ignore)
 
 Dynamic bonding (Christmas Ornament pattern):
   Use --ref to specify a custom child reference with variable substitution.
   This creates IDs like "parent.child-ref" instead of random hashes.
 
   Example:
-    bd mol bond mol-polecat-arm bd-patrol --ref arm-{{polecat_name}} --var polecat_name=ace
+    bd mol bond mol-worker-arm bd-patrol --ref arm-{{worker_name}} --var worker_name=ace
     # Creates: bd-patrol.arm-ace (and children like bd-patrol.arm-ace.capture)
 
 Use cases:
@@ -89,13 +88,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 
 	// mol bond requires direct store access
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: mol bond requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol bond %s %s ...\n", args[0], args[1])
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
-		os.Exit(1)
+		FatalError("no database connection")
 	}
 
 	bondType, _ := cmd.Flags().GetString("type")
@@ -108,19 +101,17 @@ func runMolBond(cmd *cobra.Command, args []string) {
 
 	// Validate phase flags are not both set
 	if ephemeral && pour {
-		fmt.Fprintf(os.Stderr, "Error: cannot use both --ephemeral and --pour\n")
-		os.Exit(1)
+		FatalError("cannot use both --ephemeral and --pour")
 	}
 
 	// All issues go in the main store; ephemeral vs pour determines the Wisp flag
-	// --ephemeral: create with Ephemeral=true (ephemeral, excluded from JSONL export)
-	// --pour: create with Ephemeral=false (persistent, exported to JSONL)
+	// --ephemeral: create with Ephemeral=true (ephemeral, stored in dolt_ignore table, excluded from sync)
+	// --pour: create with Ephemeral=false (persistent, synced via Dolt)
 	// Default: follow target's phase (ephemeral if target is ephemeral, otherwise persistent)
 
 	// Validate bond type
 	if bondType != types.BondTypeSequential && bondType != types.BondTypeParallel && bondType != types.BondTypeConditional {
-		fmt.Fprintf(os.Stderr, "Error: invalid bond type '%s', must be: sequential, parallel, or conditional\n", bondType)
-		os.Exit(1)
+		FatalError("invalid bond type '%s', must be: sequential, parallel, or conditional", bondType)
 	}
 
 	// Parse variables
@@ -128,8 +119,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	for _, v := range varFlags {
 		parts := strings.SplitN(v, "=", 2)
 		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-			os.Exit(1)
+			FatalError("invalid variable format '%s', expected 'key=value'", v)
 		}
 		vars[parts[0]] = parts[1]
 	}
@@ -138,13 +128,11 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	if dryRun {
 		issueA, formulaA, err := resolveOrDescribe(ctx, store, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		issueB, formulaB, err := resolveOrDescribe(ctx, store, args[1])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		idA := args[0]
@@ -211,13 +199,11 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	// Pass vars for step condition filtering (bd-7zka.1)
 	subgraphA, cookedA, err := resolveOrCookToSubgraph(ctx, store, args[0], vars)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 	subgraphB, cookedB, err := resolveOrCookToSubgraph(ctx, store, args[1], vars)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// No cleanup needed - in-memory subgraphs don't pollute the DB
@@ -257,12 +243,8 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error bonding: %v\n", err)
-		os.Exit(1)
+		FatalError("bonding: %v", err)
 	}
-
-	// Schedule auto-flush - wisps are in main DB now, but JSONL export skips them
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(result)
@@ -300,7 +282,7 @@ func operandType(isProtoIssue bool) string {
 }
 
 // bondProtoProto bonds two protos to create a compound proto
-func bondProtoProto(ctx context.Context, s storage.Storage, protoA, protoB *types.Issue, bondType, customTitle, actorName string) (*BondResult, error) {
+func bondProtoProto(ctx context.Context, s storage.DoltStorage, protoA, protoB *types.Issue, bondType, customTitle, actorName string) (*BondResult, error) {
 	// Create compound proto: a new root that references both protos as children
 	// The compound root will be a new issue that ties them together
 	compoundTitle := fmt.Sprintf("Compound: %s + %s", protoA.Title, protoB.Title)
@@ -309,7 +291,7 @@ func bondProtoProto(ctx context.Context, s storage.Storage, protoA, protoB *type
 	}
 
 	var compoundID string
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	err := transact(ctx, s, fmt.Sprintf("bd: bond protos %s + %s", protoA.ID, protoB.ID), func(tx storage.Transaction) error {
 		// Create compound root issue
 		compound := &types.Issue{
 			Title:       compoundTitle,
@@ -387,12 +369,12 @@ func bondProtoProto(ctx context.Context, s storage.Storage, protoA, protoB *type
 // bondProtoMol bonds a proto to an existing molecule by spawning the proto.
 // If childRef is provided, generates custom IDs like "parent.childref" (dynamic bonding).
 // protoSubgraph can be nil if proto is from DB (will be loaded), or pre-loaded for formulas.
-func bondProtoMol(ctx context.Context, s storage.Storage, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondProtoMol(ctx context.Context, s storage.DoltStorage, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	return bondProtoMolWithSubgraph(ctx, s, nil, proto, mol, bondType, vars, childRef, actorName, ephemeralFlag, pourFlag)
 }
 
 // bondProtoMolWithSubgraph is the internal implementation that accepts a pre-loaded subgraph.
-func bondProtoMolWithSubgraph(ctx context.Context, s storage.Storage, protoSubgraph *TemplateSubgraph, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondProtoMolWithSubgraph(ctx context.Context, s storage.DoltStorage, protoSubgraph *TemplateSubgraph, proto, mol *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	// Use provided subgraph or load from DB
 	subgraph := protoSubgraph
 	if subgraph == nil {
@@ -424,11 +406,28 @@ func bondProtoMolWithSubgraph(ctx context.Context, s storage.Storage, protoSubgr
 		makeEphemeral = false
 	}
 
+	// Determine dependency type for attachment
+	// Sequential: use blocks (B runs after A completes)
+	// Conditional: use conditional-blocks (B runs only if A fails)
+	// Parallel: use parent-child (organizational, no blocking)
+	var depType types.DependencyType
+	switch bondType {
+	case types.BondTypeSequential:
+		depType = types.DepBlocks
+	case types.BondTypeConditional:
+		depType = types.DepConditionalBlocks
+	default:
+		depType = types.DepParentChild
+	}
+
 	// Build CloneOptions for spawning
+	// AttachToID ensures spawn + attach happen in a single transaction (bd-wvplu)
 	opts := CloneOptions{
-		Vars:  vars,
-		Actor: actorName,
-		Ephemeral:  makeEphemeral,
+		Vars:          vars,
+		Actor:         actorName,
+		Ephemeral:     makeEphemeral,
+		AttachToID:    mol.ID,
+		AttachDepType: depType,
 	}
 
 	// Dynamic bonding: use custom IDs if childRef is provided
@@ -437,40 +436,10 @@ func bondProtoMolWithSubgraph(ctx context.Context, s storage.Storage, protoSubgr
 		opts.ChildRef = childRef
 	}
 
-	// Spawn the proto with options
+	// Spawn the proto and atomically attach to molecule
 	spawnResult, err := spawnMoleculeWithOptions(ctx, s, subgraph, opts)
 	if err != nil {
-		return nil, fmt.Errorf("spawning proto: %w", err)
-	}
-
-	// Attach spawned molecule to existing molecule
-	err = s.RunInTransaction(ctx, func(tx storage.Transaction) error {
-		// Add dependency from spawned root to molecule
-		// Sequential: use blocks (B runs after A completes)
-		// Conditional: use conditional-blocks (B runs only if A fails)
-		// Parallel: use parent-child (organizational, no blocking)
-		// Note: Schema only allows one dependency per (issue_id, depends_on_id) pair
-		var depType types.DependencyType
-		switch bondType {
-		case types.BondTypeSequential:
-			depType = types.DepBlocks
-		case types.BondTypeConditional:
-			depType = types.DepConditionalBlocks
-		default:
-			depType = types.DepParentChild
-		}
-		dep := &types.Dependency{
-			IssueID:     spawnResult.NewEpicID,
-			DependsOnID: mol.ID,
-			Type:        depType,
-		}
-		return tx.AddDependency(ctx, dep, actorName)
-		// Note: bonded_from field tracking is not yet supported by storage layer.
-		// The dependency relationship captures the bonding semantics.
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("attaching to molecule: %w", err)
+		return nil, fmt.Errorf("spawning and attaching proto: %w", err)
 	}
 
 	return &BondResult{
@@ -483,14 +452,69 @@ func bondProtoMolWithSubgraph(ctx context.Context, s storage.Storage, protoSubgr
 }
 
 // bondMolProto bonds a molecule to a proto (symmetric with bondProtoMol)
-func bondMolProto(ctx context.Context, s storage.Storage, mol, proto *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
+func bondMolProto(ctx context.Context, s storage.DoltStorage, mol, proto *types.Issue, bondType string, vars map[string]string, childRef string, actorName string, ephemeralFlag, pourFlag bool) (*BondResult, error) {
 	// Same as bondProtoMol but with arguments swapped
 	return bondProtoMol(ctx, s, proto, mol, bondType, vars, childRef, actorName, ephemeralFlag, pourFlag)
 }
 
-// bondMolMol bonds two molecules together
-func bondMolMol(ctx context.Context, s storage.Storage, molA, molB *types.Issue, bondType, actorName string) (*BondResult, error) {
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+// wouldCreateCycle checks whether adding an edge (newDepID depends on newDependsOnID)
+// would create a cycle in the dependency graph. It does a BFS from newDependsOnID
+// following "depends on" edges; if newDepID is reachable, a cycle would be formed.
+// Returns (hasCycle, cyclePath) where cyclePath shows the chain if found.
+func wouldCreateCycle(ctx context.Context, s storage.DoltStorage, newDepID, newDependsOnID string) (bool, []string) {
+	visited := map[string]bool{newDependsOnID: true}
+	// parent tracks how we reached each node, for path reconstruction.
+	parent := map[string]string{newDependsOnID: ""}
+	queue := []string{newDependsOnID}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		deps, err := s.GetDependencyRecords(ctx, current)
+		if err != nil {
+			// If we can't query deps for a node, skip it rather than failing.
+			continue
+		}
+		for _, dep := range deps {
+			next := dep.DependsOnID
+			if next == newDepID {
+				// Found the cycle. Reconstruct the path.
+				path := []string{newDepID}
+				for node := current; node != ""; node = parent[node] {
+					path = append(path, node)
+				}
+				// Reverse to get forward direction.
+				for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+					path[i], path[j] = path[j], path[i]
+				}
+				// Append newDepID again to show the cycle closing.
+				path = append(path, newDepID)
+				return true, path
+			}
+			if !visited[next] {
+				visited[next] = true
+				parent[next] = current
+				queue = append(queue, next)
+			}
+		}
+	}
+	return false, nil
+}
+
+// bondMolMol bonds two molecules together.
+// It checks for transitive cycles in the dependency graph (GH#2719).
+func bondMolMol(ctx context.Context, s storage.DoltStorage, molA, molB *types.Issue, bondType, actorName string) (*BondResult, error) {
+	// The bond creates: molB depends on molA (IssueID=molB.ID, DependsOnID=molA.ID).
+	// A cycle exists if molA already transitively depends on molB, because then
+	// adding molB→molA would close the loop: molA→...→molB→molA.
+	hasCycle, cyclePath := wouldCreateCycle(ctx, s, molB.ID, molA.ID)
+	if hasCycle {
+		return nil, fmt.Errorf("cannot bond %s → %s: would create a transitive dependency cycle: %s",
+			molA.ID, molB.ID, strings.Join(cyclePath, " → "))
+	}
+
+	err := transact(ctx, s, fmt.Sprintf("bd: bond molecules %s + %s", molA.ID, molB.ID), func(tx storage.Transaction) error {
 		// Add dependency: B links to A
 		// Sequential: use blocks (B runs after A completes)
 		// Conditional: use conditional-blocks (B runs only if A fails)
@@ -541,7 +565,7 @@ func minPriority(a, b int) int {
 // resolveOrDescribe checks if an operand is an issue or formula without cooking.
 // Used for dry-run mode. Returns (issue, formulaName, error).
 // If it's an issue, issue is set. If it's a formula, formulaName is set.
-func resolveOrDescribe(ctx context.Context, s storage.Storage, operand string) (*types.Issue, string, error) {
+func resolveOrDescribe(ctx context.Context, s storage.DoltStorage, operand string) (*types.Issue, string, error) {
 	// First, try to resolve as an existing issue
 	id, err := utils.ResolvePartialID(ctx, s, operand)
 	if err == nil {
@@ -572,7 +596,7 @@ func resolveOrDescribe(ctx context.Context, s storage.Storage, operand string) (
 //
 // The vars parameter is used for step condition filtering (bd-7zka.1).
 // This implements gt-4v1eo: formulas are cooked to in-memory subgraphs (no DB storage).
-func resolveOrCookToSubgraph(ctx context.Context, s storage.Storage, operand string, vars map[string]string) (*TemplateSubgraph, bool, error) {
+func resolveOrCookToSubgraph(ctx context.Context, s storage.DoltStorage, operand string, vars map[string]string) (*TemplateSubgraph, bool, error) {
 	// First, try to resolve as an existing issue
 	id, err := utils.ResolvePartialID(ctx, s, operand)
 	if err == nil {

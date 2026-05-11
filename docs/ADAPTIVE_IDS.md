@@ -139,10 +139,10 @@ Output shows:
 
 ### Location
 
-- Algorithm: `internal/storage/sqlite/adaptive_length.go`
-- ID generation: `internal/storage/sqlite/sqlite.go` (`generateHashID`)
-- Tests: `internal/storage/sqlite/adaptive_length_test.go`
-- E2E tests: `internal/storage/sqlite/adaptive_e2e_test.go`
+- Algorithm: `internal/storage/dolt/adaptive_length.go`
+- ID generation: `internal/storage/dolt/dolt.go` (`generateHashID`)
+- Tests: `internal/storage/dolt/adaptive_length_test.go`
+- E2E tests: `internal/storage/dolt/adaptive_e2e_test.go`
 
 ### Database Schema
 
@@ -158,7 +158,7 @@ INSERT INTO config (key, value) VALUES ('max_hash_length', '8');
 
 - Collision probability calculation: ~10ns per call
 - ID generation with adaptive length: ~300ns (same as before)
-- Database query to count issues: ~100μs (cached by SQLite)
+- Database query to count issues: ~100μs
 
 ## Migration
 
@@ -191,6 +191,29 @@ Potential improvements (not yet implemented):
 - **Per-workspace thresholds**: Different configs for different projects
 - **Dynamic adjustment**: Auto-adjust threshold based on observed collision rate
 - **Compaction-aware**: Don't count compacted issues in collision calculation
+
+## Alternative: Sequential Counter IDs
+
+Adaptive hash IDs are the default, but beads also supports sequential integer IDs
+(`bd-1`, `bd-2`, ...) for projects that prefer human-readable numbering.
+
+Counter mode is controlled by the `issue_id_mode` config key:
+
+```bash
+# Switch to sequential IDs
+bd config set issue_id_mode counter
+
+# Revert to hash IDs (default)
+bd config set issue_id_mode hash
+```
+
+**Tradeoff:**
+
+- **Hash IDs** (this document): Collision-free across parallel branches and agents; IDs are less predictable but always unique.
+- **Counter IDs**: Human-friendly and sequential; require care in multi-branch workflows where counters can diverge.
+
+See [CONFIG.md](CONFIG.md) for full documentation on `issue_id_mode=counter`, including migration
+guidance and per-prefix counter isolation.
 
 ## Related
 

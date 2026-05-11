@@ -11,27 +11,30 @@ import (
 	"github.com/steveyegge/beads/internal/ui"
 )
 
-// setupStealthMode configures git settings for stealth operation
+// setupStealthMode configures git settings for stealth operation.
+// Only configures git-level invisibility (.git/info/exclude).
+// Tool-specific setup (Claude, Cursor, etc.) is handled by `bd setup <tool>`.
 // Uses .git/info/exclude (per-repository) instead of global gitignore because:
 // - Global gitignore doesn't support absolute paths (GitHub #704)
 // - .git/info/exclude is designed for user-specific, repo-local ignores
 // - Patterns are relative to repo root, so ".beads/" works correctly
 func setupStealthMode(verbose bool) error {
-	// Setup per-repository git exclude file
+	// Setup per-repository git exclude file (skip if not in a git repo)
 	if err := setupGitExclude(verbose); err != nil {
-		return fmt.Errorf("failed to setup git exclude: %w", err)
-	}
-
-	// Setup claude settings
-	if err := setupClaudeSettings(verbose); err != nil {
-		return fmt.Errorf("failed to setup claude settings: %w", err)
+		if strings.Contains(err.Error(), "not a git repository") {
+			if verbose {
+				fmt.Printf("Not in a git repository — skipping git exclude setup\n")
+			}
+		} else {
+			return fmt.Errorf("failed to setup git exclude: %w", err)
+		}
 	}
 
 	if verbose {
 		fmt.Printf("\n%s Stealth mode configured successfully!\n\n", ui.RenderPass("✓"))
 		fmt.Printf("  Git exclude: %s\n", ui.RenderAccent(".git/info/exclude configured"))
-		fmt.Printf("  Claude settings: %s\n\n", ui.RenderAccent("configured with bd onboard instruction"))
-		fmt.Printf("Your beads setup is now %s - other repo collaborators won't see any beads-related files.\n\n", ui.RenderAccent("invisible"))
+		fmt.Printf("\nYour beads setup is now %s - other repo collaborators won't see any beads-related files.\n", ui.RenderAccent("invisible"))
+		fmt.Printf("To set up a specific AI tool, run: %s\n\n", ui.RenderAccent("bd setup <claude|cursor|aider|...> --stealth"))
 	}
 
 	return nil
@@ -189,9 +192,9 @@ func containsExactPattern(content, pattern string) bool {
 }
 
 // promptForkExclude asks if user wants to configure .git/info/exclude for fork workflow (GH#742)
-func promptForkExclude(upstreamURL string, quiet bool) bool {
+func promptForkExclude(upstreamURL string, quiet bool) (bool, error) {
 	if quiet {
-		return false // Don't prompt in quiet mode
+		return false, nil // Don't prompt in quiet mode
 	}
 
 	fmt.Printf("\n%s Detected fork (upstream: %s)\n\n", ui.RenderAccent("▶"), upstreamURL)
@@ -200,11 +203,17 @@ func promptForkExclude(upstreamURL string, quiet bool) bool {
 	fmt.Print("\n[Y/n]: ")
 
 	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
+	response, err := readLineWithContext(getRootContext(), reader, os.Stdin)
+	if err != nil {
+		if isCanceled(err) {
+			return false, err
+		}
+		response = ""
+	}
 	response = strings.TrimSpace(strings.ToLower(response))
 
 	// Default to yes (empty or "y" or "yes")
-	return response == "" || response == "y" || response == "yes"
+	return response == "" || response == "y" || response == "yes", nil
 }
 
 // setupGlobalGitIgnore configures global gitignore to ignore beads and claude files for a specific project

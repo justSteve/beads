@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/formula"
@@ -14,10 +15,10 @@ import (
 // TestSubstituteFormulaVars tests variable substitution in formulas
 func TestSubstituteFormulaVars(t *testing.T) {
 	tests := []struct {
-		name        string
-		formula     *formula.Formula
-		vars        map[string]string
-		wantDesc    string
+		name          string
+		formula       *formula.Formula
+		vars          map[string]string
+		wantDesc      string
 		wantStepTitle string
 	}{
 		{
@@ -37,9 +38,9 @@ func TestSubstituteFormulaVars(t *testing.T) {
 					{Title: "Implement {{name}}"},
 				},
 			},
-			vars:           map[string]string{"name": "login"},
-			wantDesc:       "Feature work",
-			wantStepTitle:  "Implement login",
+			vars:          map[string]string{"name": "login"},
+			wantDesc:      "Feature work",
+			wantStepTitle: "Implement login",
 		},
 		{
 			name: "substitute multiple variables",
@@ -112,6 +113,43 @@ func TestSubstituteFormulaVars(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSubstituteFormulaVars_GateFields(t *testing.T) {
+	f := &formula.Formula{
+		Steps: []*formula.Step{
+			{
+				ID: "wait-for-pr",
+				Gate: &formula.Gate{
+					Type:    "gh:{{kind}}",
+					ID:      "{{legacy_id}}",
+					AwaitID: "{{pr}}",
+					Timeout: "{{timeout}}",
+				},
+			},
+		},
+	}
+
+	substituteFormulaVars(f, map[string]string{
+		"kind":      "pr",
+		"legacy_id": "legacy-42",
+		"pr":        "https://github.com/org/repo/pull/123",
+		"timeout":   "1h",
+	})
+
+	gate := f.Steps[0].Gate
+	if gate.Type != "gh:pr" {
+		t.Errorf("Gate.Type = %q, want gh:pr", gate.Type)
+	}
+	if gate.ID != "legacy-42" {
+		t.Errorf("Gate.ID = %q, want legacy-42", gate.ID)
+	}
+	if gate.AwaitID != "https://github.com/org/repo/pull/123" {
+		t.Errorf("Gate.AwaitID = %q, want expanded PR URL", gate.AwaitID)
+	}
+	if gate.Timeout != "1h" {
+		t.Errorf("Gate.Timeout = %q, want 1h", gate.Timeout)
 	}
 }
 
@@ -196,16 +234,16 @@ func TestCompileTimeVsRuntimeMode(t *testing.T) {
 // TestCreateGateIssue tests that createGateIssue creates proper gate issues
 func TestCreateGateIssue(t *testing.T) {
 	tests := []struct {
-		name        string
-		step        *formula.Step
-		parentID    string
-		wantID      string
-		wantTitle   string
+		name          string
+		step          *formula.Step
+		parentID      string
+		wantID        string
+		wantTitle     string
 		wantAwaitType string
-		wantAwaitID string
+		wantAwaitID   string
 	}{
 		{
-			name: "gh:run gate with ID",
+			name: "gh:run gate with legacy ID",
 			step: &formula.Step{
 				ID:    "await-ci",
 				Title: "Wait for CI",
@@ -219,6 +257,22 @@ func TestCreateGateIssue(t *testing.T) {
 			wantTitle:     "Gate: gh:run release-build",
 			wantAwaitType: "gh:run",
 			wantAwaitID:   "release-build",
+		},
+		{
+			name: "gh:pr gate with await_id",
+			step: &formula.Step{
+				ID:    "await-pr",
+				Title: "Wait for PR",
+				Gate: &formula.Gate{
+					Type:    "gh:pr",
+					AwaitID: "https://github.com/org/repo/pull/123",
+				},
+			},
+			parentID:      "mol-feature",
+			wantID:        "mol-feature.gate-await-pr",
+			wantTitle:     "Gate: gh:pr https://github.com/org/repo/pull/123",
+			wantAwaitType: "gh:pr",
+			wantAwaitID:   "https://github.com/org/repo/pull/123",
 		},
 		{
 			name: "gh:pr gate without ID",
@@ -369,8 +423,8 @@ func TestCookFormulaToSubgraph_GateBeads(t *testing.T) {
 				},
 			},
 			{
-				ID:    "verify",
-				Title: "Verify deployment",
+				ID:        "verify",
+				Title:     "Verify deployment",
 				DependsOn: []string{"await-ci"},
 			},
 		},
@@ -499,5 +553,201 @@ func TestCookFormulaToSubgraph_GateParentChild(t *testing.T) {
 		for _, dep := range subgraph.Dependencies {
 			t.Logf("  %s -> %s (%s)", dep.IssueID, dep.DependsOnID, dep.Type)
 		}
+	}
+}
+
+// =============================================================================
+// Standalone Expansion Tests (bd-qzb)
+// =============================================================================
+
+// TestCookFormulaToSubgraph_StandaloneExpansion tests that a materialized
+// expansion formula produces the correct subgraph with root epic + children.
+func TestCookFormulaToSubgraph_StandaloneExpansion(t *testing.T) {
+	f := &formula.Formula{
+		Formula:     "rule-of-five",
+		Description: "Iterative refinement",
+		Version:     1,
+		Type:        formula.TypeExpansion,
+		Template: []*formula.Step{
+			{ID: "{target}.draft", Title: "Draft: {target.title}"},
+			{ID: "{target}.refine-1", Title: "Refine 1", Needs: []string{"{target}.draft"}},
+			{ID: "{target}.refine-2", Title: "Refine 2", Needs: []string{"{target}.refine-1"}},
+			{ID: "{target}.refine-3", Title: "Refine 3", Needs: []string{"{target}.refine-2"}},
+			{ID: "{target}.refine-4", Title: "Refine 4", Needs: []string{"{target}.refine-3"}},
+		},
+	}
+
+	// Materialize the expansion (converts Template -> Steps)
+	err := formula.MaterializeExpansion(f, "main", nil)
+	if err != nil {
+		t.Fatalf("MaterializeExpansion failed: %v", err)
+	}
+
+	// Cook to subgraph
+	subgraph, err := cookFormulaToSubgraph(f, "rule-of-five")
+	if err != nil {
+		t.Fatalf("cookFormulaToSubgraph failed: %v", err)
+	}
+
+	// Should have: 1 root epic + 5 child steps = 6 issues
+	if len(subgraph.Issues) != 6 {
+		t.Errorf("expected 6 issues, got %d", len(subgraph.Issues))
+		for _, issue := range subgraph.Issues {
+			t.Logf("  Issue: %s (%s) %s", issue.ID, issue.IssueType, issue.Title)
+		}
+	}
+
+	// Root molecule
+	if subgraph.Root.ID != "rule-of-five" {
+		t.Errorf("Root.ID = %q, want %q", subgraph.Root.ID, "rule-of-five")
+	}
+	if subgraph.Root.IssueType != types.TypeMolecule {
+		t.Errorf("Root.IssueType = %q, want %q", subgraph.Root.IssueType, types.TypeMolecule)
+	}
+
+	// Verify child issue IDs
+	expectedChildIDs := []string{
+		"rule-of-five.main.draft",
+		"rule-of-five.main.refine-1",
+		"rule-of-five.main.refine-2",
+		"rule-of-five.main.refine-3",
+		"rule-of-five.main.refine-4",
+	}
+	for _, expID := range expectedChildIDs {
+		found := false
+		for _, issue := range subgraph.Issues {
+			if issue.ID == expID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected child issue %q not found in subgraph", expID)
+		}
+	}
+
+	// Verify dependency chain: each refine step depends on the previous
+	// Dependencies include parent-child + needs (blocks)
+	depMap := make(map[string][]string) // issueID -> depends on
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == "blocks" {
+			depMap[dep.IssueID] = append(depMap[dep.IssueID], dep.DependsOnID)
+		}
+	}
+
+	// refine-1 should block on draft
+	if deps, ok := depMap["rule-of-five.main.refine-1"]; !ok || len(deps) == 0 {
+		t.Error("refine-1 should have a blocking dependency")
+	} else {
+		found := false
+		for _, d := range deps {
+			if d == "rule-of-five.main.draft" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("refine-1 should depend on draft, got deps: %v", deps)
+		}
+	}
+}
+
+// TestCookFormulaToSubgraph_StandaloneExpansionWithWorkflowVars tests that
+// {{double-brace}} vars survive materialization and appear in cooked issues.
+func TestCookFormulaToSubgraph_StandaloneExpansionWithWorkflowVars(t *testing.T) {
+	f := &formula.Formula{
+		Formula:     "scoped-expansion",
+		Description: "Expansion with workflow vars",
+		Version:     1,
+		Type:        formula.TypeExpansion,
+		Template: []*formula.Step{
+			{
+				ID:          "{target}.work",
+				Title:       "Work on {{feature}}",
+				Description: "Build {{feature}} per brief: {{brief}}",
+			},
+		},
+	}
+
+	err := formula.MaterializeExpansion(f, "main", nil)
+	if err != nil {
+		t.Fatalf("MaterializeExpansion failed: %v", err)
+	}
+
+	subgraph, err := cookFormulaToSubgraph(f, "scoped-expansion")
+	if err != nil {
+		t.Fatalf("cookFormulaToSubgraph failed: %v", err)
+	}
+
+	// Find the work issue
+	var workIssue *types.Issue
+	for _, issue := range subgraph.Issues {
+		if issue.ID == "scoped-expansion.main.work" {
+			workIssue = issue
+			break
+		}
+	}
+
+	if workIssue == nil {
+		t.Fatal("work issue not found in subgraph")
+	}
+
+	// {{double-brace}} vars should be preserved for later substitution
+	if workIssue.Title != "Work on {{feature}}" {
+		t.Errorf("Title = %q, want %q", workIssue.Title, "Work on {{feature}}")
+	}
+	if workIssue.Description != "Build {{feature}} per brief: {{brief}}" {
+		t.Errorf("Description = %q, want {{vars}} preserved", workIssue.Description)
+	}
+}
+
+// TestCookFormulaToSubgraph_StepMetadata verifies that a step's Metadata flows
+// through cook onto the resulting Issue.Metadata as a JSON object. Regression
+// for gastownhall/beads#3341.
+func TestCookFormulaToSubgraph_StepMetadata(t *testing.T) {
+	f := &formula.Formula{
+		Formula: "repro",
+		Version: 1,
+		Type:    formula.TypeWorkflow,
+		Steps: []*formula.Step{
+			{
+				ID:     "work",
+				Title:  "Do the work",
+				Labels: []string{"worker"},
+				Metadata: map[string]interface{}{
+					"priority_level": "high",
+					"origin":         "repro",
+				},
+			},
+		},
+	}
+
+	subgraph, err := cookFormulaToSubgraph(f, "repro")
+	if err != nil {
+		t.Fatalf("cookFormulaToSubgraph failed: %v", err)
+	}
+
+	var workIssue *types.Issue
+	for _, issue := range subgraph.Issues {
+		if issue.ID == "repro.work" {
+			workIssue = issue
+			break
+		}
+	}
+	if workIssue == nil {
+		t.Fatal("repro.work issue not found in subgraph")
+	}
+	if len(workIssue.Metadata) == 0 {
+		t.Fatalf("workIssue.Metadata is empty; want JSON object carrying step metadata")
+	}
+
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(workIssue.Metadata, &decoded); err != nil {
+		t.Fatalf("workIssue.Metadata is not valid JSON: %v (raw: %s)", err, string(workIssue.Metadata))
+	}
+	if got := decoded["priority_level"]; got != "high" {
+		t.Errorf("Metadata[priority_level] = %v, want \"high\"", got)
+	}
+	if got := decoded["origin"]; got != "repro" {
+		t.Errorf("Metadata[origin] = %v, want \"repro\"", got)
 	}
 }

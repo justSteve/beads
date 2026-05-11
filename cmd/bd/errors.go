@@ -6,6 +6,72 @@ import (
 	"os"
 )
 
+func activeWorkspaceNotFoundError() string {
+	return "no active beads workspace found"
+}
+
+func activeWorkspaceNotFoundMessage() string {
+	return "No active beads workspace found."
+}
+
+// diagHint returns the appropriate diagnostic hint when the active beads
+// workspace cannot be resolved. In embedded mode, 'bd doctor' is not
+// available so the hint omits it.
+func diagHint() string {
+	return workspaceDiagHint(true)
+}
+
+func whereDiagHint() string {
+	return workspaceDiagHint(false)
+}
+
+func workspaceDiagHint(includeWhere bool) string {
+	if includeWhere {
+		if !usesSQLServer() {
+			return "run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database"
+		}
+		return "run 'bd where' to inspect the resolved workspace, run 'bd doctor' to diagnose, or 'bd init' to create a new database"
+	}
+	if !usesSQLServer() {
+		return "check BEADS_DIR/worktree setup, or run 'bd init' to create a new database"
+	}
+	return "check BEADS_DIR/worktree setup, run 'bd doctor' to diagnose, or run 'bd init' to create a new database"
+}
+
+// buildJSONError constructs a JSON error object respecting envelope mode.
+func buildJSONError(message, hint string) interface{} {
+	inner := map[string]interface{}{
+		"error": message,
+	}
+	if hint != "" {
+		inner["hint"] = hint
+	}
+	if jsonEnvelopeEnabled() {
+		return map[string]interface{}{
+			"schema_version": JSONSchemaVersion,
+			"data":           inner,
+		}
+	}
+	inner["schema_version"] = JSONSchemaVersion
+	return inner
+}
+
+// jsonStderrError writes a structured JSON error to stderr when --json is active.
+func jsonStderrError(message, hint string) {
+	encoder := json.NewEncoder(os.Stderr)
+	encoder.SetIndent("", "  ")
+	_ = encoder.Encode(buildJSONError(message, hint))
+}
+
+// jsonStdoutError writes a structured JSON error to stdout when --json is active.
+// Used by FatalErrorRespectJSON and FatalErrorWithHintRespectJSON where
+// callers expect errors on stdout (e.g., bd show nonexistent-id --json).
+func jsonStdoutError(message, hint string) {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	_ = encoder.Encode(buildJSONError(message, hint))
+}
+
 // FatalError writes an error message to stderr and exits with code 1.
 // Use this for fatal errors that prevent the command from completing.
 //
@@ -20,7 +86,12 @@ import (
 //	    FatalError("%v", err)
 //	}
 func FatalError(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	if jsonOutput {
+		jsonStderrError(msg, "")
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+	}
 	os.Exit(1)
 }
 
@@ -38,10 +109,21 @@ func FatalError(format string, args ...interface{}) {
 func FatalErrorRespectJSON(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	if jsonOutput {
-		data, _ := json.MarshalIndent(map[string]string{"error": msg}, "", "  ")
-		fmt.Println(string(data))
+		jsonStdoutError(msg, "")
 	} else {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", msg)
+	}
+	os.Exit(1)
+}
+
+// FatalErrorWithHintRespectJSON writes an error message with a hint and exits.
+// If --json is set, emits structured JSON to stdout so callers can parse it.
+func FatalErrorWithHintRespectJSON(message, hint string) {
+	if jsonOutput {
+		jsonStdoutError(message, hint)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+		fmt.Fprintf(os.Stderr, "Hint: %s\n", hint)
 	}
 	os.Exit(1)
 }
@@ -53,8 +135,12 @@ func FatalErrorRespectJSON(format string, args ...interface{}) {
 //
 //	FatalErrorWithHint("database not found", "Run 'bd init' to create a database")
 func FatalErrorWithHint(message, hint string) {
-	fmt.Fprintf(os.Stderr, "Error: %s\n", message)
-	fmt.Fprintf(os.Stderr, "Hint: %s\n", hint)
+	if jsonOutput {
+		jsonStderrError(message, hint)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+		fmt.Fprintf(os.Stderr, "Hint: %s\n", hint)
+	}
 	os.Exit(1)
 }
 

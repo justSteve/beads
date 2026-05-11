@@ -4,12 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -22,7 +21,6 @@ var resetCmd = &cobra.Command{
 This command removes:
   - The .beads directory (database, JSONL, config)
   - Git hooks installed by bd
-  - Merge driver configuration
   - Sync branch worktrees
 
 By default, shows what would be deleted (dry-run mode).
@@ -40,6 +38,9 @@ func init() {
 }
 
 func runReset(cmd *cobra.Command, args []string) {
+	if err := requireServerMode("reset"); err != nil {
+		FatalError("%v", err)
+	}
 	CheckReadonly("reset")
 
 	force, _ := cmd.Flags().GetBool("force")
@@ -57,9 +58,9 @@ func runReset(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Check if .beads directory exists
-	beadsDir := ".beads"
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+	// Resolve .beads directory (worktree-aware)
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"message": "beads not initialized",
@@ -94,18 +95,6 @@ type resetItem struct {
 func collectResetItems(gitCommonDir, beadsDir string) []resetItem {
 	var items []resetItem
 
-	// Check for running daemon
-	pidFile := filepath.Join(beadsDir, "daemon.pid")
-	if _, err := os.Stat(pidFile); err == nil {
-		if isRunning, pid := isDaemonRunning(pidFile); isRunning {
-			items = append(items, resetItem{
-				Type:        "daemon",
-				Path:        pidFile,
-				Description: fmt.Sprintf("Stop running daemon (PID %d)", pid),
-			})
-		}
-	}
-
 	// Check for git hooks (hooks are in common git dir, shared across worktrees)
 	hookNames := []string{"pre-commit", "post-merge", "pre-push", "post-checkout"}
 	hooksDir := filepath.Join(gitCommonDir, "hooks")
@@ -121,24 +110,6 @@ func collectResetItems(gitCommonDir, beadsDir string) []resetItem {
 				})
 			}
 		}
-	}
-
-	// Check for merge driver config
-	if hasMergeDriverConfig() {
-		items = append(items, resetItem{
-			Type:        "config",
-			Path:        "merge.beads.*",
-			Description: "Remove merge driver configuration",
-		})
-	}
-
-	// Check for .gitattributes entry
-	if hasGitattributesEntry() {
-		items = append(items, resetItem{
-			Type:        "gitattributes",
-			Path:        ".gitattributes",
-			Description: "Remove beads entry from .gitattributes",
-		})
 	}
 
 	// Check for sync branch worktrees (in common git dir, shared across worktrees)
@@ -181,23 +152,6 @@ func isBdHook(hookPath string) bool {
 	return false
 }
 
-func hasMergeDriverConfig() bool {
-	cmd := exec.Command("git", "config", "--get", "merge.beads.driver")
-	if err := cmd.Run(); err == nil {
-		return true
-	}
-	return false
-}
-
-func hasGitattributesEntry() bool {
-	// #nosec G304 -- fixed path
-	content, err := os.ReadFile(".gitattributes")
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(content), "merge=beads")
-}
-
 func showResetPreview(items []resetItem) {
 	if jsonOutput {
 		outputJSON(map[string]interface{}{
@@ -206,7 +160,6 @@ func showResetPreview(items []resetItem) {
 		})
 		return
 	}
-
 
 	fmt.Println(ui.RenderWarn("Reset preview (dry-run mode)"))
 	fmt.Println()
@@ -226,19 +179,12 @@ func showResetPreview(items []resetItem) {
 	fmt.Printf("To proceed, run: %s\n", ui.RenderWarn("bd reset --force"))
 }
 
-func performReset(items []resetItem, _, beadsDir string) {
+func performReset(items []resetItem, _, _ string) {
 
 	var errors []string
 
 	for _, item := range items {
 		switch item.Type {
-		case "daemon":
-			pidFile := filepath.Join(beadsDir, "daemon.pid")
-			stopDaemonQuiet(pidFile)
-			if !jsonOutput {
-				fmt.Printf("%s Stopped daemon\n", ui.RenderPass("✓"))
-			}
-
 		case "hook":
 			if err := os.Remove(item.Path); err != nil {
 				errors = append(errors, fmt.Sprintf("failed to remove hook %s: %v", item.Path, err))
@@ -251,21 +197,6 @@ func performReset(items []resetItem, _, beadsDir string) {
 				if err := os.Rename(backupPath, item.Path); err == nil && !jsonOutput {
 					fmt.Printf("  Restored backup hook\n")
 				}
-			}
-
-		case "config":
-			// Remove merge driver config (ignore errors - may not exist)
-			_ = exec.Command("git", "config", "--unset", "merge.beads.driver").Run()
-			_ = exec.Command("git", "config", "--unset", "merge.beads.name").Run()
-			if !jsonOutput {
-				fmt.Printf("%s Removed merge driver config\n", ui.RenderPass("✓"))
-			}
-
-		case "gitattributes":
-			if err := removeGitattributesEntry(); err != nil {
-				errors = append(errors, fmt.Sprintf("failed to update .gitattributes: %v", err))
-			} else if !jsonOutput {
-				fmt.Printf("%s Updated .gitattributes\n", ui.RenderPass("✓"))
 			}
 
 		case "worktrees":
@@ -307,80 +238,4 @@ func performReset(items []resetItem, _, beadsDir string) {
 		fmt.Println()
 		fmt.Println("To reinitialize beads, run: bd init")
 	}
-}
-
-// stopDaemonQuiet stops the daemon without printing status messages
-func stopDaemonQuiet(pidFile string) {
-	isRunning, pid := isDaemonRunning(pidFile)
-	if !isRunning {
-		return
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-
-	_ = sendStopSignal(process) // Best-effort graceful stop
-
-	// Wait for daemon to stop gracefully
-	for i := 0; i < daemonShutdownAttempts; i++ {
-		time.Sleep(daemonShutdownPollInterval)
-		if isRunning, _ := isDaemonRunning(pidFile); !isRunning {
-			return
-		}
-	}
-
-	// Force kill if still running
-	_ = process.Kill() // Best-effort force kill, process may have already exited
-}
-
-func removeGitattributesEntry() error {
-	// #nosec G304 -- fixed path
-	content, err := os.ReadFile(".gitattributes")
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(content), "\n")
-	var newLines []string
-	skipNextEmpty := false
-	
-	for _, line := range lines {
-		// Skip lines containing beads merge configuration
-		if strings.Contains(line, "merge=beads") {
-			skipNextEmpty = true
-			continue
-		}
-		
-		// Skip beads-related comment lines
-		if strings.Contains(line, "Use bd merge for beads JSONL files") {
-			skipNextEmpty = true
-			continue
-		}
-		
-		// Skip empty lines that follow removed beads entries
-		if skipNextEmpty && strings.TrimSpace(line) == "" {
-			continue
-		}
-		
-		skipNextEmpty = false
-		
-		// Keep the line
-		newLines = append(newLines, line)
-	}
-
-	newContent := strings.Join(newLines, "\n")
-	// Remove trailing empty lines
-	newContent = strings.TrimRight(newContent, "\n")
-
-	// If file is now empty or only whitespace, remove it
-	if strings.TrimSpace(newContent) == "" {
-		return os.Remove(".gitattributes")
-	}
-
-	// Add single trailing newline
-	newContent += "\n"
-	//nolint:gosec // G306: .gitattributes must be world-readable (0644)
-	return os.WriteFile(".gitattributes", []byte(newContent), 0644)
 }

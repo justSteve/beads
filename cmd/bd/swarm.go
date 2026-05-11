@@ -3,14 +3,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/factory"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -28,24 +28,24 @@ with dependencies forming a DAG (directed acyclic graph) of work.`,
 
 // SwarmAnalysis holds the results of analyzing an epic's structure for swarming.
 type SwarmAnalysis struct {
-	EpicID          string                  `json:"epic_id"`
-	EpicTitle       string                  `json:"epic_title"`
-	TotalIssues     int                     `json:"total_issues"`
-	ClosedIssues    int                     `json:"closed_issues"`
-	ReadyFronts     []ReadyFront            `json:"ready_fronts"`
-	MaxParallelism  int                     `json:"max_parallelism"`
+	EpicID            string                `json:"epic_id"`
+	EpicTitle         string                `json:"epic_title"`
+	TotalIssues       int                   `json:"total_issues"`
+	ClosedIssues      int                   `json:"closed_issues"`
+	ReadyFronts       []ReadyFront          `json:"ready_fronts"`
+	MaxParallelism    int                   `json:"max_parallelism"`
 	EstimatedSessions int                   `json:"estimated_sessions"`
-	Warnings        []string                `json:"warnings"`
-	Errors          []string                `json:"errors"`
-	Swarmable       bool                    `json:"swarmable"`
-	Issues          map[string]*IssueNode   `json:"issues,omitempty"` // Only included with --verbose
+	Warnings          []string              `json:"warnings"`
+	Errors            []string              `json:"errors"`
+	Swarmable         bool                  `json:"swarmable"`
+	Issues            map[string]*IssueNode `json:"issues,omitempty"` // Only included with --verbose
 }
 
 // ReadyFront represents a group of issues that can be worked on in parallel.
 type ReadyFront struct {
-	Wave    int      `json:"wave"`
-	Issues  []string `json:"issues"`
-	Titles  []string `json:"titles,omitempty"` // Only for human output
+	Wave   int      `json:"wave"`
+	Issues []string `json:"issues"`
+	Titles []string `json:"titles,omitempty"` // Only for human output
 }
 
 // IssueNode represents an issue in the dependency graph.
@@ -160,16 +160,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve epic ID
@@ -626,16 +617,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve ID
@@ -647,10 +629,10 @@ Examples:
 		// Get the issue
 		issue, err := store.GetIssue(ctx, issueID)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalErrorRespectJSON("issue '%s' not found", issueID)
+			}
 			FatalErrorRespectJSON("failed to get issue: %v", err)
-		}
-		if issue == nil {
-			FatalErrorRespectJSON("issue '%s' not found", issueID)
 		}
 
 		var epic *types.Issue
@@ -786,16 +768,16 @@ func getSwarmStatus(ctx context.Context, s SwarmStorage, epic *types.Issue) (*Sw
 
 	// Sort each category by ID for consistent output
 	sort.Slice(status.Completed, func(i, j int) bool {
-		return status.Completed[i].ID < status.Completed[j].ID
+		return utils.NaturalCompareIDs(status.Completed[i].ID, status.Completed[j].ID) < 0
 	})
 	sort.Slice(status.Active, func(i, j int) bool {
-		return status.Active[i].ID < status.Active[j].ID
+		return utils.NaturalCompareIDs(status.Active[i].ID, status.Active[j].ID) < 0
 	})
 	sort.Slice(status.Ready, func(i, j int) bool {
-		return status.Ready[i].ID < status.Ready[j].ID
+		return utils.NaturalCompareIDs(status.Ready[i].ID, status.Ready[j].ID) < 0
 	})
 	sort.Slice(status.Blocked, func(i, j int) bool {
-		return status.Blocked[i].ID < status.Blocked[j].ID
+		return utils.NaturalCompareIDs(status.Blocked[i].ID, status.Blocked[j].ID) < 0
 	})
 
 	// Compute counts and progress
@@ -908,9 +890,9 @@ If given a single issue (not an epic), it will be auto-wrapped:
 - Then creates the swarm molecule for that epic
 
 Examples:
-  bd swarm create gt-epic-123                          # Create swarm for epic
-  bd swarm create gt-epic-123 --coordinator=witness/   # With specific coordinator
-  bd swarm create gt-task-456                          # Auto-wrap single issue`,
+  bd swarm create bd-epic-123                          # Create swarm for epic
+  bd swarm create bd-epic-123 --coordinator=observer/   # With specific coordinator
+  bd swarm create bd-task-456                          # Auto-wrap single issue`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("swarm create")
@@ -920,16 +902,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Resolve the input ID
@@ -941,10 +914,10 @@ Examples:
 		// Get the issue
 		issue, err := store.GetIssue(ctx, inputID)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalErrorRespectJSON("issue '%s' not found", inputID)
+			}
 			FatalErrorRespectJSON("failed to get issue: %v", err)
-		}
-		if issue == nil {
-			FatalErrorRespectJSON("issue '%s' not found", inputID)
 		}
 
 		var epicID string
@@ -1000,8 +973,8 @@ Examples:
 		if existingSwarm != nil && !force {
 			if jsonOutput {
 				outputJSON(map[string]interface{}{
-					"error":         "swarm already exists",
-					"existing_id":   existingSwarm.ID,
+					"error":          "swarm already exists",
+					"existing_id":    existingSwarm.ID,
 					"existing_title": existingSwarm.Title,
 				})
 			} else {
@@ -1064,6 +1037,8 @@ Examples:
 			FatalErrorRespectJSON("failed to link swarm to epic: %v", err)
 		}
 
+		commandDidWrite.Store(true)
+
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"swarm_id":    swarmMol.ID,
@@ -1102,16 +1077,7 @@ Examples:
 
 		// Swarm commands require direct store access
 		if store == nil {
-			if daemonClient != nil {
-				var err error
-				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
-				if err != nil {
-					FatalErrorRespectJSON("failed to open database: %v", err)
-				}
-				defer func() { _ = store.Close() }()
-			} else {
-				FatalErrorRespectJSON("no database connection")
-			}
+			FatalErrorRespectJSON("no database connection")
 		}
 
 		// Query for all swarm molecules
@@ -1211,7 +1177,7 @@ Examples:
 
 func init() {
 	swarmValidateCmd.Flags().Bool("verbose", false, "Include detailed issue graph in output")
-	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., gastown/witness)")
+	swarmCreateCmd.Flags().String("coordinator", "", "Coordinator address (e.g., my-project/witness)")
 	swarmCreateCmd.Flags().Bool("force", false, "Create new swarm even if one already exists")
 
 	swarmCmd.AddCommand(swarmValidateCmd)

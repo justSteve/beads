@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,51 +17,24 @@ type CleanupEmptyResponse struct {
 	Ephemeral    bool   `json:"ephemeral,omitempty"`
 }
 
-// Hard delete mode: bypass tombstone TTL safety, use --older-than days directly
-
-// showCleanupDeprecationHint shows a hint about bd doctor --fix
-func showCleanupDeprecationHint() {
-	fmt.Fprintln(os.Stderr, ui.RenderMuted("💡 Tip: 'bd doctor --fix' can now cleanup stale issues and prune tombstones"))
-}
-
 var cleanupCmd = &cobra.Command{
 	Use:   "cleanup",
-	Short: "Delete closed issues and prune expired tombstones",
-	Long: `Delete closed issues and prune expired tombstones to reduce database size.
+	Short: "Delete closed issues to reduce database size",
+	Long: `Delete closed issues to reduce database size.
 
-This command:
-1. Converts closed issues to tombstones (soft delete)
-2. Prunes expired tombstones (older than 30 days) from issues.jsonl
+This command permanently removes closed issues from the database.
 
-It does NOT remove temporary files - use 'bd clean' for that.
+NOTE: This command only manages issue lifecycle (closed -> deleted). For general
+health checks and automatic repairs, use 'bd doctor --fix' instead.
 
 By default, deletes ALL closed issues. Use --older-than to only delete
 issues closed before a certain date.
 
-HARD DELETE MODE:
-Use --hard to bypass the 30-day tombstone safety period. When combined with
---older-than, tombstones older than N days are permanently removed from JSONL.
-This is useful for cleaning house when you know old clones won't resurrect issues.
-
-WARNING: --hard bypasses sync safety. Deleted issues may resurrect if an old
-clone syncs before you've cleaned up all clones.
-
 EXAMPLES:
-Delete all closed issues and prune tombstones:
-  bd cleanup --force
-
-Delete issues closed more than 30 days ago:
-  bd cleanup --older-than 30 --force
-
-Delete only closed wisps (transient molecules):
-  bd cleanup --ephemeral --force
-
-Preview what would be deleted/pruned:
-  bd cleanup --dry-run
-  bd cleanup --older-than 90 --dry-run
-
-Hard delete: permanently remove issues/tombstones older than 3 days:
-  bd cleanup --older-than 3 --hard --force
+  bd admin cleanup --force                          # Delete all closed issues
+  bd admin cleanup --older-than 30 --force          # Only issues closed 30+ days ago
+  bd admin cleanup --ephemeral --force              # Only closed wisps (transient molecules)
+  bd admin cleanup --dry-run                        # Preview what would be deleted
 
 SAFETY:
 - Requires --force flag to actually delete (unless --dry-run)
@@ -71,43 +43,22 @@ SAFETY:
 - Use --json for programmatic output
 
 SEE ALSO:
-  bd clean      Remove temporary git merge artifacts
-  bd compact    Run compaction on issues`,
+  bd doctor --fix    Automatic health checks and repairs (recommended for routine maintenance)
+  bd admin compact   Compact old closed issues to save space`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if err := requireServerMode("cleanup"); err != nil {
+			FatalError("%v", err)
+		}
 		force, _ := cmd.Flags().GetBool("force")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		cascade, _ := cmd.Flags().GetBool("cascade")
 		olderThanDays, _ := cmd.Flags().GetInt("older-than")
-		hardDelete, _ := cmd.Flags().GetBool("hard")
 		wispOnly, _ := cmd.Flags().GetBool("ephemeral")
 
-		// Calculate custom TTL for --hard mode
-		// When --hard is set, use --older-than days as the tombstone TTL cutoff
-		// This bypasses the default 30-day tombstone safety period
-		var customTTL time.Duration
-		if hardDelete {
-			if olderThanDays > 0 {
-				customTTL = time.Duration(olderThanDays) * 24 * time.Hour
-			} else {
-				// --hard without --older-than: prune ALL tombstones immediately
-				// Negative TTL means "immediately expired" (bd-4q8 fix)
-				customTTL = -1
-			}
-			if !jsonOutput && !dryRun {
-				fmt.Println(ui.RenderWarn("⚠️  HARD DELETE MODE: Bypassing tombstone TTL safety"))
-			}
-		}
-
 		// Ensure we have storage
-		if daemonClient != nil {
-			if err := ensureDirectMode("daemon does not support delete command"); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store == nil {
+		if store == nil {
 			if err := ensureStoreActive(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 		}
 
@@ -134,8 +85,7 @@ SEE ALSO:
 		// Get all closed issues matching filter
 		closedIssues, err := store.SearchIssues(ctx, "", filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
-			os.Exit(1)
+			FatalError("listing issues: %v", err)
 		}
 
 		// Filter out pinned issues - they are protected from cleanup (bd-b2k)
@@ -193,8 +143,9 @@ SEE ALSO:
 			if wispOnly {
 				issueType = "closed wisp"
 			}
-			fmt.Fprintf(os.Stderr, "Would delete %d %s issue(s). Use --force to confirm or --dry-run to preview.\n", len(issueIDs), issueType)
-			os.Exit(1)
+			FatalErrorWithHint(
+				fmt.Sprintf("would delete %d %s issue(s)", len(issueIDs), issueType),
+				"Use --force to confirm or --dry-run to preview.")
 		}
 
 		if !jsonOutput {
@@ -214,52 +165,7 @@ SEE ALSO:
 		}
 
 		// Use the existing batch deletion logic
-		// Note: cleanup always creates tombstones first; --hard prunes them after
 		deleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, false, "cleanup")
-
-		// Also prune expired tombstones
-		// This runs after closed issues are converted to tombstones, cleaning up old ones
-		// In --hard mode, customTTL overrides the default 30-day TTL
-		if dryRun {
-			// Preview what tombstones would be pruned
-			tombstoneResult, err := previewPruneTombstones(customTTL)
-			if err != nil {
-				if !jsonOutput {
-					fmt.Fprintf(os.Stderr, "Warning: failed to check tombstones: %v\n", err)
-				}
-			} else if tombstoneResult != nil && tombstoneResult.PrunedCount > 0 {
-				if !jsonOutput {
-					ttlMsg := fmt.Sprintf("older than %d days", tombstoneResult.TTLDays)
-					if hardDelete && olderThanDays == 0 {
-						ttlMsg = "all tombstones (--hard mode)"
-					}
-					fmt.Printf("\nExpired tombstones that would be pruned: %d (%s)\n",
-						tombstoneResult.PrunedCount, ttlMsg)
-				}
-			}
-		} else if force {
-			// Actually prune expired tombstones
-			tombstoneResult, err := pruneExpiredTombstones(customTTL)
-			if err != nil {
-				if !jsonOutput {
-					fmt.Fprintf(os.Stderr, "Warning: failed to prune expired tombstones: %v\n", err)
-				}
-			} else if tombstoneResult != nil && tombstoneResult.PrunedCount > 0 {
-				if !jsonOutput {
-					ttlMsg := fmt.Sprintf("older than %d days", tombstoneResult.TTLDays)
-					if hardDelete && olderThanDays == 0 {
-						ttlMsg = "all tombstones (--hard mode)"
-					}
-					fmt.Printf("\n%s Pruned %d expired tombstone(s) (%s)\n",
-						ui.RenderPass("✓"), tombstoneResult.PrunedCount, ttlMsg)
-				}
-			}
-		}
-
-		// bd-bqcc: Show hint about doctor --fix consolidation
-		if !jsonOutput {
-			showCleanupDeprecationHint()
-		}
 	},
 }
 
@@ -268,7 +174,6 @@ func init() {
 	cleanupCmd.Flags().Bool("dry-run", false, "Preview what would be deleted without making changes")
 	cleanupCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
 	cleanupCmd.Flags().Int("older-than", 0, "Only delete issues closed more than N days ago (0 = all closed issues)")
-	cleanupCmd.Flags().Bool("hard", false, "Bypass tombstone TTL safety; use --older-than days as cutoff")
 	cleanupCmd.Flags().Bool("ephemeral", false, "Only delete closed wisps (transient molecules)")
 	// Note: cleanupCmd is added to adminCmd in admin.go
 }

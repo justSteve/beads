@@ -67,7 +67,7 @@ func (r *Runner) Run(event string, issue *types.Issue) {
 
 	// Run asynchronously (ignore error as this is fire-and-forget)
 	go func() {
-		_ = r.runHook(hookPath, event, issue)
+		_ = r.runHook(hookPath, event, issue) // Best effort: hook failures should not block the triggering operation
 	}()
 }
 
@@ -108,6 +108,18 @@ func (r *Runner) HookExists(event string) bool {
 	}
 
 	return info.Mode()&0111 != 0
+}
+
+// maxOutputBytes is the maximum number of bytes captured from hook stdout/stderr
+// before truncation. Keeps span attributes reasonably sized.
+const maxOutputBytes = 1024
+
+// truncateOutput truncates hook output to maxOutputBytes, appending a note when truncated.
+func truncateOutput(s string) string {
+	if len(s) <= maxOutputBytes {
+		return s
+	}
+	return s[:maxOutputBytes] + "... (truncated)"
 }
 
 func eventToHook(event string) string {

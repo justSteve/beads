@@ -8,26 +8,31 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync"
 	"text/template"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/steveyegge/beads/internal/audit"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
-	defaultModel   = "claude-3-5-haiku-20241022"
 	maxRetries     = 3
 	initialBackoff = 1 * time.Second
 )
 
-// ErrAPIKeyRequired is returned when an API key is needed but not provided.
-var ErrAPIKeyRequired = errors.New("API key required")
+// errAPIKeyRequired is returned when an API key is needed but not provided.
+var errAPIKeyRequired = errors.New("API key required")
 
-// HaikuClient wraps the Anthropic API for issue summarization.
-type HaikuClient struct {
+// haikuClient wraps the Anthropic API for issue summarization.
+type haikuClient struct {
 	client         anthropic.Client
 	model          anthropic.Model
 	tier1Template  *template.Template
@@ -37,14 +42,17 @@ type HaikuClient struct {
 	auditActor     string
 }
 
-// NewHaikuClient creates a new Haiku API client. Env var ANTHROPIC_API_KEY takes precedence over explicit apiKey.
-func NewHaikuClient(apiKey string) (*HaikuClient, error) {
+// newHaikuClient creates a new Haiku API client.
+// API key resolution order: ANTHROPIC_API_KEY env var > ai.api_key config > explicit apiKey parameter.
+func newHaikuClient(apiKey string) (*haikuClient, error) {
 	envKey := os.Getenv("ANTHROPIC_API_KEY")
 	if envKey != "" {
 		apiKey = envKey
+	} else if configKey := config.GetString("ai.api_key"); configKey != "" {
+		apiKey = configKey
 	}
 	if apiKey == "" {
-		return nil, fmt.Errorf("%w: set ANTHROPIC_API_KEY environment variable or provide via config", ErrAPIKeyRequired)
+		return nil, fmt.Errorf("%w: set ANTHROPIC_API_KEY environment variable or ai.api_key in config", errAPIKeyRequired)
 	}
 
 	client := anthropic.NewClient(option.WithAPIKey(apiKey))
@@ -54,9 +62,11 @@ func NewHaikuClient(apiKey string) (*HaikuClient, error) {
 		return nil, fmt.Errorf("failed to parse tier1 template: %w", err)
 	}
 
-	return &HaikuClient{
+	aiMetricsOnce.Do(initAIMetrics)
+
+	return &haikuClient{
 		client:         client,
-		model:          defaultModel,
+		model:          config.DefaultAIModel(),
 		tier1Template:  tier1Tmpl,
 		maxRetries:     maxRetries,
 		initialBackoff: initialBackoff,
@@ -64,7 +74,7 @@ func NewHaikuClient(apiKey string) (*HaikuClient, error) {
 }
 
 // SummarizeTier1 creates a structured summary of an issue (Summary, Key Decisions, Resolution).
-func (h *HaikuClient) SummarizeTier1(ctx context.Context, issue *types.Issue) (string, error) {
+func (h *haikuClient) SummarizeTier1(ctx context.Context, issue *types.Issue) (string, error) {
 	prompt, err := h.renderTier1Prompt(issue)
 	if err != nil {
 		return "", fmt.Errorf("failed to render prompt: %w", err)
@@ -77,19 +87,52 @@ func (h *HaikuClient) SummarizeTier1(ctx context.Context, issue *types.Issue) (s
 			Kind:     "llm_call",
 			Actor:    h.auditActor,
 			IssueID:  issue.ID,
-			Model:    string(h.model),
+			Model:    h.model,
 			Prompt:   prompt,
 			Response: resp,
 		}
 		if callErr != nil {
 			e.Error = callErr.Error()
 		}
-		_, _ = audit.Append(e)
+		_, _ = audit.Append(e) // Best effort: audit logging must never fail compaction
 	}
 	return resp, callErr
 }
 
-func (h *HaikuClient) callWithRetry(ctx context.Context, prompt string) (string, error) {
+// aiMetrics holds lazily-initialized OTel instruments for Anthropic API calls.
+var aiMetrics struct {
+	inputTokens  metric.Int64Counter
+	outputTokens metric.Int64Counter
+	duration     metric.Float64Histogram
+}
+
+var aiMetricsOnce sync.Once
+
+func initAIMetrics() {
+	m := telemetry.Meter("github.com/steveyegge/beads/ai")
+	aiMetrics.inputTokens, _ = m.Int64Counter("bd.ai.input_tokens",
+		metric.WithDescription("Anthropic API input tokens consumed"),
+		metric.WithUnit("{token}"),
+	)
+	aiMetrics.outputTokens, _ = m.Int64Counter("bd.ai.output_tokens",
+		metric.WithDescription("Anthropic API output tokens generated"),
+		metric.WithUnit("{token}"),
+	)
+	aiMetrics.duration, _ = m.Float64Histogram("bd.ai.request.duration",
+		metric.WithDescription("Anthropic API request duration in milliseconds"),
+		metric.WithUnit("ms"),
+	)
+}
+
+func (h *haikuClient) callWithRetry(ctx context.Context, prompt string) (string, error) {
+	tracer := telemetry.Tracer("github.com/steveyegge/beads/ai")
+	ctx, span := tracer.Start(ctx, "anthropic.messages.new")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("bd.ai.model", h.model),
+		attribute.String("bd.ai.operation", "compact"),
+	)
+
 	var lastErr error
 	params := anthropic.MessageNewParams{
 		Model:     h.model,
@@ -109,9 +152,24 @@ func (h *HaikuClient) callWithRetry(ctx context.Context, prompt string) (string,
 			}
 		}
 
+		t0 := time.Now()
 		message, err := h.client.Messages.New(ctx, params)
+		ms := float64(time.Since(t0).Milliseconds())
 
 		if err == nil {
+			// Record token usage and latency.
+			modelAttr := attribute.String("bd.ai.model", h.model)
+			if aiMetrics.inputTokens != nil {
+				aiMetrics.inputTokens.Add(ctx, message.Usage.InputTokens, metric.WithAttributes(modelAttr))
+				aiMetrics.outputTokens.Add(ctx, message.Usage.OutputTokens, metric.WithAttributes(modelAttr))
+				aiMetrics.duration.Record(ctx, ms, metric.WithAttributes(modelAttr))
+			}
+			span.SetAttributes(
+				attribute.Int64("bd.ai.input_tokens", message.Usage.InputTokens),
+				attribute.Int64("bd.ai.output_tokens", message.Usage.OutputTokens),
+				attribute.Int("bd.ai.attempts", attempt+1),
+			)
+
 			if len(message.Content) > 0 {
 				content := message.Content[0]
 				if content.Type == "text" {
@@ -129,10 +187,16 @@ func (h *HaikuClient) callWithRetry(ctx context.Context, prompt string) (string,
 		}
 
 		if !isRetryable(err) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return "", fmt.Errorf("non-retryable error: %w", err)
 		}
 	}
 
+	if lastErr != nil {
+		span.RecordError(lastErr)
+		span.SetStatus(codes.Error, lastErr.Error())
+	}
 	return "", fmt.Errorf("failed after %d retries: %w", h.maxRetries+1, lastErr)
 }
 
@@ -170,7 +234,7 @@ type tier1Data struct {
 	Notes              string
 }
 
-func (h *HaikuClient) renderTier1Prompt(issue *types.Issue) (string, error) {
+func (h *haikuClient) renderTier1Prompt(issue *types.Issue) (string, error) {
 	var buf []byte
 	w := &bytesWriter{buf: buf}
 

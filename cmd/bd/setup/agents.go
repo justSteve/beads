@@ -5,8 +5,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/templates/agents"
+	"github.com/steveyegge/beads/internal/utils"
 )
+
+// readFileBytesImpl is used in tests; avoids import cycle.
+var readFileBytesImpl = os.ReadFile
 
 // AGENTS.md integration markers for beads section
 const (
@@ -14,98 +22,13 @@ const (
 	agentsEndMarker   = "<!-- END BEADS INTEGRATION -->"
 )
 
-const agentsBeadsSection = `<!-- BEGIN BEADS INTEGRATION -->
-## Issue Tracking with bd (beads)
-
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
-
-### Why bd?
-
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Auto-syncs to JSONL for version control
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
-
-### Quick Start
-
-**Check for ready work:**
-
-` + "```bash" + `
-bd ready --json
-` + "```" + `
-
-**Create new issues:**
-
-` + "```bash" + `
-bd create "Issue title" --description="Detailed context" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" --description="What this issue is about" -p 1 --deps discovered-from:bd-123 --json
-` + "```" + `
-
-**Claim and update:**
-
-` + "```bash" + `
-bd update bd-42 --status in_progress --json
-bd update bd-42 --priority 1 --json
-` + "```" + `
-
-**Complete work:**
-
-` + "```bash" + `
-bd close bd-42 --reason "Completed" --json
-` + "```" + `
-
-### Issue Types
-
-- ` + "`bug`" + ` - Something broken
-- ` + "`feature`" + ` - New functionality
-- ` + "`task`" + ` - Work item (tests, docs, refactoring)
-- ` + "`epic`" + ` - Large feature with subtasks
-- ` + "`chore`" + ` - Maintenance (dependencies, tooling)
-
-### Priorities
-
-- ` + "`0`" + ` - Critical (security, data loss, broken builds)
-- ` + "`1`" + ` - High (major features, important bugs)
-- ` + "`2`" + ` - Medium (default, nice-to-have)
-- ` + "`3`" + ` - Low (polish, optimization)
-- ` + "`4`" + ` - Backlog (future ideas)
-
-### Workflow for AI Agents
-
-1. **Check ready work**: ` + "`bd ready`" + ` shows unblocked issues
-2. **Claim your task**: ` + "`bd update <id> --status in_progress`" + `
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - ` + "`bd create \"Found bug\" --description=\"Details about what was found\" -p 1 --deps discovered-from:<parent-id>`" + `
-5. **Complete**: ` + "`bd close <id> --reason \"Done\"`" + `
-
-### Auto-Sync
-
-bd automatically syncs with git:
-
-- Exports to ` + "`.beads/issues.jsonl`" + ` after changes (5s debounce)
-- Imports from JSONL when newer (e.g., after ` + "`git pull`" + `)
-- No manual export/import needed!
-
-### Important Rules
-
-- ✅ Use bd for ALL task tracking
-- ✅ Always use ` + "`--json`" + ` flag for programmatic use
-- ✅ Link discovered work with ` + "`discovered-from`" + ` dependencies
-- ✅ Check ` + "`bd ready`" + ` before asking "what should I work on?"
-- ❌ Do NOT create markdown TODO lists
-- ❌ Do NOT use external issue trackers
-- ❌ Do NOT duplicate tracking systems
-
-For more details, see README.md and docs/QUICKSTART.md.
-
-<!-- END BEADS INTEGRATION -->
-`
-
 var (
 	errAgentsFileMissing   = errors.New("agents file not found")
 	errBeadsSectionMissing = errors.New("beads section missing")
+	errBeadsSectionStale   = errors.New("beads section is stale")
 )
+
+const muxAgentInstructionsURL = "https://mux.coder.com/AGENTS.md"
 
 type agentsEnv struct {
 	agentsPath string
@@ -117,21 +40,72 @@ type agentsIntegration struct {
 	name         string
 	setupCommand string
 	readHint     string
+	docsURL      string
+	profile      agents.Profile // "full" or "minimal"; empty defaults to "full"
 }
 
 func defaultAgentsEnv() agentsEnv {
 	return agentsEnv{
-		agentsPath: "AGENTS.md",
+		agentsPath: config.SafeAgentsFile(),
 		stdout:     os.Stdout,
 		stderr:     os.Stderr,
 	}
 }
 
+// detectRenderOptsImpl checks whether a Dolt sync remote is configured and returns
+// appropriate RenderOpts. When no remote is configured, the rendered template
+// omits "bd dolt push" from session-completion instructions.
+// Exposed as a variable so tests can override.
+var detectRenderOptsImpl = func() agents.RenderOpts {
+	return agents.RenderOpts{
+		HasRemote: config.GetString("sync.remote") != "" || config.GetString("sync.git-remote") != "",
+	}
+}
+
+func detectRenderOpts() agents.RenderOpts {
+	return detectRenderOptsImpl()
+}
+
+// containsBeadsMarker returns true if content contains a BEGIN BEADS INTEGRATION marker
+// (either legacy or new format with metadata).
+func containsBeadsMarker(content string) bool {
+	return strings.Contains(content, "<!-- BEGIN BEADS INTEGRATION")
+}
+
+// resolveProfile returns the integration's profile, defaulting to full.
+func resolveProfile(integration agentsIntegration) agents.Profile {
+	if integration.profile != "" {
+		return integration.profile
+	}
+	return agents.ProfileFull
+}
+
+func agentsFileName(path string) string {
+	base := filepath.Base(path)
+	if base == "" || base == "." {
+		return path
+	}
+	return base
+}
+
 func installAgents(env agentsEnv, integration agentsIntegration) error {
 	_, _ = fmt.Fprintf(env.stdout, "Installing %s integration...\n", integration.name)
+	agentsFile := agentsFileName(env.agentsPath)
+
+	profile := resolveProfile(integration)
+	opts := detectRenderOpts()
+
+	// Resolve symlinks so that e.g. CLAUDE.md -> AGENTS.md writes to the real target.
+	// This uses the existing atomicWriteFile path which also calls ResolveForWrite,
+	// but we need the resolved path here to read the current content from the right place.
+	resolvedPath, err := utils.ResolveForWrite(env.agentsPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(env.stderr, "Error: resolve path %s: %v\n", env.agentsPath, err)
+		return err
+	}
 
 	var currentContent string
-	data, err := os.ReadFile(env.agentsPath)
+	data, err := os.ReadFile(resolvedPath) // #nosec G304 -- resolvedPath is derived from env.agentsPath via ResolveForWrite
 	if err == nil {
 		currentContent = string(data)
 	} else if !os.IsNotExist(err) {
@@ -139,29 +113,42 @@ func installAgents(env agentsEnv, integration agentsIntegration) error {
 		return err
 	}
 
+	// Profile precedence: if the file already has a full profile and we're
+	// requesting minimal, preserve full to avoid information loss (e.g. when
+	// CLAUDE.md is a symlink to AGENTS.md and both Claude and Codex target it).
+	if currentContent != "" && containsBeadsMarker(currentContent) {
+		existingProfile := existingBeadsProfile(currentContent)
+		if existingProfile == agents.ProfileFull && profile == agents.ProfileMinimal {
+			_, _ = fmt.Fprintf(env.stdout, "  ℹ File already has full profile; preserving (higher-information) content\n")
+			profile = agents.ProfileFull
+		}
+	}
+
+	beadsSection := agents.RenderSectionWithOpts(profile, opts)
+
 	if currentContent != "" {
-		if strings.Contains(currentContent, agentsBeginMarker) {
-			newContent := updateBeadsSection(currentContent)
+		if containsBeadsMarker(currentContent) {
+			newContent := updateBeadsSectionWithOpts(currentContent, profile, opts)
 			if err := atomicWriteFile(env.agentsPath, []byte(newContent)); err != nil {
 				_, _ = fmt.Fprintf(env.stderr, "Error: write %s: %v\n", env.agentsPath, err)
 				return err
 			}
-			_, _ = fmt.Fprintln(env.stdout, "✓ Updated existing beads section in AGENTS.md")
+			_, _ = fmt.Fprintf(env.stdout, "✓ Updated existing beads section in %s\n", agentsFile)
 		} else {
-			newContent := currentContent + "\n\n" + agentsBeadsSection
+			newContent := currentContent + "\n\n" + beadsSection
 			if err := atomicWriteFile(env.agentsPath, []byte(newContent)); err != nil {
 				_, _ = fmt.Fprintf(env.stderr, "Error: write %s: %v\n", env.agentsPath, err)
 				return err
 			}
-			_, _ = fmt.Fprintln(env.stdout, "✓ Added beads section to existing AGENTS.md")
+			_, _ = fmt.Fprintf(env.stdout, "✓ Added beads section to existing %s\n", agentsFile)
 		}
 	} else {
-		newContent := createNewAgentsFile()
+		newContent := createNewAgentsFileWithOpts(profile, opts)
 		if err := atomicWriteFile(env.agentsPath, []byte(newContent)); err != nil {
 			_, _ = fmt.Fprintf(env.stderr, "Error: write %s: %v\n", env.agentsPath, err)
 			return err
 		}
-		_, _ = fmt.Fprintln(env.stdout, "✓ Created new AGENTS.md with beads integration")
+		_, _ = fmt.Fprintf(env.stdout, "✓ Created new %s with beads integration\n", agentsFile)
 	}
 
 	_, _ = fmt.Fprintf(env.stdout, "\n✓ %s integration installed\n", integration.name)
@@ -169,14 +156,19 @@ func installAgents(env agentsEnv, integration agentsIntegration) error {
 	if integration.readHint != "" {
 		_, _ = fmt.Fprintf(env.stdout, "\n%s\n", integration.readHint)
 	}
+	if integration.docsURL != "" {
+		_, _ = fmt.Fprintf(env.stdout, "Review guide: %s\n", integration.docsURL)
+	}
 	_, _ = fmt.Fprintln(env.stdout, "No additional configuration needed!")
 	return nil
 }
 
 func checkAgents(env agentsEnv, integration agentsIntegration) error {
+	agentsFile := agentsFileName(env.agentsPath)
+
 	data, err := os.ReadFile(env.agentsPath)
 	if os.IsNotExist(err) {
-		_, _ = fmt.Fprintln(env.stdout, "✗ AGENTS.md not found")
+		_, _ = fmt.Fprintf(env.stdout, "✗ %s not found\n", agentsFile)
 		_, _ = fmt.Fprintf(env.stdout, "  Run: %s\n", integration.setupCommand)
 		return errAgentsFileMissing
 	} else if err != nil {
@@ -185,22 +177,49 @@ func checkAgents(env agentsEnv, integration agentsIntegration) error {
 	}
 
 	content := string(data)
-	if strings.Contains(content, agentsBeginMarker) {
-		_, _ = fmt.Fprintf(env.stdout, "✓ %s integration installed: %s\n", integration.name, env.agentsPath)
-		_, _ = fmt.Fprintln(env.stdout, "  Beads section found in AGENTS.md")
+	if !containsBeadsMarker(content) {
+		_, _ = fmt.Fprintf(env.stdout, "⚠ %s exists but no beads section found\n", agentsFile)
+		_, _ = fmt.Fprintf(env.stdout, "  Run: %s (to add beads section)\n", integration.setupCommand)
+		return errBeadsSectionMissing
+	}
+
+	// Section exists — check freshness via profile and hash
+	profile := resolveProfile(integration)
+	existingProf := existingBeadsProfile(content)
+
+	// Extract hash from marker
+	idx := findBeginMarker(content)
+	line := content[idx:]
+	if nl := strings.Index(line, "\n"); nl != -1 {
+		line = line[:nl]
+	}
+	meta := agents.ParseMarker(line)
+
+	checkProfile := profile
+	if profile == agents.ProfileMinimal && existingProf == agents.ProfileFull {
+		// Accept full profile as current when a minimal integration targets the same
+		// file (typically via symlinks like CLAUDE.md -> AGENTS.md).
+		checkProfile = agents.ProfileFull
+	}
+
+	currentHash := agents.CurrentHashWithOpts(checkProfile, detectRenderOpts())
+	if meta != nil && meta.Hash == currentHash && existingProf == checkProfile {
+		_, _ = fmt.Fprintf(env.stdout, "✓ %s integration installed: %s (current)\n", integration.name, env.agentsPath)
 		return nil
 	}
 
-	_, _ = fmt.Fprintln(env.stdout, "⚠ AGENTS.md exists but no beads section found")
-	_, _ = fmt.Fprintf(env.stdout, "  Run: %s (to add beads section)\n", integration.setupCommand)
-	return errBeadsSectionMissing
+	// Stale or legacy section
+	_, _ = fmt.Fprintf(env.stdout, "⚠ %s integration installed but stale: %s\n", integration.name, env.agentsPath)
+	_, _ = fmt.Fprintf(env.stdout, "  Run: %s (to update)\n", integration.setupCommand)
+	return errBeadsSectionStale
 }
 
 func removeAgents(env agentsEnv, integration agentsIntegration) error {
 	_, _ = fmt.Fprintf(env.stdout, "Removing %s integration...\n", integration.name)
+	agentsFile := agentsFileName(env.agentsPath)
 	data, err := os.ReadFile(env.agentsPath)
 	if os.IsNotExist(err) {
-		_, _ = fmt.Fprintln(env.stdout, "No AGENTS.md file found")
+		_, _ = fmt.Fprintf(env.stdout, "No %s file found\n", agentsFile)
 		return nil
 	} else if err != nil {
 		_, _ = fmt.Fprintf(env.stderr, "Error: failed to read %s: %v\n", env.agentsPath, err)
@@ -208,83 +227,118 @@ func removeAgents(env agentsEnv, integration agentsIntegration) error {
 	}
 
 	content := string(data)
-	if !strings.Contains(content, agentsBeginMarker) {
-		_, _ = fmt.Fprintln(env.stdout, "No beads section found in AGENTS.md")
+	if !containsBeadsMarker(content) {
+		_, _ = fmt.Fprintf(env.stdout, "No beads section found in %s\n", agentsFile)
 		return nil
 	}
 
 	newContent := removeBeadsSection(content)
-	trimmed := strings.TrimSpace(newContent)
-	if trimmed == "" {
-		if err := os.Remove(env.agentsPath); err != nil {
-			_, _ = fmt.Fprintf(env.stderr, "Error: failed to remove %s: %v\n", env.agentsPath, err)
-			return err
-		}
-		_, _ = fmt.Fprintf(env.stdout, "✓ Removed %s (file was empty after removing beads section)\n", env.agentsPath)
-		return nil
-	}
 
 	if err := atomicWriteFile(env.agentsPath, []byte(newContent)); err != nil {
 		_, _ = fmt.Fprintf(env.stderr, "Error: write %s: %v\n", env.agentsPath, err)
 		return err
 	}
-	_, _ = fmt.Fprintln(env.stdout, "✓ Removed beads section from AGENTS.md")
+	_, _ = fmt.Fprintf(env.stdout, "✓ Removed beads section from %s\n", agentsFile)
 	return nil
 }
 
-// updateBeadsSection replaces the beads section in existing content
+// updateBeadsSection replaces the beads section in existing content using the full profile.
+// Kept for backward compatibility with existing callers and tests.
 func updateBeadsSection(content string) string {
-	start := strings.Index(content, agentsBeginMarker)
-	end := strings.Index(content, agentsEndMarker)
+	return updateBeadsSectionWithProfile(content, agents.ProfileFull)
+}
 
-	if start == -1 || end == -1 || start > end {
-		// Markers not found or invalid, append instead
-		return content + "\n\n" + agentsBeadsSection
+// updateBeadsSectionWithProfile replaces the beads section with the given profile.
+// Delegates to the canonical agents.ReplaceSection. Returns an error string on
+// malformed markers (logged by callers) instead of silently appending.
+func updateBeadsSectionWithProfile(content string, profile agents.Profile) string {
+	return updateBeadsSectionWithOpts(content, profile, agents.DefaultRenderOpts())
+}
+
+// updateBeadsSectionWithOpts replaces the beads section with the given profile and render opts.
+func updateBeadsSectionWithOpts(content string, profile agents.Profile, opts agents.RenderOpts) string {
+	replaced, _, err := agents.ReplaceSectionWithOpts(content, profile, opts)
+	if err != nil {
+		return content
 	}
-
-	// Replace section between markers (including end marker line)
-	endOfEndMarker := end + len(agentsEndMarker)
-	// Find the next newline after end marker
-	nextNewline := strings.Index(content[endOfEndMarker:], "\n")
-	if nextNewline != -1 {
-		endOfEndMarker += nextNewline + 1
-	}
-
-	return content[:start] + agentsBeadsSection + content[endOfEndMarker:]
+	return replaced
 }
 
 // removeBeadsSection removes the beads section from content
 func removeBeadsSection(content string) string {
-	start := strings.Index(content, agentsBeginMarker)
+	start := findBeginMarker(content)
 	end := strings.Index(content, agentsEndMarker)
 
 	if start == -1 || end == -1 || start > end {
 		return content
 	}
 
-	// Find the next newline after end marker
+	// Remove exactly the managed section, including a single trailing newline
+	// immediately after the end marker if present. We intentionally do NOT trim
+	// surrounding whitespace or unrelated content to keep user file content intact.
 	endOfEndMarker := end + len(agentsEndMarker)
-	nextNewline := strings.Index(content[endOfEndMarker:], "\n")
-	if nextNewline != -1 {
-		endOfEndMarker += nextNewline + 1
+	if endOfEndMarker < len(content) {
+		switch content[endOfEndMarker] {
+		case '\r':
+			endOfEndMarker++
+			if endOfEndMarker < len(content) && content[endOfEndMarker] == '\n' {
+				endOfEndMarker++
+			}
+		case '\n':
+			endOfEndMarker++
+		}
 	}
 
-	// Also remove leading blank lines before the section
-	trimStart := start
-	for trimStart > 0 && (content[trimStart-1] == '\n' || content[trimStart-1] == '\r') {
-		trimStart--
-	}
-
-	return content[:trimStart] + content[endOfEndMarker:]
+	return content[:start] + content[endOfEndMarker:]
 }
 
-// createNewAgentsFile creates a new AGENTS.md with a basic template
+// findBeginMarker returns the index of the BEGIN BEADS INTEGRATION marker in content,
+// matching both legacy (exact) and new (with metadata) formats via prefix match.
+// Returns -1 if not found.
+func findBeginMarker(content string) int {
+	return strings.Index(content, "<!-- BEGIN BEADS INTEGRATION")
+}
+
+// existingBeadsProfile extracts the profile from an existing beads section's
+// begin marker. Returns ProfileFull if the marker contains "profile:full" or
+// if it's a legacy marker (legacy sections contain full content).
+// Returns ProfileMinimal only if explicitly marked as such.
+func existingBeadsProfile(content string) agents.Profile {
+	idx := findBeginMarker(content)
+	if idx == -1 {
+		return agents.ProfileFull
+	}
+	line := content[idx:]
+	if nl := strings.Index(line, "\n"); nl != -1 {
+		line = line[:nl]
+	}
+	meta := agents.ParseMarker(line)
+	if meta == nil || meta.Profile == "" {
+		// Legacy marker — assume full (it contains all the content)
+		return agents.ProfileFull
+	}
+	return meta.Profile
+}
+
+// createNewAgentsFile creates a new AGENTS.md with a basic template using the full profile.
 func createNewAgentsFile() string {
+	return createNewAgentsFileWithProfile(agents.ProfileFull)
+}
+
+// createNewAgentsFileWithProfile creates a new AGENTS.md with the given profile.
+func createNewAgentsFileWithProfile(profile agents.Profile) string {
+	return createNewAgentsFileWithOpts(profile, agents.DefaultRenderOpts())
+}
+
+// createNewAgentsFileWithOpts creates a new AGENTS.md with the given profile and render opts.
+func createNewAgentsFileWithOpts(profile agents.Profile, opts agents.RenderOpts) string {
+	beadsSection := agents.RenderSectionWithOpts(profile, opts)
+
 	return `# Project Instructions for AI Agents
 
 This file provides instructions and context for AI coding agents working on this project.
 
-` + agentsBeadsSection + `
+` + beadsSection + `
 
 ## Build & Test
 

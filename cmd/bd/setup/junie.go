@@ -16,7 +16,7 @@ This project uses **Beads (bd)** for issue tracking. Use the bd CLI or MCP tools
 2. **Check ready work first** - Run ` + "`bd ready`" + ` to find unblocked issues
 3. **Always include descriptions** - Provide meaningful context when creating issues
 4. **Link discovered work** - Use ` + "`discovered-from`" + ` dependencies for issues found during work
-5. **Sync at session end** - Run ` + "`bd sync`" + ` before ending your session
+5. **Sync at session end** - Run ` + "`bd dolt push`" + ` before ending your session
 
 ## Quick Command Reference
 
@@ -36,7 +36,7 @@ bd create "Found bug" --description="Details" --deps discovered-from:bd-42 --jso
 
 ### Working on Issues
 ` + "```bash" + `
-bd update <id> --status in_progress  # Claim work
+bd update <id> --claim               # Claim work atomically
 bd update <id> --priority 1          # Change priority
 bd close <id> --reason "Completed"   # Mark complete
 ` + "```" + `
@@ -49,7 +49,7 @@ bd dep add <issue> <depends-on> --type=related  # Soft link
 
 ### Syncing
 ` + "```bash" + `
-bd sync  # ALWAYS run at session end - commits and pushes changes
+bd dolt push  # ALWAYS run at session end - commits and pushes changes
 ` + "```" + `
 
 ## Issue Types
@@ -87,7 +87,7 @@ If the MCP server is configured, you can use these tools directly:
 - ✅ Always use ` + "`--json`" + ` flag for programmatic use
 - ✅ Link discovered work with ` + "`discovered-from`" + ` dependencies
 - ✅ Check ` + "`bd ready`" + ` before asking "what should I work on?"
-- ✅ Run ` + "`bd sync`" + ` at end of session
+- ✅ Run ` + "`bd dolt push`" + ` at end of session
 - ❌ Do NOT create markdown TODO lists
 - ❌ Do NOT use external issue trackers
 - ❌ Do NOT duplicate tracking systems
@@ -116,33 +116,28 @@ func InstallJunie() {
 
 	// Ensure .junie directory exists
 	if err := EnsureDir(".junie", 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Ensure .junie/mcp directory exists
 	if err := EnsureDir(".junie/mcp", 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Write guidelines file
 	if err := atomicWriteFile(guidelinesPath, []byte(junieGuidelinesTemplate)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: write guidelines: %v\n", err)
-		os.Exit(1)
+		FatalError("write guidelines: %v", err)
 	}
 
 	// Write MCP config file
 	mcpConfig := junieMCPConfig()
 	mcpData, err := json.MarshalIndent(mcpConfig, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: marshal MCP config: %v\n", err)
-		os.Exit(1)
+		FatalError("marshal MCP config: %v", err)
 	}
 
 	if err := atomicWriteFile(mcpPath, mcpData); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: write MCP config: %v\n", err)
-		os.Exit(1)
+		FatalError("write MCP config: %v", err)
 	}
 
 	fmt.Printf("\n✓ Junie integration installed\n")
@@ -178,21 +173,17 @@ func CheckJunie() {
 		fmt.Println("⚠ Partial Junie integration (guidelines only)")
 		fmt.Printf("  Guidelines: %s\n", guidelinesPath)
 		fmt.Println("  Missing: MCP config")
-		fmt.Println("  Run: bd setup junie (to complete installation)")
-		os.Exit(1)
+		FatalErrorWithHint("partial Junie integration", "Run: bd setup junie (to complete installation)")
 	}
 
 	if mcpExists {
 		fmt.Println("⚠ Partial Junie integration (MCP only)")
 		fmt.Printf("  MCP Config: %s\n", mcpPath)
 		fmt.Println("  Missing: Guidelines")
-		fmt.Println("  Run: bd setup junie (to complete installation)")
-		os.Exit(1)
+		FatalErrorWithHint("partial Junie integration", "Run: bd setup junie (to complete installation)")
 	}
 
-	fmt.Println("✗ Junie integration not installed")
-	fmt.Println("  Run: bd setup junie")
-	os.Exit(1)
+	FatalErrorWithHint("Junie integration not installed", "Run: bd setup junie")
 }
 
 // RemoveJunie removes Junie integration
@@ -209,8 +200,7 @@ func RemoveJunie() {
 	// Remove guidelines
 	if err := os.Remove(guidelinesPath); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: failed to remove guidelines: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to remove guidelines: %v", err)
 		}
 	} else {
 		removed = true
@@ -219,8 +209,7 @@ func RemoveJunie() {
 	// Remove MCP config
 	if err := os.Remove(mcpPath); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: failed to remove MCP config: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to remove MCP config: %v", err)
 		}
 	} else {
 		removed = true

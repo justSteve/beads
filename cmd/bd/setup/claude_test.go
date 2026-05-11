@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/templates/agents"
 )
 
 func newClaudeTestEnv(t *testing.T) (claudeEnv, *bytes.Buffer, *bytes.Buffer) {
@@ -253,6 +255,38 @@ func TestRemoveHookCommand(t *testing.T) {
 		},
 	}
 
+	// Separate test: sibling commands within the same hook entry must be
+	// preserved when only the matching command is removed. The bug that
+	// prompted this test dropped the entire hook entry on first match,
+	// silently deleting any sibling commands in the same hooks array.
+	t.Run("preserves sibling commands in same hook entry", func(t *testing.T) {
+		hooks := map[string]interface{}{
+			"SessionStart": []interface{}{
+				map[string]interface{}{
+					"matcher": "",
+					"hooks": []interface{}{
+						map[string]interface{}{"type": "command", "command": "bd prime"},
+						map[string]interface{}{"type": "command", "command": "other-tool"},
+					},
+				},
+			},
+		}
+		removeHookCommand(hooks, "SessionStart", "bd prime")
+
+		entries, ok := hooks["SessionStart"].([]interface{})
+		if !ok || len(entries) != 1 {
+			t.Fatalf("expected 1 hook entry to remain, got %v", hooks["SessionStart"])
+		}
+		entryMap := entries[0].(map[string]interface{})
+		cmds := entryMap["hooks"].([]interface{})
+		if len(cmds) != 1 {
+			t.Fatalf("expected 1 sibling command to remain, got %d", len(cmds))
+		}
+		if cmds[0].(map[string]interface{})["command"] != "other-tool" {
+			t.Errorf("sibling command was lost; commands: %v", cmds)
+		}
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			removeHookCommand(tt.existingHooks, tt.event, tt.command)
@@ -321,7 +355,8 @@ func TestInstallClaudeCleanupNullHooks(t *testing.T) {
 	env, stdout, _ := newClaudeTestEnv(t)
 
 	// Create settings file with null hooks (simulating the bug)
-	settingsPath := globalSettingsPath(env.homeDir)
+	// Use project settings path (default install target)
+	settingsPath := projectSettingsPath(env.projectDir)
 	writeSettings(t, settingsPath, map[string]interface{}{
 		"hooks": map[string]interface{}{
 			"SessionStart": nil,
@@ -329,7 +364,7 @@ func TestInstallClaudeCleanupNullHooks(t *testing.T) {
 		},
 	})
 
-	// Install should clean up null values and add proper hooks
+	// Install should clean up null values and add proper hooks (global=false → project)
 	err := installClaude(env, false, false)
 	if err != nil {
 		t.Fatalf("install failed: %v", err)
@@ -358,7 +393,7 @@ func TestInstallClaudeCleanupNullHooks(t *testing.T) {
 	if !ok {
 		t.Fatal("hooks section missing")
 	}
-	for _, event := range []string{"SessionStart", "PreCompact"} {
+	for _, event := range []string{"SessionStart"} {
 		eventHooks, ok := hooks[event].([]interface{})
 		if !ok {
 			t.Errorf("%s should be an array, not nil or missing", event)
@@ -366,6 +401,55 @@ func TestInstallClaudeCleanupNullHooks(t *testing.T) {
 		if len(eventHooks) == 0 {
 			t.Errorf("%s should have hooks", event)
 		}
+	}
+}
+
+func TestInstallClaudeUsesPrimeForClaudeHooks(t *testing.T) {
+	env, _, _ := newClaudeTestEnv(t)
+
+	if err := installClaude(env, false, false); err != nil {
+		t.Fatalf("install failed: %v", err)
+	}
+
+	data, err := env.readFile(projectSettingsPath(env.projectDir))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	settingsJSON := string(data)
+
+	for _, want := range []string{
+		`"command": "bd prime --hook-json"`,
+		`"SessionStart"`,
+	} {
+		if !strings.Contains(settingsJSON, want) {
+			t.Fatalf("settings missing %q:\n%s", want, settingsJSON)
+		}
+	}
+
+	for _, stale := range []string{"bd sync", "bd dolt push"} {
+		if strings.Contains(settingsJSON, stale) {
+			t.Fatalf("settings contain stale Claude hook command %q:\n%s", stale, settingsJSON)
+		}
+	}
+}
+
+func TestClaudeSettingsUsesRemovedSyncCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"empty", "{}", false},
+		{"bd prime only", `{"hooks":{"PreCompact":[{"matcher":"","hooks":[{"type":"command","command":"bd prime"}]}]}}`, false},
+		{"bd sync hook", `{"hooks":{"PreCompact":[{"matcher":"","hooks":[{"type":"command","command":"bd sync"}]}]}}`, true},
+		{"bd sync with suffix", `{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"bd sync --flush-only"}]}]}}`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := claudeSettingsUsesRemovedSyncCommand([]byte(tt.raw)); got != tt.want {
+				t.Fatalf("claudeSettingsUsesRemovedSyncCommand() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -419,7 +503,7 @@ func TestHasBeadsHooks(t *testing.T) {
 			name: "has bd prime in PreCompact",
 			settingsData: map[string]interface{}{
 				"hooks": map[string]interface{}{
-					"PreCompact": []interface{}{
+					"SessionStart": []interface{}{
 						map[string]interface{}{
 							"matcher": "",
 							"hooks": []interface{}{
@@ -445,6 +529,44 @@ func TestHasBeadsHooks(t *testing.T) {
 								map[string]interface{}{
 									"type":    "command",
 									"command": "bd prime --stealth",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "has bd prime --hook-json hook (current format)",
+			settingsData: map[string]interface{}{
+				"hooks": map[string]interface{}{
+					"SessionStart": []interface{}{
+						map[string]interface{}{
+							"matcher": "",
+							"hooks": []interface{}{
+								map[string]interface{}{
+									"type":    "command",
+									"command": "bd prime --hook-json",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "has bd prime --stealth --hook-json hook (current format)",
+			settingsData: map[string]interface{}{
+				"hooks": map[string]interface{}{
+					"PreCompact": []interface{}{
+						map[string]interface{}{
+							"matcher": "",
+							"hooks": []interface{}{
+								map[string]interface{}{
+									"type":    "command",
+									"command": "bd prime --stealth --hook-json",
 								},
 							},
 						},
@@ -553,7 +675,8 @@ func TestIdempotencyWithStealth(t *testing.T) {
 
 func TestInstallClaudeProject(t *testing.T) {
 	env, stdout, stderr := newClaudeTestEnv(t)
-	if err := installClaude(env, true, false); err != nil {
+	// global=false means project-local (the new default)
+	if err := installClaude(env, false, false); err != nil {
 		t.Fatalf("installClaude: %v", err)
 	}
 	data, err := os.ReadFile(projectSettingsPath(env.projectDir))
@@ -567,6 +690,14 @@ func TestInstallClaudeProject(t *testing.T) {
 	if !hasBeadsHooks(projectSettingsPath(env.projectDir)) {
 		t.Fatal("project hooks not detected")
 	}
+	instructionsPath := filepath.Join(env.projectDir, claudeInstructionsFile)
+	instructions, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", claudeInstructionsFile, err)
+	}
+	if !strings.Contains(string(instructions), "profile:minimal") {
+		t.Fatalf("expected minimal profile in %s", claudeInstructionsFile)
+	}
 	if !strings.Contains(stdout.String(), "project") {
 		t.Error("expected project installation message")
 	}
@@ -577,7 +708,8 @@ func TestInstallClaudeProject(t *testing.T) {
 
 func TestInstallClaudeGlobalStealth(t *testing.T) {
 	env, stdout, _ := newClaudeTestEnv(t)
-	if err := installClaude(env, false, true); err != nil {
+	// global=true, stealth=true
+	if err := installClaude(env, true, true); err != nil {
 		t.Fatalf("installClaude: %v", err)
 	}
 	data, err := os.ReadFile(globalSettingsPath(env.homeDir))
@@ -586,6 +718,10 @@ func TestInstallClaudeGlobalStealth(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "bd prime --stealth") {
 		t.Error("expected stealth command in settings")
+	}
+	instructionsPath := filepath.Join(env.projectDir, claudeInstructionsFile)
+	if _, err := os.Stat(instructionsPath); err != nil {
+		t.Fatalf("expected %s to be created: %v", claudeInstructionsFile, err)
 	}
 	if !strings.Contains(stdout.String(), "globally") {
 		t.Error("expected global installation message")
@@ -602,7 +738,8 @@ func TestInstallClaudeErrors(t *testing.T) {
 		if err := os.WriteFile(path, []byte("not json"), 0o644); err != nil {
 			t.Fatalf("write file: %v", err)
 		}
-		if err := installClaude(env, true, false); err == nil {
+		// global=false → project-local, should hit the invalid json
+		if err := installClaude(env, false, false); err == nil {
 			t.Fatal("expected parse error")
 		}
 		if !strings.Contains(stderr.String(), "failed to parse") {
@@ -613,13 +750,16 @@ func TestInstallClaudeErrors(t *testing.T) {
 	t.Run("ensure dir error", func(t *testing.T) {
 		env, _, _ := newClaudeTestEnv(t)
 		env.ensureDir = func(string, os.FileMode) error { return errors.New("boom") }
-		if err := installClaude(env, true, false); err == nil {
+		// global=false → project-local
+		if err := installClaude(env, false, false); err == nil {
 			t.Fatal("expected ensureDir error")
 		}
 	})
 }
 
 func TestCheckClaudeScenarios(t *testing.T) {
+	stubDetectRenderOpts(t)
+
 	t.Run("global hooks", func(t *testing.T) {
 		env, stdout, _ := newClaudeTestEnv(t)
 		writeSettings(t, globalSettingsPath(env.homeDir), map[string]interface{}{
@@ -634,6 +774,9 @@ func TestCheckClaudeScenarios(t *testing.T) {
 				},
 			},
 		})
+		if err := os.WriteFile(filepath.Join(env.projectDir, claudeInstructionsFile), []byte(agents.RenderSection(agents.ProfileMinimal)), 0o644); err != nil {
+			t.Fatalf("write %s: %v", claudeInstructionsFile, err)
+		}
 		if err := checkClaude(env); err != nil {
 			t.Fatalf("checkClaude: %v", err)
 		}
@@ -656,6 +799,9 @@ func TestCheckClaudeScenarios(t *testing.T) {
 				},
 			},
 		})
+		if err := os.WriteFile(filepath.Join(env.projectDir, claudeInstructionsFile), []byte(agents.RenderSection(agents.ProfileMinimal)), 0o644); err != nil {
+			t.Fatalf("write %s: %v", claudeInstructionsFile, err)
+		}
 		if err := checkClaude(env); err != nil {
 			t.Fatalf("checkClaude: %v", err)
 		}
@@ -671,6 +817,28 @@ func TestCheckClaudeScenarios(t *testing.T) {
 		}
 		if !strings.Contains(stdout.String(), "Run: bd setup claude") {
 			t.Error("expected guidance message")
+		}
+	})
+
+	t.Run("missing instructions", func(t *testing.T) {
+		env, stdout, _ := newClaudeTestEnv(t)
+		writeSettings(t, globalSettingsPath(env.homeDir), map[string]interface{}{
+			"hooks": map[string]interface{}{
+				"SessionStart": []interface{}{
+					map[string]interface{}{
+						"matcher": "",
+						"hooks": []interface{}{
+							map[string]interface{}{"type": "command", "command": "bd prime"},
+						},
+					},
+				},
+			},
+		})
+		if err := checkClaude(env); !errors.Is(err, errAgentsFileMissing) {
+			t.Fatalf("expected errAgentsFileMissing, got %v", err)
+		}
+		if !strings.Contains(stdout.String(), claudeInstructionsFile+" not found") {
+			t.Fatalf("expected missing %s message, got: %s", claudeInstructionsFile, stdout.String())
 		}
 	})
 }
@@ -692,7 +860,12 @@ func TestRemoveClaudeScenarios(t *testing.T) {
 				},
 			},
 		})
-		if err := removeClaude(env, false); err != nil {
+		instructionsPath := filepath.Join(env.projectDir, claudeInstructionsFile)
+		if err := os.WriteFile(instructionsPath, []byte(agents.RenderSection(agents.ProfileMinimal)), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", claudeInstructionsFile, err)
+		}
+		// global=true → remove from global settings
+		if err := removeClaude(env, true); err != nil {
 			t.Fatalf("removeClaude: %v", err)
 		}
 		data, err := os.ReadFile(path)
@@ -702,6 +875,13 @@ func TestRemoveClaudeScenarios(t *testing.T) {
 		if strings.Contains(string(data), "bd prime") {
 			t.Error("expected bd prime hooks removed")
 		}
+		instructions, err := os.ReadFile(instructionsPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", claudeInstructionsFile, err)
+		}
+		if strings.Contains(string(instructions), "BEGIN BEADS INTEGRATION") {
+			t.Fatalf("expected beads section removed from %s", claudeInstructionsFile)
+		}
 		if !strings.Contains(stdout.String(), "hooks removed") {
 			t.Error("expected success message")
 		}
@@ -709,7 +889,8 @@ func TestRemoveClaudeScenarios(t *testing.T) {
 
 	t.Run("missing file", func(t *testing.T) {
 		env, stdout, _ := newClaudeTestEnv(t)
-		if err := removeClaude(env, true); err != nil {
+		// global=false → project-local (default)
+		if err := removeClaude(env, false); err != nil {
 			t.Fatalf("removeClaude: %v", err)
 		}
 		if !strings.Contains(stdout.String(), "No settings file found") {
@@ -726,7 +907,8 @@ func TestRemoveClaudeScenarios(t *testing.T) {
 		if err := os.WriteFile(path, []byte("not json"), 0o644); err != nil {
 			t.Fatalf("write file: %v", err)
 		}
-		if err := removeClaude(env, true); err == nil {
+		// global=false → project-local
+		if err := removeClaude(env, false); err == nil {
 			t.Fatal("expected parse error")
 		}
 		if !strings.Contains(stderr.String(), "failed to parse") {
@@ -750,7 +932,8 @@ func TestClaudeWrappersExit(t *testing.T) {
 		env, _, _ := newClaudeTestEnv(t)
 		env.ensureDir = func(string, os.FileMode) error { return errors.New("boom") }
 		stubClaudeEnvProvider(t, env, nil)
-		InstallClaude(true, false)
+		// global=false → project-local (default)
+		InstallClaude(false, false)
 		if !cap.called || cap.code != 1 {
 			t.Fatal("InstallClaude should exit when installClaude fails")
 		}
@@ -769,7 +952,8 @@ func TestClaudeWrappersExit(t *testing.T) {
 	t.Run("remove parse error", func(t *testing.T) {
 		cap := stubSetupExit(t)
 		env, _, _ := newClaudeTestEnv(t)
-		path := globalSettingsPath(env.homeDir)
+		// Write invalid JSON to project settings path (default target)
+		path := projectSettingsPath(env.projectDir)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
@@ -777,9 +961,139 @@ func TestClaudeWrappersExit(t *testing.T) {
 			t.Fatalf("write file: %v", err)
 		}
 		stubClaudeEnvProvider(t, env, nil)
+		// global=false → project-local (default)
 		RemoveClaude(false)
 		if !cap.called || cap.code != 1 {
 			t.Fatal("RemoveClaude should exit on parse error")
 		}
 	})
+}
+
+// settingsWithPlugin returns settings data with the beads plugin enabled.
+func settingsWithPlugin() map[string]interface{} {
+	return map[string]interface{}{
+		"enabledPlugins": map[string]interface{}{
+			"beads@beads-marketplace": true,
+		},
+	}
+}
+
+func TestHasBeadsPlugin(t *testing.T) {
+	t.Run("plugin in project settings", func(t *testing.T) {
+		env, _, _ := newClaudeTestEnv(t)
+		writeSettings(t, projectSettingsPath(env.projectDir), settingsWithPlugin())
+		if !hasBeadsPlugin(env) {
+			t.Error("expected plugin to be detected in project settings")
+		}
+	})
+
+	t.Run("plugin in global settings", func(t *testing.T) {
+		env, _, _ := newClaudeTestEnv(t)
+		writeSettings(t, globalSettingsPath(env.homeDir), settingsWithPlugin())
+		if !hasBeadsPlugin(env) {
+			t.Error("expected plugin to be detected in global settings")
+		}
+	})
+
+	t.Run("plugin disabled", func(t *testing.T) {
+		env, _, _ := newClaudeTestEnv(t)
+		writeSettings(t, projectSettingsPath(env.projectDir), map[string]interface{}{
+			"enabledPlugins": map[string]interface{}{
+				"beads@beads-marketplace": false,
+			},
+		})
+		if hasBeadsPlugin(env) {
+			t.Error("disabled plugin should not be detected")
+		}
+	})
+
+	t.Run("no plugin", func(t *testing.T) {
+		env, _, _ := newClaudeTestEnv(t)
+		if hasBeadsPlugin(env) {
+			t.Error("expected no plugin detected")
+		}
+	})
+}
+
+func TestInstallClaudeSkipsHooksWhenPluginPresent(t *testing.T) {
+	env, stdout, _ := newClaudeTestEnv(t)
+
+	// Pre-populate project settings with the plugin enabled
+	writeSettings(t, projectSettingsPath(env.projectDir), settingsWithPlugin())
+
+	if err := installClaude(env, false, false); err != nil {
+		t.Fatalf("installClaude: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "plugin-managed") {
+		t.Error("expected plugin-managed message in output")
+	}
+	if strings.Contains(out, "Registered SessionStart hook") {
+		t.Error("should NOT register hooks when plugin is present")
+	}
+
+	// Verify settings file has no hooks written
+	data, err := env.readFile(projectSettingsPath(env.projectDir))
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	hooks, _ := settings["hooks"].(map[string]interface{})
+	if hooks != nil {
+		if _, hasSession := hooks["SessionStart"]; hasSession {
+			t.Error("SessionStart hooks should not be written when plugin is present")
+		}
+		if _, hasCompact := hooks["PreCompact"]; hasCompact {
+			t.Error("PreCompact hooks should not be written when plugin is present")
+		}
+	}
+
+	// CLAUDE.md should still be installed
+	instructionsPath := filepath.Join(env.projectDir, claudeInstructionsFile)
+	if _, err := os.Stat(instructionsPath); err != nil {
+		t.Errorf("CLAUDE.md should still be installed even with plugin: %v", err)
+	}
+}
+
+func TestInstallClaudeWritesHooksWithoutPlugin(t *testing.T) {
+	env, stdout, _ := newClaudeTestEnv(t)
+
+	if err := installClaude(env, false, false); err != nil {
+		t.Fatalf("installClaude: %v", err)
+	}
+
+	out := stdout.String()
+	if strings.Contains(out, "plugin-managed") {
+		t.Error("should NOT show plugin-managed when no plugin")
+	}
+	if !strings.Contains(out, "Registered SessionStart hook") {
+		t.Error("expected hooks to be registered without plugin")
+	}
+}
+
+func TestCheckClaudePluginManaged(t *testing.T) {
+	stubDetectRenderOpts(t)
+	env, stdout, _ := newClaudeTestEnv(t)
+
+	// Plugin enabled but no hooks in settings files
+	writeSettings(t, globalSettingsPath(env.homeDir), settingsWithPlugin())
+
+	// checkClaude needs CLAUDE.md to exist for the agents check
+	instructionsPath := filepath.Join(env.projectDir, claudeInstructionsFile)
+	if err := os.WriteFile(instructionsPath, []byte(agents.RenderSection(agents.ProfileMinimal)), 0o644); err != nil {
+		t.Fatalf("write CLAUDE.md: %v", err)
+	}
+
+	if err := checkClaude(env); err != nil {
+		t.Fatalf("checkClaude: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "plugin-managed") {
+		t.Errorf("expected plugin-managed message, got: %s", out)
+	}
 }

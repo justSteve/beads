@@ -10,21 +10,14 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/debug"
-)
-
-// Sync trigger constants define when sync operations occur.
-const (
-	// SyncTriggerPush triggers sync on git push operations.
-	SyncTriggerPush = "push"
-
-	// SyncTriggerChange triggers sync on every database change.
-	SyncTriggerChange = "change"
-
-	// SyncTriggerPull triggers import on git pull operations.
-	SyncTriggerPull = "pull"
+	"gopkg.in/yaml.v3"
 )
 
 var v *viper.Viper
+
+// overriddenKeys tracks keys explicitly set via Set() at runtime, so
+// GetValueSource can distinguish them from Viper defaults.
+var overriddenKeys = map[string]bool{}
 
 // Initialize sets up the viper configuration singleton
 // Should be called once at application startup
@@ -34,82 +27,155 @@ func Initialize() error {
 	// Set config type to yaml (we only load config.yaml, not config.json)
 	v.SetConfigType("yaml")
 
-	// Explicitly locate config.yaml and use SetConfigFile to avoid picking up config.json
-	// Precedence: project .beads/config.yaml > ~/.config/bd/config.yaml > ~/.beads/config.yaml
-	configFileSet := false
+	// Collect config files from lowest to highest priority.
+	// We load the lowest first with ReadInConfig, then MergeInConfig each
+	// subsequent file so higher-priority values overwrite lower-priority ones.
+	//
+	// Precedence (highest to lowest):
+	//   BEADS_DIR/config.yaml > project .beads/config.yaml > ~/.config/bd/config.yaml > ~/.beads/config.yaml
+	//
+	// Previously, only ONE config file was loaded (the highest-priority match),
+	// which meant user-level config was silently ignored when project-level
+	// config existed — e.g., the idle-monitor daemon with BEADS_DIR set (GH#2375).
+	var configPaths []string     // ordered lowest priority first
+	var primaryConfigPath string // project-level config (for config.local.yaml and SaveConfigValue)
 
-	// 1. Walk up from CWD to find project .beads/config.yaml
-	//    This allows commands to work from subdirectories
-	cwd, err := os.Getwd()
-	if err == nil && !configFileSet {
-		// Walk up parent directories to find .beads/config.yaml
-		for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
-			beadsDir := filepath.Join(dir, ".beads")
-			configPath := filepath.Join(beadsDir, "config.yaml")
-			if _, err := os.Stat(configPath); err == nil {
-				// Found .beads/config.yaml - set it explicitly
-				v.SetConfigFile(configPath)
-				configFileSet = true
+	// 3. Legacy: ~/.beads/config.yaml (lowest priority)
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(homeDir, ".beads", "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			configPaths = append(configPaths, p)
+		}
+	}
+
+	// 2. User: ~/.config/bd/config.yaml
+	if configDir, err := os.UserConfigDir(); err == nil {
+		p := filepath.Join(configDir, "bd", "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			configPaths = append(configPaths, p)
+		}
+	}
+
+	// Also check ~/.config/bd/config.yaml explicitly. On macOS,
+	// os.UserConfigDir() returns ~/Library/Application Support, not ~/.config.
+	// This ensures the documented path works on all platforms.
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		xdgPath := filepath.Join(homeDir, ".config", "bd", "config.yaml")
+		alreadyAdded := false
+		for _, existing := range configPaths {
+			if filepath.Clean(existing) == filepath.Clean(xdgPath) {
+				alreadyAdded = true
 				break
 			}
 		}
-	}
-
-	// 2. User config directory (~/.config/bd/config.yaml)
-	if !configFileSet {
-		if configDir, err := os.UserConfigDir(); err == nil {
-			configPath := filepath.Join(configDir, "bd", "config.yaml")
-			if _, err := os.Stat(configPath); err == nil {
-				v.SetConfigFile(configPath)
-				configFileSet = true
+		if !alreadyAdded {
+			if _, err := os.Stat(xdgPath); err == nil {
+				configPaths = append(configPaths, xdgPath)
 			}
 		}
 	}
 
-	// 3. Home directory (~/.beads/config.yaml)
-	if !configFileSet {
-		if homeDir, err := os.UserHomeDir(); err == nil {
-			configPath := filepath.Join(homeDir, ".beads", "config.yaml")
-			if _, err := os.Stat(configPath); err == nil {
-				v.SetConfigFile(configPath)
-				configFileSet = true
+	// 1. Project: walk up from CWD to find .beads/config.yaml
+	beadsDirEnv := strings.TrimSpace(os.Getenv("BEADS_DIR"))
+	beadsEnvConfigPath := ""
+	if beadsDirEnv != "" {
+		beadsEnvConfigPath = filepath.Clean(filepath.Join(beadsDirEnv, "config.yaml"))
+	}
+	cwd, err := os.Getwd()
+	if err == nil {
+		// In the beads repo, `.beads/config.yaml` is tracked and may set non-default config values.
+		// In `go test` (especially for `cmd/bd`), we want to avoid unintentionally picking up
+		// the repo-local config, while still allowing tests to load config.yaml from temp repos.
+		//
+		// If BEADS_TEST_IGNORE_REPO_CONFIG is set, we will ignore the config at
+		// <module-root>/.beads/config.yaml (where module-root is the nearest parent containing go.mod).
+		ignoreRepoConfig := os.Getenv("BEADS_TEST_IGNORE_REPO_CONFIG") != ""
+		var moduleRoot string
+		if ignoreRepoConfig {
+			// Find module root by walking up to go.mod.
+			for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+				if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+					moduleRoot = dir
+					break
+				}
 			}
+		}
+
+		tryProjectConfig := func(path string) bool {
+			if path == "" {
+				return false
+			}
+			if _, err := os.Stat(path); err != nil {
+				return false
+			}
+			if ignoreRepoConfig && moduleRoot != "" {
+				// Only ignore the repo-local config (moduleRoot/.beads/config.yaml).
+				wantIgnore := filepath.Clean(path) == filepath.Clean(filepath.Join(moduleRoot, ".beads", "config.yaml"))
+				if wantIgnore {
+					return false
+				}
+			}
+			configPaths = append(configPaths, path)
+			primaryConfigPath = path
+			return true
+		}
+
+		// Walk up parent directories to find .beads/config.yaml.
+		for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+			p := filepath.Join(dir, ".beads", "config.yaml")
+			if _, err := os.Stat(p); err == nil {
+				// When BEADS_DIR points at a different runtime workspace, do not
+				// merge the caller repo's config underneath it. That leaks caller
+				// settings like readonly/json/actor into explicit-target commands.
+				if beadsEnvConfigPath != "" && filepath.Clean(p) != beadsEnvConfigPath {
+					break
+				}
+				if tryProjectConfig(p) {
+					break
+				}
+			}
+		}
+
+		// Worktree/shared fallback: the active workspace may live outside the
+		// worktree tree, so the parent walk above won't find it.
+		if primaryConfigPath == "" {
+			p := worktreeFallbackConfigPath(cwd)
+			_ = tryProjectConfig(p)
+		}
+	}
+
+	// 0. BEADS_DIR: highest priority
+	if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
+		p := filepath.Join(beadsDir, "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			// Avoid duplicate if BEADS_DIR points to same config as CWD walk
+			if primaryConfigPath == "" || filepath.Clean(p) != filepath.Clean(primaryConfigPath) {
+				configPaths = append(configPaths, p)
+			}
+			primaryConfigPath = p
 		}
 	}
 
 	// Automatic environment variable binding
 	// Environment variables take precedence over config file
-	// E.g., BD_JSON, BD_NO_DAEMON, BD_ACTOR, BD_DB
+	// E.g., BD_JSON, BD_NO_DAEMON, BD_DB (BD_ACTOR deprecated in favor of BEADS_ACTOR)
 	v.SetEnvPrefix("BD")
 
 	// Replace hyphens and dots with underscores for env var mapping
-	// This allows BD_NO_DAEMON to map to "no-daemon" config key
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	v.AutomaticEnv()
 
 	// Set defaults for all flags
 	v.SetDefault("json", false)
-	v.SetDefault("no-daemon", false)
-	v.SetDefault("no-auto-flush", false)
-	v.SetDefault("no-auto-import", false)
+	v.SetDefault("events-export", false)
 	v.SetDefault("no-db", false)
+	v.SetDefault("no-hooks", false)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
-	v.SetDefault("lock-timeout", "30s")
-
 	// Additional environment variables (not prefixed with BD_)
-	// These are bound explicitly for backward compatibility
-	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")
-	_ = v.BindEnv("auto-start-daemon", "BEADS_AUTO_START_DAEMON")
-	_ = v.BindEnv("identity", "BEADS_IDENTITY")
-	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL")
-
-	// Set defaults for additional settings
-	v.SetDefault("flush-debounce", "30s")
-	v.SetDefault("auto-start-daemon", true)
+	_ = v.BindEnv("identity", "BEADS_IDENTITY") // BindEnv only fails with zero args, which can't happen here
 	v.SetDefault("identity", "")
-	v.SetDefault("remote-sync-interval", "30s")
 
 	// Dolt configuration defaults
 	// Controls whether beads should automatically create Dolt commits after write commands.
@@ -125,18 +191,11 @@ func Initialize() error {
 	// Sync configuration defaults (bd-4u8)
 	v.SetDefault("sync.require_confirmation_on_mass_delete", false)
 
-	// Sync mode configuration (hq-ew1mbr.3)
-	// See docs/CONFIG.md for detailed documentation
-	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | realtime | dolt-native | belt-and-suspenders
-	v.SetDefault("sync.export_on", SyncTriggerPush) // push | change
-	v.SetDefault("sync.import_on", SyncTriggerPull) // pull | change
-
-	// Conflict resolution configuration
-	v.SetDefault("conflict.strategy", ConflictStrategyNewest) // newest | ours | theirs | manual
-
 	// Federation configuration (optional Dolt remote)
-	v.SetDefault("federation.remote", "")      // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
-	v.SetDefault("federation.sovereignty", "") // T1 | T2 | T3 | T4 (empty = no restriction)
+	v.SetDefault("federation.remote", "")                          // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads, az://account.blob.core.windows.net/container/beads
+	v.SetDefault("federation.sovereignty", "")                     // T1 | T2 | T3 | T4 (empty = no restriction)
+	v.SetDefault("federation.allowed-remote-patterns", []string{}) // glob patterns restricting allowed remote URLs (enterprise lockdown)
+	v.SetDefault("federation.exclude_types", []string{"wisp"})     // issue types excluded from federation push (privacy filter)
 
 	// Push configuration defaults
 	v.SetDefault("no-push", false)
@@ -150,7 +209,14 @@ func Initialize() error {
 	// - "warn": validate and print warnings but proceed
 	// - "error": validate and fail on missing sections
 	v.SetDefault("validation.on-create", "none")
+	v.SetDefault("validation.on-close", "none")
 	v.SetDefault("validation.on-sync", "none")
+
+	// Metadata schema validation (GH#1416 Phase 2)
+	// - "none": no metadata schema validation (default)
+	// - "warn": validate and print warnings but proceed
+	// - "error": validate and reject invalid metadata
+	v.SetDefault("validation.metadata.mode", "none")
 
 	// Hierarchy configuration defaults (GH#995)
 	// Maximum nesting depth for hierarchical IDs (e.g., bd-abc.1.2.3)
@@ -165,30 +231,72 @@ func Initialize() error {
 	// Maps directory patterns to labels for automatic filtering in monorepos
 	v.SetDefault("directory.labels", map[string]string{})
 
+	// Backup configuration defaults (JSONL export to .beads/backup/)
+	v.SetDefault("backup.enabled", false)
+	v.SetDefault("backup.interval", "15m")
+	v.SetDefault("backup.git-push", false)
+	v.SetDefault("backup.git-repo", "")
+
+	// Auto-export: write git-tracked JSONL after mutations for portability
+	// When no Dolt remote is configured, this is the primary way to share
+	// beads state (issues + memories) across machines via git.  Enabled by
+	// default so that viewers (bv) and git-based workflows see fresh data
+	// without extra configuration (GH#2973).
+	v.SetDefault("export.auto", true)
+	v.SetDefault("export.interval", "60s")
+	v.SetDefault("export.path", "issues.jsonl") // relative to .beads/; canonical name
+	v.SetDefault("export.git-add", true)
+
+	// Auto-import: pull JSONL into Dolt after git merge/checkout so issues
+	// created on other machines enter the local database before the next
+	// auto-export overwrites the JSONL with our (possibly stale) view.
+	// Symmetric to export.auto. Closes the JSONL-in-git sync gap (GH#3729).
+	v.SetDefault("import.auto", true)
+
+	// AI configuration defaults
+	v.SetDefault("ai.model", "claude-haiku-4-5-20251001")
+
+	// Output configuration (GH#1384)
+	// Controls title display in command feedback messages.
+	// 0 = hide title, N > 0 = truncate to N chars with "…"
+	v.SetDefault("output.title-length", 255)
+
 	// External projects for cross-project dependency resolution (bd-h807)
 	// Maps project names to paths for resolving external: blocked_by references
 	v.SetDefault("external_projects", map[string]string{})
 
-	// Agent marketplace integration settings
-	// These configure how beads integrates with the agents marketplace
-	v.SetDefault("agents.marketplace.repo", "")           // Path to agents marketplace repo
-	v.SetDefault("agents.marketplace.enabled", "")        // Comma-separated list of enabled plugins
-	v.SetDefault("agents.default_model", "sonnet")        // Default model for agents (opus, sonnet, haiku)
-	v.SetDefault("agents.session.auto_prime", true)       // Auto-run bd prime at session start
-	v.SetDefault("agents.session.track_skills", false)    // Track skill usage in database
-	v.SetDefault("agents.enforcement.description_min_length", 50)  // Minimum description length
-	v.SetDefault("agents.enforcement.dependency_validation", true) // Validate causal dependencies
-	v.SetDefault("agents.enforcement.single_issue_max", 1)         // Max concurrent in_progress issues
-	v.SetDefault("agents.prefer_model", "")               // User preference override for model
-	v.SetDefault("agents.context_budget", 20000)          // Max context tokens for agent sessions
-	v.SetDefault("agents.skill_autoload", true)           // Automatically load relevant skills
-
-	// Read config file if it was found
-	if configFileSet {
+	// Load config files: lowest priority first, each MergeInConfig overwrites
+	if len(configPaths) > 0 {
+		v.SetConfigFile(configPaths[0])
 		if err := v.ReadInConfig(); err != nil {
 			return fmt.Errorf("error reading config file: %w", err)
 		}
-		debug.Logf("Debug: loaded config from %s\n", v.ConfigFileUsed())
+		debug.Logf("Debug: loaded config from %s\n", configPaths[0])
+
+		for _, p := range configPaths[1:] {
+			v.SetConfigFile(p)
+			if err := v.MergeInConfig(); err != nil {
+				return fmt.Errorf("error merging config file %s: %w", p, err)
+			}
+			debug.Logf("Debug: merged config from %s\n", p)
+		}
+
+		// Restore primary config path as ConfigFileUsed (used by SaveConfigValue,
+		// ResolveExternalProjectPath, etc.)
+		v.SetConfigFile(primaryConfigPath)
+
+		// Merge local config overrides if present (config.local.yaml)
+		// This allows machine-specific settings without polluting tracked config
+		localConfigPath := filepath.Join(filepath.Dir(primaryConfigPath), "config.local.yaml")
+		if _, err := os.Stat(localConfigPath); err == nil {
+			v.SetConfigFile(localConfigPath)
+			if err := v.MergeInConfig(); err != nil {
+				return fmt.Errorf("error merging local config file: %w", err)
+			}
+			debug.Logf("Debug: merged local config from %s\n", localConfigPath)
+			// Restore primary as ConfigFileUsed
+			v.SetConfigFile(primaryConfigPath)
+		}
 	} else {
 		// No config.yaml found - use defaults and environment variables
 		debug.Logf("Debug: no config.yaml found; using defaults and environment variables\n")
@@ -202,6 +310,64 @@ func Initialize() error {
 // WARNING: Not thread-safe. Only call from single-threaded test contexts.
 func ResetForTesting() {
 	v = nil
+	overriddenKeys = map[string]bool{}
+}
+
+func worktreeFallbackConfigPath(repoPath string) string {
+	gitDir, commonDir, ok := gitDirsForRepo(repoPath)
+	if !ok || samePath(gitDir, commonDir) {
+		return ""
+	}
+
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Join(filepath.Dir(commonDir), ".beads", "config.yaml")
+	}
+
+	return filepath.Join(commonDir, ".beads", "config.yaml")
+}
+
+func gitDirsForRepo(repoPath string) (gitDir, commonDir string, ok bool) {
+	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--git-dir", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", "", false
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) < 2 {
+		return "", "", false
+	}
+
+	gitDir = gitPathForRepo(repoPath, strings.TrimSpace(lines[0]))
+	commonDir = gitPathForRepo(repoPath, strings.TrimSpace(lines[1]))
+	if gitDir == "" || commonDir == "" {
+		return "", "", false
+	}
+
+	return gitDir, commonDir, true
+}
+
+func gitPathForRepo(repoPath, path string) string {
+	if path == "" {
+		return ""
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repoPath, path)
+	}
+
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+
+	return path
+}
+
+func samePath(left, right string) bool {
+	if left == "" || right == "" {
+		return left == right
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 // ConfigSource represents where a configuration value came from
@@ -231,17 +397,18 @@ func GetValueSource(key string) ConfigSource {
 		return SourceDefault
 	}
 
-	// Check if value is set from environment variable
-	// Viper's IsSet returns true if the key is set from any source (env, config, or default)
-	// We need to check specifically for env var by looking at the env var directly
+	// Check if value is set from environment variable.
+	// Use LookupEnv (not Getenv) so that explicitly-set-but-empty vars like
+	// BD_BACKUP_ENABLED= are recognized as "set by the user" rather than
+	// falling through to the default/auto-detect path.
 	envKey := "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
-	if os.Getenv(envKey) != "" {
+	if _, ok := os.LookupEnv(envKey); ok {
 		return SourceEnvVar
 	}
 
 	// Check BEADS_ prefixed env vars for legacy compatibility
 	beadsEnvKey := "BEADS_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
-	if os.Getenv(beadsEnvKey) != "" {
+	if _, ok := os.LookupEnv(beadsEnvKey); ok {
 		return SourceEnvVar
 	}
 
@@ -250,7 +417,27 @@ func GetValueSource(key string) ConfigSource {
 		return SourceConfigFile
 	}
 
+	// Check if value was explicitly set via Set() at runtime
+	if overriddenKeys[key] {
+		return SourceConfigFile
+	}
+
 	return SourceDefault
+}
+
+// EnvVarName returns the environment variable name that would override the given
+// config key, if one is set. Returns the BD_ or BEADS_ prefixed name, or empty
+// string if no env var is set for this key.
+func EnvVarName(key string) string {
+	envKey := "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+	if _, ok := os.LookupEnv(envKey); ok {
+		return envKey
+	}
+	beadsEnvKey := "BEADS_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+	if _, ok := os.LookupEnv(beadsEnvKey); ok {
+		return beadsEnvKey
+	}
+	return ""
 }
 
 // CheckOverrides checks for configuration overrides and returns a list of detected overrides.
@@ -297,18 +484,15 @@ func CheckOverrides(flagOverrides map[string]struct {
 		for _, key := range v.AllKeys() {
 			envSource := GetValueSource(key)
 			if envSource == SourceEnvVar && v.InConfig(key) {
-				// Env var is overriding config file value
-				// Get the config file value by temporarily unsetting the env
+				// Env var is overriding config file value.
+				// Use LookupEnv to detect presence — empty-string env vars
+				// are still intentional overrides.
 				envKey := "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
-				envValue := os.Getenv(envKey)
-				if envValue == "" {
+				if _, ok := os.LookupEnv(envKey); !ok {
 					envKey = "BEADS_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
-					envValue = os.Getenv(envKey)
-				}
-
-				// Skip if no env var actually set (shouldn't happen but be safe)
-				if envValue == "" {
-					continue
+					if _, ok := os.LookupEnv(envKey); !ok {
+						continue
+					}
 				}
 
 				overrides = append(overrides, ConfigOverride{
@@ -354,12 +538,103 @@ func LogOverride(override ConfigOverride) {
 		override.Key, overrideDesc, override.OriginalValue, sourceDesc, override.EffectiveValue)
 }
 
+// SaveConfigValue sets a key-value pair and writes it to the config file.
+// If no config file is currently loaded, it creates config.yaml in the given beadsDir.
+// Only the specified key is modified; other file contents are preserved.
+func SaveConfigValue(key string, value interface{}, beadsDir string) error {
+	if v == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	v.Set(key, value)
+
+	configPath := v.ConfigFileUsed()
+	if configPath == "" {
+		configPath = filepath.Join(beadsDir, "config.yaml")
+		v.SetConfigFile(configPath)
+	}
+
+	// Read existing file contents to avoid dumping all merged viper state
+	// (defaults, env vars, overrides) into the config file.
+	existing := make(map[string]interface{})
+	if data, err := os.ReadFile(filepath.Clean(configPath)); err == nil {
+		_ = yaml.Unmarshal(data, &existing)
+	}
+
+	// Set the single key using dot-path splitting for nested keys (e.g. "routing.mode").
+	setNestedKey(existing, key, value)
+
+	out, err := yaml.Marshal(existing)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+	return os.WriteFile(configPath, out, 0o600)
+}
+
+// setNestedKey sets a value in a nested map using a dot-separated key path.
+func setNestedKey(m map[string]interface{}, key string, value interface{}) {
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) == 1 {
+		m[key] = value
+		return
+	}
+	sub, ok := m[parts[0]].(map[string]interface{})
+	if !ok {
+		sub = make(map[string]interface{})
+		m[parts[0]] = sub
+	}
+	setNestedKey(sub, parts[1], value)
+}
+
 // GetString retrieves a string configuration value
 func GetString(key string) string {
 	if v == nil {
 		return ""
 	}
 	return v.GetString(key)
+}
+
+// GetStringFromDir reads a single string configuration value directly from
+// <beadsDir>/config.yaml without using or modifying global viper state.
+// This is intended for library consumers that call NewFromConfigWithOptions
+// without first invoking config.Initialize().
+//
+// The key uses dotted notation (e.g. "dolt.auto-start"). YAML booleans and
+// numbers are coerced to their string representations ("true", "false", etc.).
+// Returns "" if the file is absent, the key is not found, or any error occurs.
+func GetStringFromDir(beadsDir, key string) string {
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return ""
+	}
+	parts := strings.SplitN(key, ".", 2)
+	node := root
+	for len(parts) == 2 {
+		val, ok := node[parts[0]]
+		if !ok {
+			return ""
+		}
+		m, ok := val.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		node = m
+		parts = strings.SplitN(parts[1], ".", 2)
+	}
+	val, ok := node[parts[0]]
+	if !ok {
+		return ""
+	}
+	switch s := val.(type) {
+	case string:
+		return s
+	default:
+		return fmt.Sprintf("%v", s)
+	}
 }
 
 // GetBool retrieves a boolean configuration value
@@ -390,6 +665,7 @@ func GetDuration(key string) time.Duration {
 func Set(key string, value interface{}) {
 	if v != nil {
 		v.Set(key, value)
+		overriddenKeys[key] = true
 	}
 }
 
@@ -404,12 +680,27 @@ func Set(key string, value interface{}) {
 // 	return v.BindPFlag(key, flag)
 // }
 
+// DefaultAIModel returns the configured AI model identifier.
+// Override via: bd config set ai.model "model-name" or BD_AI_MODEL=model-name
+func DefaultAIModel() string {
+	return GetString("ai.model")
+}
+
 // AllSettings returns all configuration settings as a map
 func AllSettings() map[string]interface{} {
 	if v == nil {
 		return map[string]interface{}{}
 	}
 	return v.AllSettings()
+}
+
+// AllKeys returns all keys in the viper registry (defaults + config file + env).
+// Keys are returned in lowercase dot-notation (e.g., "federation.remote").
+func AllKeys() []string {
+	if v == nil {
+		return nil
+	}
+	return v.AllKeys()
 }
 
 // ConfigFileUsed returns the path to the config file that was loaded.
@@ -499,7 +790,7 @@ func GetMultiRepoConfig() *MultiRepoConfig {
 //
 //	external_projects:
 //	  beads: ../beads
-//	  gastown: /absolute/path/to/gastown
+//	  other-project: /absolute/path/to/other-project
 func GetExternalProjects() map[string]string {
 	return GetStringMapString("external_projects")
 }
@@ -515,7 +806,7 @@ func ResolveExternalProjectPath(projectName string) string {
 
 	// Resolve relative paths from repo root (parent of .beads/), NOT CWD.
 	// This ensures paths like "../beads" in config resolve correctly
-	// when running from different directories or in daemon context.
+	// when running from different directories.
 	if !filepath.IsAbs(path) {
 		// Config is at .beads/config.yaml, so go up twice to get repo root
 		configFile := ConfigFileUsed()
@@ -575,138 +866,20 @@ func GetIdentity(flagValue string) string {
 	return "unknown"
 }
 
-// SyncConfig holds the sync mode configuration.
-type SyncConfig struct {
-	Mode     SyncMode // git-portable, realtime, dolt-native, belt-and-suspenders
-	ExportOn string   // push, change
-	ImportOn string   // pull, change
-}
-
-// GetSyncConfig returns the current sync configuration.
-func GetSyncConfig() SyncConfig {
-	return SyncConfig{
-		Mode:     GetSyncMode(),
-		ExportOn: GetString("sync.export_on"),
-		ImportOn: GetString("sync.import_on"),
-	}
-}
-
-// ConflictConfig holds the conflict resolution configuration.
-type ConflictConfig struct {
-	Strategy ConflictStrategy          // newest, ours, theirs, manual (default for all fields)
-	Fields   map[string]FieldStrategy  // Per-field strategy overrides
-}
-
-// GetConflictConfig returns the current conflict resolution configuration.
-func GetConflictConfig() ConflictConfig {
-	return ConflictConfig{
-		Strategy: GetConflictStrategy(),
-		Fields:   GetFieldStrategies(),
-	}
-}
-
-// GetFieldStrategies retrieves per-field conflict resolution strategies from config.
-// Returns a map of field name to strategy (e.g., {"labels": "union", "compaction_level": "max"}).
-// Invalid strategies are logged and skipped.
-//
-// Config key: conflict.fields
-// Example:
-//
-//	conflict:
-//	  strategy: newest
-//	  fields:
-//	    compaction_level: max
-//	    labels: union
-//	    waiters: union
-//	    estimated_minutes: manual
-func GetFieldStrategies() map[string]FieldStrategy {
-	result := make(map[string]FieldStrategy)
-	if v == nil {
-		return result
-	}
-
-	// Get the raw map from config
-	fieldsMap := v.GetStringMapString("conflict.fields")
-	if fieldsMap == nil {
-		return result
-	}
-
-	for field, strategyStr := range fieldsMap {
-		strategy := FieldStrategy(strings.ToLower(strings.TrimSpace(strategyStr)))
-		if !validFieldStrategies[strategy] {
-			logConfigWarning("Warning: invalid conflict.fields.%s strategy %q (valid: %s), skipping\n",
-				field, strategyStr, strings.Join(ValidFieldStrategies(), ", "))
-			continue
-		}
-		result[field] = strategy
-	}
-
-	return result
-}
-
-// GetFieldStrategy returns the merge strategy for a specific field.
-// Returns the per-field strategy if configured, otherwise returns "newest" (default).
-func GetFieldStrategy(field string) FieldStrategy {
-	fields := GetFieldStrategies()
-	if strategy, ok := fields[field]; ok {
-		return strategy
-	}
-	return FieldStrategyNewest // Default
-}
-
 // FederationConfig holds the federation (Dolt remote) configuration.
 type FederationConfig struct {
-	Remote      string      // dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
-	Sovereignty Sovereignty // T1, T2, T3, T4
+	Remote       string      // dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
+	Sovereignty  Sovereignty // T1, T2, T3, T4
+	ExcludeTypes []string    // issue types excluded from federation push (e.g. ["wisp"])
 }
 
 // GetFederationConfig returns the current federation configuration.
 func GetFederationConfig() FederationConfig {
 	return FederationConfig{
-		Remote:      GetString("federation.remote"),
-		Sovereignty: GetSovereignty(),
+		Remote:       GetString("federation.remote"),
+		Sovereignty:  GetSovereignty(),
+		ExcludeTypes: GetStringSlice("federation.exclude_types"),
 	}
-}
-
-// IsSyncModeValid checks if the given sync mode string is valid.
-func IsSyncModeValid(mode string) bool {
-	return validSyncModes[SyncMode(mode)]
-}
-
-// IsConflictStrategyValid checks if the given conflict strategy string is valid.
-func IsConflictStrategyValid(strategy string) bool {
-	return validConflictStrategies[ConflictStrategy(strategy)]
-}
-
-// IsSovereigntyValid checks if the given sovereignty tier string is valid.
-// Note: empty string is valid (means no restriction).
-func IsSovereigntyValid(sovereignty string) bool {
-	if sovereignty == "" {
-		return true
-	}
-	return validSovereigntyTiers[Sovereignty(sovereignty)]
-}
-
-// ShouldExportOnChange returns true if sync.export_on is set to "change".
-func ShouldExportOnChange() bool {
-	return GetString("sync.export_on") == SyncTriggerChange
-}
-
-// ShouldImportOnChange returns true if sync.import_on is set to "change".
-func ShouldImportOnChange() bool {
-	return GetString("sync.import_on") == SyncTriggerChange
-}
-
-// NeedsDoltRemote returns true if the sync mode requires a Dolt remote.
-func NeedsDoltRemote() bool {
-	mode := GetSyncMode()
-	return mode == SyncModeDoltNative || mode == SyncModeBeltAndSuspenders
-}
-
-// NeedsJSONL returns true if the sync mode requires JSONL export.
-func NeedsJSONL() bool {
-	mode := GetSyncMode()
-	return mode == SyncModeGitPortable || mode == SyncModeRealtime || mode == SyncModeBeltAndSuspenders
 }
 
 // GetCustomTypesFromYAML retrieves custom issue types from config.yaml.
@@ -717,6 +890,13 @@ func GetCustomTypesFromYAML() []string {
 	return getConfigList("types.custom")
 }
 
+// GetInfraTypesFromYAML retrieves infrastructure type names from config.yaml.
+// Infrastructure types are routed to the wisps table instead of the versioned issues table.
+// Returns nil if no infra types are configured in config.yaml (caller should use defaults).
+func GetInfraTypesFromYAML() []string {
+	return getConfigList("types.infra")
+}
+
 // GetCustomStatusesFromYAML retrieves custom statuses from config.yaml.
 // This is used as a fallback when the database doesn't have status.custom set yet
 // or when the database connection is temporarily unavailable.
@@ -725,34 +905,90 @@ func GetCustomStatusesFromYAML() []string {
 	return getConfigList("status.custom")
 }
 
-// ===== Agent Role Configuration =====
-// These functions return agent role types from config.yaml for agent ID parsing.
-// Each role category has different parsing semantics:
-//   - Town-level: <prefix>-<role> (singleton, no rig)
-//   - Rig-level: <prefix>-<rig>-<role> (singleton per rig)
-//   - Named: <prefix>-<rig>-<role>-<name> (multiple per rig)
-
-// GetTownLevelRoles returns roles that are town-level singletons.
-// These roles have no rig association and appear as: <prefix>-<role>
-func GetTownLevelRoles() []string {
-	return getConfigList("agent_roles.town_level")
+// MetadataValidationMode returns the metadata schema validation mode.
+// Returns "none" if config is not initialized or mode is empty/unknown.
+func MetadataValidationMode() string {
+	if v == nil {
+		return "none"
+	}
+	mode := v.GetString("validation.metadata.mode")
+	switch mode {
+	case "warn", "error":
+		return mode
+	default:
+		return "none"
+	}
 }
 
-// GetRigLevelRoles returns roles that are rig-level singletons.
-// These roles have one instance per rig: <prefix>-<rig>-<role>
-func GetRigLevelRoles() []string {
-	return getConfigList("agent_roles.rig_level")
+// MetadataSchemaFields returns the raw field definitions from config.
+// Returns nil if config is not initialized or no fields are defined.
+// Each entry maps field name → map of properties (type, values, required, min, max).
+func MetadataSchemaFields() map[string]interface{} {
+	if v == nil {
+		return nil
+	}
+	raw := v.Get("validation.metadata.fields")
+	if raw == nil {
+		return nil
+	}
+	// Viper returns map[string]interface{} for nested YAML maps
+	if m, ok := raw.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
 }
 
-// GetNamedRoles returns roles that can have multiple named instances per rig.
-// These roles include a name suffix: <prefix>-<rig>-<role>-<name>
-func GetNamedRoles() []string {
-	return getConfigList("agent_roles.named")
+// DefaultAgentsFile is the default filename for agent instructions.
+const DefaultAgentsFile = "AGENTS.md"
+
+// AgentsFile returns the configured agents instruction filename.
+// Returns DefaultAgentsFile ("AGENTS.md") if no custom value is set.
+// Note: Use SafeAgentsFile() when the value will be used for file I/O,
+// as config.yaml may be manually edited with invalid values.
+func AgentsFile() string {
+	if name := GetString("agents.file"); name != "" {
+		return name
+	}
+	return DefaultAgentsFile
+}
+
+// SafeAgentsFile returns the configured agents filename after validation.
+// If the stored config value is invalid (e.g. manually edited with traversal
+// paths), it falls back to DefaultAgentsFile and logs a warning.
+func SafeAgentsFile() string {
+	name := AgentsFile()
+	if err := ValidateAgentsFile(name); err != nil {
+		debug.Logf("config: agents.file %q failed validation (%v), using default", name, err)
+		return DefaultAgentsFile
+	}
+	return name
+}
+
+// ValidateAgentsFile checks that filename is safe to use as an agents file path.
+// It rejects absolute paths, path separators, names longer than 255 characters,
+// and non-markdown extensions. This is a pure string validation function — I/O
+// checks (e.g. symlink detection) are deferred to the file write layer.
+func ValidateAgentsFile(filename string) error {
+	if filename == "" {
+		return fmt.Errorf("agents file name must not be empty")
+	}
+	if len(filename) > 255 {
+		return fmt.Errorf("agents file name exceeds 255 characters")
+	}
+	if strings.ContainsAny(filename, "/\\") {
+		return fmt.Errorf("agents file must be a simple filename without path separators, got %q", filename)
+	}
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".md" {
+		return fmt.Errorf("agents file must have .md extension, got %q", ext)
+	}
+	return nil
 }
 
 // getConfigList is a helper that retrieves a comma-separated list from config.yaml.
 func getConfigList(key string) []string {
 	if v == nil {
+		debug.Logf("config: viper not initialized, returning nil for key %q", key)
 		return nil
 	}
 

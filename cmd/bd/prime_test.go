@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,8 +25,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: false,
 			localOnlyMode: false,
-			expectText:    []string{"Beads Workflow Context", "bd sync", "git push"},
-			rejectText:    []string{"bd sync --flush-only", "--from-main"},
+			expectText:    []string{"Beads Workflow Context", "bd dolt push", "git push"},
+			rejectText:    []string{"bd export", "--from-main"},
 		},
 		{
 			name:          "CLI Normal (ephemeral)",
@@ -31,8 +34,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: true,
 			localOnlyMode: false,
-			expectText:    []string{"Beads Workflow Context", "bd sync --from-main", "ephemeral branch"},
-			rejectText:    []string{"bd sync --flush-only", "git push"},
+			expectText:    []string{"Beads Workflow Context", "bd dolt pull", "ephemeral branch"},
+			rejectText:    []string{"bd export", "git push", "--from-main"},
 		},
 		{
 			name:          "CLI Stealth",
@@ -40,8 +43,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   true,
 			ephemeralMode: false, // stealth mode overrides ephemeral detection
 			localOnlyMode: false,
-			expectText:    []string{"Beads Workflow Context", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add"},
+			expectText:    []string{"Beads Workflow Context", "bd close"},
+			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add", "bd export"},
 		},
 		{
 			name:          "CLI Local-only (no git remote)",
@@ -49,8 +52,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: false,
 			localOnlyMode: true,
-			expectText:    []string{"Beads Workflow Context", "bd sync --flush-only", "No git remote configured"},
-			rejectText:    []string{"git push", "git pull", "--from-main"},
+			expectText:    []string{"Beads Workflow Context", "bd close", "No git remote configured"},
+			rejectText:    []string{"git push", "git pull", "--from-main", "bd export"},
 		},
 		{
 			name:          "CLI Local-only overrides ephemeral",
@@ -58,8 +61,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: true, // ephemeral is true but local-only takes precedence
 			localOnlyMode: true,
-			expectText:    []string{"Beads Workflow Context", "bd sync --flush-only", "No git remote configured"},
-			rejectText:    []string{"git push", "--from-main", "ephemeral branch"},
+			expectText:    []string{"Beads Workflow Context", "bd close", "No git remote configured"},
+			rejectText:    []string{"git push", "--from-main", "ephemeral branch", "bd export"},
 		},
 		{
 			name:          "CLI Stealth overrides local-only",
@@ -67,8 +70,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   true,
 			ephemeralMode: false,
 			localOnlyMode: true, // local-only is true but stealth takes precedence
-			expectText:    []string{"Beads Workflow Context", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add", "No git remote configured"},
+			expectText:    []string{"Beads Workflow Context", "bd close"},
+			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add", "No git remote configured", "bd export"},
 		},
 		{
 			name:          "MCP Normal (non-ephemeral)",
@@ -76,8 +79,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: false,
 			localOnlyMode: false,
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync", "git push"},
-			rejectText:    []string{"bd sync --flush-only", "--from-main"},
+			expectText:    []string{"Beads Issue Tracker Active", "git push"},
+			rejectText:    []string{"bd export", "--from-main"},
 		},
 		{
 			name:          "MCP Normal (ephemeral)",
@@ -85,8 +88,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: true,
 			localOnlyMode: false,
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync --from-main", "ephemeral branch"},
-			rejectText:    []string{"bd sync --flush-only", "git push"},
+			expectText:    []string{"Beads Issue Tracker Active", "ephemeral branch"},
+			rejectText:    []string{"bd export", "git push", "--from-main"},
 		},
 		{
 			name:          "MCP Stealth",
@@ -94,8 +97,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   true,
 			ephemeralMode: false, // stealth mode overrides ephemeral detection
 			localOnlyMode: false,
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add"},
+			expectText:    []string{"Beads Issue Tracker Active", "bd close"},
+			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add", "bd export"},
 		},
 		{
 			name:          "MCP Local-only (no git remote)",
@@ -103,8 +106,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: false,
 			localOnlyMode: true,
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "git pull", "--from-main"},
+			expectText:    []string{"Beads Issue Tracker Active", "bd close"},
+			rejectText:    []string{"git push", "git pull", "--from-main", "bd export"},
 		},
 		{
 			name:          "MCP Local-only overrides ephemeral",
@@ -112,8 +115,8 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   false,
 			ephemeralMode: true, // ephemeral is true but local-only takes precedence
 			localOnlyMode: true,
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "--from-main", "ephemeral branch"},
+			expectText:    []string{"Beads Issue Tracker Active", "bd close"},
+			rejectText:    []string{"git push", "--from-main", "ephemeral branch", "bd export"},
 		},
 		{
 			name:          "MCP Stealth overrides local-only",
@@ -121,15 +124,14 @@ func TestOutputContextFunction(t *testing.T) {
 			stealthMode:   true,
 			ephemeralMode: false,
 			localOnlyMode: true, // local-only is true but stealth takes precedence
-			expectText:    []string{"Beads Issue Tracker Active", "bd sync --flush-only"},
-			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add"},
+			expectText:    []string{"Beads Issue Tracker Active", "bd close"},
+			rejectText:    []string{"git push", "git pull", "git commit", "git status", "git add", "bd export"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			defer stubIsEphemeralBranch(tt.ephemeralMode)()
-			defer stubIsDaemonAutoSyncing(false)()             // Default: no auto-sync in tests
 			defer stubPrimeHasGitRemote(!tt.localOnlyMode)() // localOnly = !primeHasGitRemote
 
 			var buf bytes.Buffer
@@ -155,6 +157,72 @@ func TestOutputContextFunction(t *testing.T) {
 	}
 }
 
+func TestPrimeClaimGuidanceUsesAtomicClaim(t *testing.T) {
+	defer stubIsEphemeralBranch(false)()
+	defer stubPrimeHasGitRemote(true)()
+
+	var buf bytes.Buffer
+	if err := outputPrimeContext(&buf, false, false); err != nil {
+		t.Fatalf("outputPrimeContext failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "bd update <id> --claim") {
+		t.Fatal("prime output should teach bd update <id> --claim")
+	}
+	if strings.Contains(output, "bd update <id> --status=in_progress") {
+		t.Fatal("prime output should not teach bd update <id> --status=in_progress")
+	}
+}
+
+func TestPrimeStartsWithTruncationDirective(t *testing.T) {
+	defer stubIsEphemeralBranch(false)()
+	defer stubPrimeHasGitRemote(true)()
+
+	for _, mcpMode := range []bool{false, true} {
+		var buf bytes.Buffer
+		if err := outputPrimeContext(&buf, mcpMode, false); err != nil {
+			t.Fatalf("outputPrimeContext failed: %v", err)
+		}
+		if !strings.HasPrefix(buf.String(), primeTruncationDirective) {
+			t.Fatalf("prime output should start with truncation directive; got %q", buf.String()[:min(120, buf.Len())])
+		}
+	}
+}
+
+func TestPrimeMemoriesOnlyNoMemories(t *testing.T) {
+	var buf bytes.Buffer
+	if err := outputPrimeContextWithOptions(&buf, false, false, true); err != nil {
+		t.Fatalf("outputPrimeContextWithOptions failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.HasPrefix(output, primeTruncationDirective) {
+		t.Fatal("memories-only output should start with truncation directive")
+	}
+	if strings.Contains(output, "Essential Commands") {
+		t.Fatalf("memories-only output should not include the full workflow guide: %s", output)
+	}
+}
+
+func TestPrimeContextUsesWorkspaceLanguage(t *testing.T) {
+	defer stubIsEphemeralBranch(false)()
+	defer stubPrimeHasGitRemote(true)()
+
+	var buf bytes.Buffer
+	if err := outputPrimeContext(&buf, false, false); err != nil {
+		t.Fatalf("outputPrimeContext failed: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "resolved") || !strings.Contains(output, "workspace") {
+		t.Fatalf("prime output should describe resolved workspace semantics: %s", output)
+	}
+	if strings.Contains(output, "when .beads/ detected") {
+		t.Fatal("prime output should not imply local .beads detection is required")
+	}
+}
+
 // stubIsEphemeralBranch temporarily replaces isEphemeralBranch
 // with a stub returning returnValue.
 //
@@ -172,18 +240,6 @@ func stubIsEphemeralBranch(isEphem bool) func() {
 	}
 }
 
-// stubIsDaemonAutoSyncing temporarily replaces isDaemonAutoSyncing
-// with a stub returning returnValue.
-func stubIsDaemonAutoSyncing(isAutoSync bool) func() {
-	original := isDaemonAutoSyncing
-	isDaemonAutoSyncing = func() bool {
-		return isAutoSync
-	}
-	return func() {
-		isDaemonAutoSyncing = original
-	}
-}
-
 // stubPrimeHasGitRemote temporarily replaces primeHasGitRemote
 // with a stub returning returnValue.
 //
@@ -198,5 +254,123 @@ func stubPrimeHasGitRemote(hasRemote bool) func() {
 	}
 	return func() {
 		primeHasGitRemote = original
+	}
+}
+
+func TestPrimeGlobalFallback(t *testing.T) {
+	// Create a temp directory to act as config dir
+	tmpDir := t.TempDir()
+	beadsConfigDir := filepath.Join(tmpDir, "beads")
+	if err := os.MkdirAll(beadsConfigDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	content := "# Global PRIME override\nCustom instructions here.\n"
+	if err := os.WriteFile(filepath.Join(beadsConfigDir, "PRIME.md"), []byte(content), 0644); err != nil {
+		t.Fatalf("write PRIME.md: %v", err)
+	}
+
+	// Call the helper that resolves the global prime path
+	got := resolveGlobalPrimePath(tmpDir)
+	if got == "" {
+		t.Fatal("resolveGlobalPrimePath returned empty, want path to global PRIME.md")
+	}
+
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", got, err)
+	}
+	if string(data) != content {
+		t.Errorf("content = %q, want %q", string(data), content)
+	}
+}
+
+func TestPrimeGlobalFallback_Missing(t *testing.T) {
+	// When no global PRIME.md exists, should return empty string
+	tmpDir := t.TempDir()
+	got := resolveGlobalPrimePath(tmpDir)
+	if got != "" {
+		t.Errorf("resolveGlobalPrimePath = %q, want empty for missing file", got)
+	}
+}
+
+// hookJSONEnvelope mirrors the JSON shape produced by outputHookJSON —
+// kept in test code so the assertion fails loudly if the production shape
+// drifts.
+type hookJSONEnvelope struct {
+	HookSpecificOutput struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	} `json:"hookSpecificOutput"`
+}
+
+func TestOutputHookJSON_ShapeWithContent(t *testing.T) {
+	var buf bytes.Buffer
+	const payload = "# Hello\n\nbd ready\n"
+	if err := outputHookJSON(&buf, payload); err != nil {
+		t.Fatalf("outputHookJSON: %v", err)
+	}
+
+	// json.Encoder.Encode appends a trailing newline; the JSON itself must
+	// still be valid.
+	out := strings.TrimRight(buf.String(), "\n")
+
+	var env hookJSONEnvelope
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if env.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Errorf("hookEventName = %q, want SessionStart", env.HookSpecificOutput.HookEventName)
+	}
+	if env.HookSpecificOutput.AdditionalContext != payload {
+		t.Errorf("additionalContext = %q, want %q", env.HookSpecificOutput.AdditionalContext, payload)
+	}
+}
+
+func TestOutputHookJSON_EmptyContent(t *testing.T) {
+	// Empty envelope is the contract for "nothing to inject" — the hook host
+	// still requires valid JSON on stdout, so we cannot just emit nothing.
+	var buf bytes.Buffer
+	if err := outputHookJSON(&buf, ""); err != nil {
+		t.Fatalf("outputHookJSON: %v", err)
+	}
+
+	var env hookJSONEnvelope
+	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &env); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if env.HookSpecificOutput.HookEventName != "SessionStart" {
+		t.Errorf("hookEventName = %q, want SessionStart", env.HookSpecificOutput.HookEventName)
+	}
+	if env.HookSpecificOutput.AdditionalContext != "" {
+		t.Errorf("additionalContext = %q, want empty", env.HookSpecificOutput.AdditionalContext)
+	}
+}
+
+// TestPrime_RawMarkdown_NotJSON_WithoutFlag is a regression guard: without
+// --hook-json, prime output must remain raw markdown (used by CLI users and
+// any hook-free integrations). It would be a regression if the JSON envelope
+// leaked into the default path.
+func TestPrime_RawMarkdown_NotJSON_WithoutFlag(t *testing.T) {
+	defer stubIsEphemeralBranch(false)()
+	defer stubPrimeHasGitRemote(true)()
+
+	var buf bytes.Buffer
+	if err := outputPrimeContext(&buf, false, false); err != nil {
+		t.Fatalf("outputPrimeContext: %v", err)
+	}
+
+	output := buf.String()
+	if strings.HasPrefix(strings.TrimSpace(output), "{") {
+		preview := output
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		t.Fatalf("prime output without --hook-json should be raw markdown, got JSON-looking content: %q", preview)
+	}
+	// Best-effort: confirm the raw markdown contract holds.
+	var envelope map[string]interface{}
+	if err := json.Unmarshal([]byte(output), &envelope); err == nil {
+		t.Fatal("prime output without --hook-json should not be valid JSON (regression guard)")
 	}
 }

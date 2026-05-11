@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -134,34 +134,27 @@ func DefaultXLargeConfig() DataConfig {
 	}
 }
 
-// LargeSQLite creates a 10K issue database with realistic patterns
-func LargeSQLite(ctx context.Context, store storage.Storage) error {
+// LargeDolt creates a 10K issue database with realistic patterns
+func LargeDolt(ctx context.Context, store *dolt.DoltStore) error {
 	cfg := DefaultLargeConfig()
 	return generateIssuesWithConfig(ctx, store, cfg)
 }
 
-// XLargeSQLite creates a 20K issue database with realistic patterns
-func XLargeSQLite(ctx context.Context, store storage.Storage) error {
+// XLargeDolt creates a 20K issue database with realistic patterns
+func XLargeDolt(ctx context.Context, store *dolt.DoltStore) error {
 	cfg := DefaultXLargeConfig()
 	return generateIssuesWithConfig(ctx, store, cfg)
 }
 
 // LargeFromJSONL creates a 10K issue database by exporting to JSONL and reimporting
-func LargeFromJSONL(ctx context.Context, store storage.Storage, tempDir string) error {
+func LargeFromJSONL(ctx context.Context, store *dolt.DoltStore, tempDir string) error {
 	cfg := DefaultLargeConfig()
 	cfg.RandSeed = 44 // different seed for JSONL path
 	return generateFromJSONL(ctx, store, tempDir, cfg)
 }
 
-// XLargeFromJSONL creates a 20K issue database by exporting to JSONL and reimporting
-func XLargeFromJSONL(ctx context.Context, store storage.Storage, tempDir string) error {
-	cfg := DefaultXLargeConfig()
-	cfg.RandSeed = 45 // different seed for JSONL path
-	return generateFromJSONL(ctx, store, tempDir, cfg)
-}
-
 // generateIssuesWithConfig creates issues with realistic epic hierarchies and cross-links using provided configuration
-func generateIssuesWithConfig(ctx context.Context, store storage.Storage, cfg DataConfig) error {
+func generateIssuesWithConfig(ctx context.Context, store *dolt.DoltStore, cfg DataConfig) error {
 	rng := rand.New(rand.NewSource(cfg.RandSeed)) // #nosec G404 -- deterministic math/rand used for repeatable fixture data
 
 	// Calculate breakdown using configuration ratios
@@ -346,7 +339,7 @@ func generateIssuesWithConfig(ctx context.Context, store storage.Storage, cfg Da
 }
 
 // generateFromJSONL creates issues, exports to JSONL, clears DB, and reimports
-func generateFromJSONL(ctx context.Context, store storage.Storage, tempDir string, cfg DataConfig) error {
+func generateFromJSONL(ctx context.Context, store *dolt.DoltStore, tempDir string, cfg DataConfig) error {
 	// First generate issues normally
 	if err := generateIssuesWithConfig(ctx, store, cfg); err != nil {
 		return fmt.Errorf("failed to generate issues: %w", err)
@@ -379,7 +372,7 @@ func generateFromJSONL(ctx context.Context, store storage.Storage, tempDir strin
 }
 
 // exportToJSONL exports all issues to a JSONL file
-func exportToJSONL(ctx context.Context, store storage.Storage, path string) error {
+func exportToJSONL(ctx context.Context, store *dolt.DoltStore, path string) error {
 	// Get all issues
 	allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
@@ -421,7 +414,7 @@ func exportToJSONL(ctx context.Context, store storage.Storage, path string) erro
 }
 
 // importFromJSONL imports issues from a JSONL file
-func importFromJSONL(ctx context.Context, store storage.Storage, path string) error {
+func importFromJSONL(ctx context.Context, store *dolt.DoltStore, path string) error {
 	// Read JSONL file
 	// #nosec G304 -- fixture imports from deterministic file created earlier in test
 	data, err := os.ReadFile(path)
@@ -463,10 +456,7 @@ func importFromJSONL(ctx context.Context, store storage.Storage, path string) er
 		issue.Labels = nil
 
 		if err := store.CreateIssue(ctx, issue, "fixture"); err != nil {
-			// Ignore duplicate errors
-			if !strings.Contains(err.Error(), "UNIQUE constraint failed") {
-				return fmt.Errorf("failed to create issue %s: %w", issue.ID, err)
-			}
+			return fmt.Errorf("failed to create issue %s: %w", issue.ID, err)
 		}
 	}
 

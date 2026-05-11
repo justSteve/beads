@@ -226,7 +226,7 @@ bd list --label needs-triage
 ### Quality Gate Workflow
 ```bash
 # Start work
-bd update bd-42 --status in_progress
+bd update bd-42 --claim
 
 # Mark quality requirements
 bd label add bd-42 needs-tests
@@ -319,19 +319,19 @@ done
 
 ## Integration with Git Workflow
 
-Labels are automatically synced to `.beads/issues.jsonl` along with all issue data:
+Labels are stored in the Dolt database and synced automatically with all issue data:
 
 ```bash
 # Make changes
 bd create "Fix bug" -l backend,urgent
 bd label add bd-42 needs-review
 
-# Auto-exported after 5 seconds (or use git hooks for immediate export)
-git add .beads/issues.jsonl
-git commit -m "Add backend issue"
+# Changes are committed to Dolt history automatically
+# Sync with remotes when ready:
+bd dolt push
 
-# After git pull, labels are auto-imported
-git pull
+# After pulling changes:
+bd dolt pull
 bd list --label backend  # Fresh data including labels
 ```
 
@@ -426,7 +426,7 @@ bd create "Extract validateToken function" -t chore -p 2 \
   --deps discovered-from:bd-10
 
 # Agent marks work for review
-bd update bd-42 --status in_progress
+bd update bd-42 --claim
 # ... agent does work ...
 bd label add bd-42 needs-review
 bd label add bd-42 ai-generated
@@ -458,11 +458,11 @@ Examples:
 ```bash
 # Event: Full record of what happened and why
 bd create "Muted patrol: user requested during debugging" -t event \
-  -l event-type:patrol-muted,actor:witness,reason:user-request
+  -l event-type:patrol-muted,actor:observer,reason:user-request
 
 # State: Update the role bead's label to reflect current state
-bd label remove beads/witness patrol:active
-bd label add beads/witness patrol:muted
+bd label remove beads/observer patrol:active
+bd label add beads/observer patrol:muted
 ```
 
 **Key principle:** Events are the source of truth. Labels are a cache for fast queries.
@@ -475,7 +475,7 @@ bd label add beads/witness patrol:muted
 bd list --type event | grep "patrol" | tail -1  # Slow, fragile
 
 # With labels-as-state: direct query
-bd show beads/witness | grep "patrol:"  # Instant
+bd show beads/observer | grep "patrol:"  # Instant
 ```
 
 **History preserved:**
@@ -524,14 +524,14 @@ transition_state() {
 }
 
 # Usage
-transition_state beads/witness patrol active muted "User debugging session"
+transition_state beads/observer patrol active muted "User debugging session"
 ```
 
 ### Querying State
 
 ```bash
 # Current state of a role
-bd label list beads/witness | grep ":"
+bd label list beads/observer | grep ":"
 
 # All roles in a specific state
 bd list --label patrol:muted
@@ -556,10 +556,10 @@ bd list --type event --label event-type:state-change
 The pattern suggests helper commands (see bd-7l67):
 ```bash
 # Query current state
-bd state beads/witness patrol     # → "muted"
+bd state beads/observer patrol     # → "muted"
 
 # Transition with automatic event creation
-bd set-state beads/witness patrol=active --reason "Debugging complete"
+bd set-state beads/observer patrol=active --reason "Debugging complete"
 ```
 
 Until helpers exist, use the manual pattern above.
@@ -617,7 +617,7 @@ bd list --label breaking-change --label needs-docs
 
 ## Operational State Pattern (Labels as Cache)
 
-For orchestration systems like Gas Town, labels can cache the current operational state of "role beads" (issues representing agents or system components). This enables fast state queries without scanning event history.
+For orchestration systems, labels can cache the current operational state of "role beads" (issues representing agents or system components). This enables fast state queries without scanning event history.
 
 ### Convention: `<dimension>:<value>`
 
@@ -637,13 +637,13 @@ health:healthy    health:failing
 
 ```bash
 # 1. Record the event (source of truth)
-bd create "Muted patrol for witness-abc" -t event \
-  --parent witness-abc \
-  -d "Reason: investigating stuck polecat. Expected duration: 30m"
+bd create "Muted patrol for agent-abc" -t event \
+  --parent agent-abc \
+  -d "Reason: investigating stuck worker. Expected duration: 30m"
 
 # 2. Update the cached state label
-bd label remove witness-abc patrol:active
-bd label add witness-abc patrol:muted
+bd label remove agent-abc patrol:active
+bd label add agent-abc patrol:muted
 ```
 
 ### Why This Pattern?
@@ -766,18 +766,18 @@ bd list --label backend       # Won't match
 bd label list-all
 ```
 
-### Syncing Labels with Git
-Labels are included in `.beads/issues.jsonl` export. If labels seem out of sync:
+### Syncing Labels
+Labels are stored in the Dolt database. If labels seem out of sync:
 ```bash
-# Force export
-bd export -o .beads/issues.jsonl
+# Pull from Dolt remote
+bd dolt pull
 
-# After pull, force import
-bd import -i .beads/issues.jsonl
+# Or run doctor to diagnose
+bd doctor
 ```
 
 ## See Also
 
 - [README.md](../README.md) - Main documentation
 - [AGENTS.md](../AGENTS.md) - AI agent integration guide
-- [ADVANCED.md](ADVANCED.md) - JSONL format details
+- [ADVANCED.md](ADVANCED.md) - Advanced features and configuration

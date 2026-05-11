@@ -43,9 +43,13 @@ check_version "integrations/beads-mcp/src/beads_mcp/__init__.py" \
     "$(grep '__version__ = ' integrations/beads-mcp/src/beads_mcp/__init__.py 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')" \
     "MCP __init__.py"
 
-check_version "claude-plugin/.claude-plugin/plugin.json" \
-    "$(jq -r '.version' claude-plugin/.claude-plugin/plugin.json 2>/dev/null)" \
+check_version "plugins/beads/.claude-plugin/plugin.json" \
+    "$(jq -r '.version' plugins/beads/.claude-plugin/plugin.json 2>/dev/null)" \
     "Claude plugin.json"
+
+check_version "plugins/beads/.codex-plugin/plugin.json" \
+    "$(jq -r '.version' plugins/beads/.codex-plugin/plugin.json 2>/dev/null)" \
+    "Codex plugin.json"
 
 check_version ".claude-plugin/marketplace.json" \
     "$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json 2>/dev/null)" \
@@ -55,16 +59,22 @@ check_version "npm-package/package.json" \
     "$(jq -r '.version' npm-package/package.json 2>/dev/null)" \
     "npm package.json"
 
-check_version "cmd/bd/templates/hooks/pre-commit" \
-    "$(grep '# bd-hooks-version:' cmd/bd/templates/hooks/pre-commit 2>/dev/null | sed 's/.*: //')" \
-    "Hook templates"
+# Hook templates are now generated dynamically by cmd/bd/hooks.go using the
+# Version constant from version.go, so no separate file check is needed.
+# (Previously checked cmd/bd/templates/hooks/pre-commit which no longer exists.)
+
+echo ""
+
+if ! ./scripts/check-docs-version.sh; then
+    MISMATCH=1
+fi
 
 echo ""
 
 if [ $MISMATCH -eq 1 ]; then
     echo -e "${RED}❌ Version mismatch detected!${NC}"
     echo ""
-    echo "Run: scripts/bump-version.sh $CANONICAL"
+    echo "Run: scripts/update-versions.sh $CANONICAL"
     echo "Or manually update the mismatched files."
     exit 1
 else

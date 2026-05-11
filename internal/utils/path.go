@@ -3,75 +3,10 @@ package utils
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
-
-// FindJSONLInDir finds the JSONL file in the given .beads directory.
-// It prefers issues.jsonl over other .jsonl files to prevent accidentally
-// reading/writing to deletions.jsonl or merge artifacts (bd-tqo fix).
-// Always returns a path (defaults to issues.jsonl if nothing suitable found).
-//
-// Search order:
-// 1. issues.jsonl (canonical name)
-// 2. beads.jsonl (legacy support)
-// 3. Any other .jsonl file except deletions/merge artifacts
-// 4. Default to issues.jsonl
-func FindJSONLInDir(dbDir string) string {
-	pattern := filepath.Join(dbDir, "*.jsonl")
-	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
-		// Default to issues.jsonl if glob fails or no matches
-		return filepath.Join(dbDir, "issues.jsonl")
-	}
-
-	// Prefer issues.jsonl over other .jsonl files (bd-tqo fix)
-	// This prevents accidentally using deletions.jsonl or merge artifacts
-	for _, match := range matches {
-		if filepath.Base(match) == "issues.jsonl" {
-			return match
-		}
-	}
-
-	// Fall back to beads.jsonl for legacy support
-	for _, match := range matches {
-		if filepath.Base(match) == "beads.jsonl" {
-			return match
-		}
-	}
-
-	// Last resort: use first match (but skip deletions.jsonl, interactions.jsonl, and merge artifacts)
-	for _, match := range matches {
-		base := filepath.Base(match)
-		// Skip deletions manifest, interactions (audit trail), and merge artifacts
-		if base == "deletions.jsonl" ||
-			base == "interactions.jsonl" ||
-			base == "beads.base.jsonl" ||
-			base == "beads.left.jsonl" ||
-			base == "beads.right.jsonl" {
-			continue
-		}
-		return match
-	}
-
-	// If only deletions/merge files exist, default to issues.jsonl
-	return filepath.Join(dbDir, "issues.jsonl")
-}
-
-// FindMoleculesJSONLInDir finds the molecules.jsonl file in the given .beads directory.
-// Returns the path to molecules.jsonl if it exists, empty string otherwise.
-// Molecules are template issues used for instantiation (beads-1ra).
-func FindMoleculesJSONLInDir(dbDir string) string {
-	moleculesPath := filepath.Join(dbDir, "molecules.jsonl")
-	// Check if file exists - we don't fall back to any other file
-	// because molecules.jsonl is optional and specific
-	if _, err := os.Stat(moleculesPath); err == nil {
-		return moleculesPath
-	}
-	return ""
-}
 
 // ResolveForWrite returns the path to write to, resolving symlinks.
 // If path is a symlink, returns the resolved target path.
@@ -130,21 +65,48 @@ func CanonicalizePath(path string) string {
 }
 
 // resolveCanonicalCase resolves a path to its true filesystem case.
-// On macOS, uses realpath(1) to get the canonical case.
+// On macOS, walks each path component and matches against actual directory
+// entries to recover the correct case (HFS+/APFS are case-insensitive).
 // Returns empty string if resolution fails.
 func resolveCanonicalCase(path string) string {
-	if runtime.GOOS == "darwin" {
-		// Use realpath to get canonical path with correct case
-		// realpath on macOS returns the true filesystem case
-		cmd := exec.Command("realpath", path)
-		output, err := cmd.Output()
-		if err == nil {
-			return strings.TrimSpace(string(output))
+	if runtime.GOOS != "darwin" {
+		// Windows: filepath.EvalSymlinks already handles case
+		return ""
+	}
+
+	// Walk the path component-by-component, resolving each to its true case
+	// by listing the parent directory and matching case-insensitively.
+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	if len(parts) == 0 {
+		return ""
+	}
+
+	// Start from root
+	resolved := string(filepath.Separator)
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		entries, err := os.ReadDir(resolved)
+		if err != nil {
+			return "" // can't read directory, fall back
+		}
+
+		found := false
+		for _, entry := range entries {
+			if strings.EqualFold(entry.Name(), part) {
+				resolved = filepath.Join(resolved, entry.Name())
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "" // component not found, fall back
 		}
 	}
-	// Windows: filepath.EvalSymlinks already handles case on Windows
-	// For other systems or if realpath fails, return empty to use fallback
-	return ""
+
+	return resolved
 }
 
 // NormalizePathForComparison returns a normalized path suitable for comparison.
@@ -182,8 +144,7 @@ func NormalizePathForComparison(path string) string {
 }
 
 // PathsEqual compares two paths for equality, handling case-insensitive
-// filesystems and symlinks. This is the preferred way to compare workspace
-// paths in the daemon registry and discovery code.
+// filesystems and symlinks.
 func PathsEqual(path1, path2 string) bool {
 	return NormalizePathForComparison(path1) == NormalizePathForComparison(path2)
 }

@@ -16,14 +16,14 @@ func TestFixGitignore_FilePermissions(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		setupFunc      func(t *testing.T, tmpDir string) // setup before fix
-		expectedPerms  os.FileMode
-		expectError    bool
+		name          string
+		setupFunc     func(t *testing.T, tmpDir string) // setup before fix
+		expectedPerms os.FileMode
+		expectError   bool
 	}{
 		{
-			name:          "creates new file with 0600 permissions",
-			setupFunc:     func(t *testing.T, tmpDir string) {
+			name: "creates new file with 0600 permissions",
+			setupFunc: func(t *testing.T, tmpDir string) {
 				// Create .beads directory but no .gitignore
 				beadsDir := filepath.Join(tmpDir, ".beads")
 				if err := os.Mkdir(beadsDir, 0750); err != nil {
@@ -97,7 +97,7 @@ func TestFixGitignore_FilePermissions(t *testing.T) {
 			tt.setupFunc(t, tmpDir)
 
 			// Run FixGitignore
-			err = FixGitignore()
+			err = FixGitignore(tmpDir)
 
 			// Check error expectation
 			if tt.expectError {
@@ -169,7 +169,7 @@ func TestFixGitignore_FileOwnership(t *testing.T) {
 	}
 
 	// Run FixGitignore
-	if err := FixGitignore(); err != nil {
+	if err := FixGitignore(tmpDir); err != nil {
 		t.Fatalf("FixGitignore failed: %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestFixGitignore_DoesNotLoosenPermissions(t *testing.T) {
 	beforePerms := beforeInfo.Mode().Perm()
 
 	// Run FixGitignore
-	if err := FixGitignore(); err != nil {
+	if err := FixGitignore(tmpDir); err != nil {
 		t.Fatalf("FixGitignore failed: %v", err)
 	}
 
@@ -340,7 +340,7 @@ daemon.log
 
 			tt.setupFunc(t, tmpDir)
 
-			check := CheckGitignore()
+			check := CheckGitignore(tmpDir)
 
 			if check.Status != tt.expectedStatus {
 				t.Errorf("Expected status %s, got %s", tt.expectedStatus, check.Status)
@@ -484,7 +484,7 @@ custom-pattern.txt
 				t.Fatal(err)
 			}
 
-			err = FixGitignore()
+			err = FixGitignore(tmpDir)
 			if err != nil {
 				t.Fatalf("FixGitignore failed: %v", err)
 			}
@@ -557,7 +557,7 @@ beads.right.meta.json
 		t.Fatal(err)
 	}
 
-	err = FixGitignore()
+	err = FixGitignore(tmpDir)
 	if err != nil {
 		t.Fatalf("FixGitignore failed: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestFixGitignore_Symlink(t *testing.T) {
 
 	// Run FixGitignore - it should write through the symlink
 	// (os.WriteFile follows symlinks, it doesn't replace them)
-	err = FixGitignore()
+	err = FixGitignore(tmpDir)
 	if err != nil {
 		t.Fatalf("FixGitignore failed: %v", err)
 	}
@@ -742,7 +742,7 @@ beads.right.meta.json
 				t.Fatal(err)
 			}
 
-			err = FixGitignore()
+			err = FixGitignore(tmpDir)
 			if err != nil {
 				t.Fatalf("FixGitignore failed: %v", err)
 			}
@@ -762,10 +762,10 @@ beads.right.meta.json
 
 func TestFixGitignore_VeryLongLines(t *testing.T) {
 	tests := []struct {
-		name           string
-		setupFunc      func(t *testing.T, tmpDir string) string
-		description    string
-		expectSuccess  bool
+		name          string
+		setupFunc     func(t *testing.T, tmpDir string) string
+		description   string
+		expectSuccess bool
 	}{
 		{
 			name: "single very long line (10KB)",
@@ -842,7 +842,7 @@ func TestFixGitignore_VeryLongLines(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			err = FixGitignore()
+			err = FixGitignore(tmpDir)
 
 			if tt.expectSuccess {
 				if err != nil {
@@ -913,7 +913,7 @@ func TestCheckGitignore_VariousStatuses(t *testing.T) {
 			description:    "returns ok when gitignore matches template",
 		},
 		{
-			name: "missing one merge artifact pattern",
+			name: "missing required patterns",
 			setupFunc: func(t *testing.T, tmpDir string) {
 				beadsDir := filepath.Join(tmpDir, ".beads")
 				if err := os.Mkdir(beadsDir, 0750); err != nil {
@@ -922,11 +922,6 @@ func TestCheckGitignore_VariousStatuses(t *testing.T) {
 				content := `*.db
 *.db?*
 daemon.log
-beads.base.jsonl
-beads.left.jsonl
-beads.base.meta.json
-beads.left.meta.json
-beads.right.meta.json
 `
 				gitignorePath := filepath.Join(beadsDir, ".gitignore")
 				if err := os.WriteFile(gitignorePath, []byte(content), 0600); err != nil {
@@ -935,7 +930,7 @@ beads.right.meta.json
 			},
 			expectedStatus: StatusWarning,
 			expectedFix:    "Run: bd doctor --fix or bd init (safe to re-run)",
-			description:    "returns warning when missing beads.right.jsonl",
+			description:    "returns warning when missing required patterns like dolt/ and redirect",
 		},
 		{
 			name: "missing multiple required patterns",
@@ -1036,7 +1031,7 @@ daemon.log
 
 			tt.setupFunc(t, tmpDir)
 
-			check := CheckGitignore()
+			check := CheckGitignore(tmpDir)
 
 			if check.Status != tt.expectedStatus {
 				t.Errorf("Expected status %s, got %s", tt.expectedStatus, check.Status)
@@ -1104,7 +1099,7 @@ func TestFixGitignore_SubdirectoryGitignore(t *testing.T) {
 	}
 
 	// Run FixGitignore
-	err = FixGitignore()
+	err = FixGitignore(tmpDir)
 	if err != nil {
 		t.Fatalf("FixGitignore failed: %v", err)
 	}
@@ -1159,7 +1154,7 @@ func TestCheckRedirectNotTracked_NoFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	check := CheckRedirectNotTracked()
+	check := CheckRedirectNotTracked(tmpDir)
 
 	if check.Status != StatusOK {
 		t.Errorf("Expected status %s, got %s", StatusOK, check.Status)
@@ -1190,10 +1185,13 @@ func TestCheckRedirectNotTracked_FileExistsNotTracked(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
+	}
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
 	}
 
 	// Create .beads directory with redirect file
@@ -1206,7 +1204,7 @@ func TestCheckRedirectNotTracked_FileExistsNotTracked(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	check := CheckRedirectNotTracked()
+	check := CheckRedirectNotTracked(tmpDir)
 
 	if check.Status != StatusOK {
 		t.Errorf("Expected status %s, got %s", StatusOK, check.Status)
@@ -1237,15 +1235,14 @@ func TestCheckRedirectNotTracked_FileTracked(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
 	}
-
-	// Configure git user for commits
-	exec.Command("git", "config", "user.email", "test@test.com").Run()
-	exec.Command("git", "config", "user.name", "Test").Run()
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
+	}
 
 	// Create .beads directory with redirect file
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -1263,7 +1260,7 @@ func TestCheckRedirectNotTracked_FileTracked(t *testing.T) {
 		t.Skipf("git add failed: %v", err)
 	}
 
-	check := CheckRedirectNotTracked()
+	check := CheckRedirectNotTracked(tmpDir)
 
 	if check.Status != StatusWarning {
 		t.Errorf("Expected status %s, got %s", StatusWarning, check.Status)
@@ -1297,15 +1294,14 @@ func TestFixRedirectTracking(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
 	}
-
-	// Configure git user for commits
-	exec.Command("git", "config", "user.email", "test@test.com").Run()
-	exec.Command("git", "config", "user.name", "Test").Run()
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
+	}
 
 	// Create .beads directory with redirect file
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -1331,7 +1327,7 @@ func TestFixRedirectTracking(t *testing.T) {
 	}
 
 	// Run the fix
-	if err := FixRedirectTracking(); err != nil {
+	if err := FixRedirectTracking(tmpDir); err != nil {
 		t.Fatalf("FixRedirectTracking failed: %v", err)
 	}
 
@@ -1345,6 +1341,51 @@ func TestFixRedirectTracking(t *testing.T) {
 	// Verify the local file still exists
 	if _, err := os.Stat(redirectPath); os.IsNotExist(err) {
 		t.Error("redirect file should still exist locally after untracking")
+	}
+}
+
+func TestCheckRedirectTargetValid_AbsolutePath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	targetRoot := filepath.Join(tmpDir, "target")
+	targetBeads := filepath.Join(targetRoot, ".beads")
+	if err := os.MkdirAll(targetBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	workRoot := filepath.Join(tmpDir, "work")
+	workBeads := filepath.Join(workRoot, ".beads")
+	if err := os.MkdirAll(workBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	redirectPath := filepath.Join(workBeads, "redirect")
+	if err := os.WriteFile(redirectPath, []byte(targetBeads+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(workRoot); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	check := CheckRedirectTargetValid(workRoot)
+	if check.Status != StatusOK {
+		t.Fatalf("expected status %s, got %s (detail: %s)", StatusOK, check.Status, check.Detail)
+	}
+	if !strings.Contains(check.Message, targetBeads) {
+		t.Errorf("expected message to include target path, got: %s", check.Message)
 	}
 }
 
@@ -1375,8 +1416,7 @@ func TestRequiredPatterns_ContainsRedirect(t *testing.T) {
 // GH#974
 func TestGitignoreTemplate_ContainsSyncStateFiles(t *testing.T) {
 	syncStateFiles := []string{
-		".sync.lock",      // Concurrency guard
-		"sync_base.jsonl", // Base state for 3-way merge (per-machine)
+		".sync.lock", // Concurrency guard
 	}
 
 	for _, pattern := range syncStateFiles {
@@ -1392,7 +1432,6 @@ func TestGitignoreTemplate_ContainsSyncStateFiles(t *testing.T) {
 func TestRequiredPatterns_ContainsSyncStatePatterns(t *testing.T) {
 	syncStatePatterns := []string{
 		".sync.lock",
-		"sync_base.jsonl",
 	}
 
 	for _, expected := range syncStatePatterns {
@@ -1432,7 +1471,7 @@ func TestCheckLastTouchedNotTracked_NoFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	check := CheckLastTouchedNotTracked()
+	check := CheckLastTouchedNotTracked(tmpDir)
 
 	if check.Status != StatusOK {
 		t.Errorf("Expected status %s, got %s", StatusOK, check.Status)
@@ -1463,10 +1502,13 @@ func TestCheckLastTouchedNotTracked_FileExistsNotTracked(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
+	}
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
 	}
 
 	// Create .beads directory with last-touched file
@@ -1479,7 +1521,7 @@ func TestCheckLastTouchedNotTracked_FileExistsNotTracked(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	check := CheckLastTouchedNotTracked()
+	check := CheckLastTouchedNotTracked(tmpDir)
 
 	if check.Status != StatusOK {
 		t.Errorf("Expected status %s, got %s", StatusOK, check.Status)
@@ -1510,15 +1552,14 @@ func TestCheckLastTouchedNotTracked_FileTracked(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
 	}
-
-	// Configure git user for commits
-	exec.Command("git", "config", "user.email", "test@test.com").Run()
-	exec.Command("git", "config", "user.name", "Test").Run()
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
+	}
 
 	// Create .beads directory with last-touched file
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -1536,7 +1577,7 @@ func TestCheckLastTouchedNotTracked_FileTracked(t *testing.T) {
 		t.Skipf("git add failed: %v", err)
 	}
 
-	check := CheckLastTouchedNotTracked()
+	check := CheckLastTouchedNotTracked(tmpDir)
 
 	if check.Status != StatusWarning {
 		t.Errorf("Expected status %s, got %s", StatusWarning, check.Status)
@@ -1570,15 +1611,14 @@ func TestFixLastTouchedTracking(t *testing.T) {
 		}
 	}()
 
-	// Initialize git repo
-	gitInit := exec.Command("git", "init")
-	if err := gitInit.Run(); err != nil {
-		t.Skipf("git init failed: %v", err)
+	// Initialize git repo from cached template
+	initGitTemplate()
+	if gitTemplateErr != nil {
+		t.Fatalf("git template init failed: %v", gitTemplateErr)
 	}
-
-	// Configure git user for commits
-	exec.Command("git", "config", "user.email", "test@test.com").Run()
-	exec.Command("git", "config", "user.name", "Test").Run()
+	if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+		t.Fatalf("failed to copy git template: %v", err)
+	}
 
 	// Create .beads directory with last-touched file
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -1597,18 +1637,18 @@ func TestFixLastTouchedTracking(t *testing.T) {
 	}
 
 	// Verify it's tracked before fix
-	checkBefore := CheckLastTouchedNotTracked()
+	checkBefore := CheckLastTouchedNotTracked(".")
 	if checkBefore.Status != StatusWarning {
 		t.Fatalf("Expected file to be tracked before fix, status: %s", checkBefore.Status)
 	}
 
 	// Apply the fix
-	if err := FixLastTouchedTracking(); err != nil {
+	if err := FixLastTouchedTracking("."); err != nil {
 		t.Fatalf("FixLastTouchedTracking failed: %v", err)
 	}
 
 	// Verify it's no longer tracked after fix
-	checkAfter := CheckLastTouchedNotTracked()
+	checkAfter := CheckLastTouchedNotTracked(".")
 	if checkAfter.Status != StatusOK {
 		t.Errorf("Expected status %s after fix, got %s", StatusOK, checkAfter.Status)
 	}
@@ -1639,5 +1679,1029 @@ func TestRequiredPatterns_ContainsLastTouched(t *testing.T) {
 	}
 	if !found {
 		t.Error("requiredPatterns should include 'last-touched'")
+	}
+}
+
+// TestGitignoreTemplate_ContainsDolt verifies that the .beads/.gitignore template
+// includes dolt/ to prevent the Dolt database directory from being committed.
+func TestGitignoreTemplate_ContainsDolt(t *testing.T) {
+	if !strings.Contains(GitignoreTemplate, "dolt/") {
+		t.Error("GitignoreTemplate should contain 'dolt/' pattern")
+	}
+}
+
+// TestRequiredPatterns_ContainsDolt verifies that bd doctor validates
+// the presence of the dolt/ pattern in .beads/.gitignore.
+func TestRequiredPatterns_ContainsDolt(t *testing.T) {
+	found := false
+	for _, pattern := range requiredPatterns {
+		if pattern == "dolt/" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("requiredPatterns should include 'dolt/'")
+	}
+}
+
+func TestCheckProjectGitignore_NoFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	check := CheckProjectGitignore(".")
+	if check.Status != StatusWarning {
+		t.Errorf("Expected warning when no .gitignore exists, got %s", check.Status)
+	}
+}
+
+func TestCheckProjectGitignore_MissingPatterns(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Create .gitignore without Dolt patterns
+	if err := os.WriteFile(".gitignore", []byte("node_modules/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckProjectGitignore(".")
+	if check.Status != StatusWarning {
+		t.Errorf("Expected warning for missing patterns, got %s", check.Status)
+	}
+	if !strings.Contains(check.Detail, ".dolt/") {
+		t.Errorf("Expected detail to mention .dolt/, got: %s", check.Detail)
+	}
+}
+
+func TestCheckProjectGitignore_AllPresent(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	content := "node_modules/\n.dolt/\n*.db\n.beads-credential-key\n.beads/proxieddb/\n"
+	if err := os.WriteFile(".gitignore", []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckProjectGitignore(".")
+	if check.Status != StatusOK {
+		t.Errorf("Expected ok when all patterns present, got %s: %s", check.Status, check.Message)
+	}
+}
+
+func TestEnsureProjectGitignore_CreatesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("EnsureProjectGitignore failed: %v", err)
+	}
+
+	content, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("Failed to read .gitignore: %v", err)
+	}
+
+	contentStr := string(content)
+	if !strings.Contains(contentStr, ".dolt/") {
+		t.Error("Expected .dolt/ pattern in .gitignore")
+	}
+	if !strings.Contains(contentStr, "*.db") {
+		t.Error("Expected *.db pattern in .gitignore")
+	}
+	if !strings.Contains(contentStr, projectGitignoreComment) {
+		t.Error("Expected section comment in .gitignore")
+	}
+}
+
+func TestEnsureProjectGitignore_AppendsToExisting(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	existingContent := "node_modules/\n.env\n"
+	if err := os.WriteFile(".gitignore", []byte(existingContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("EnsureProjectGitignore failed: %v", err)
+	}
+
+	content, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatalf("Failed to read .gitignore: %v", err)
+	}
+
+	contentStr := string(content)
+	// Original content preserved
+	if !strings.HasPrefix(contentStr, existingContent) {
+		t.Error("Expected existing content to be preserved")
+	}
+	// New patterns added
+	if !strings.Contains(contentStr, ".dolt/") {
+		t.Error("Expected .dolt/ pattern in .gitignore")
+	}
+	if !strings.Contains(contentStr, "*.db") {
+		t.Error("Expected *.db pattern in .gitignore")
+	}
+}
+
+func TestEnsureProjectGitignore_Idempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Run twice
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("First EnsureProjectGitignore failed: %v", err)
+	}
+	firstContent, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("Second EnsureProjectGitignore failed: %v", err)
+	}
+	secondContent, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(firstContent) != string(secondContent) {
+		t.Error("EnsureProjectGitignore should be idempotent")
+	}
+}
+
+func TestEnsureProjectGitignore_PartialPatterns(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Start with one pattern already present
+	existingContent := ".dolt/\n"
+	if err := os.WriteFile(".gitignore", []byte(existingContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("EnsureProjectGitignore failed: %v", err)
+	}
+
+	content, err := os.ReadFile(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contentStr := string(content)
+	// Should add only the missing pattern
+	if !strings.Contains(contentStr, "*.db") {
+		t.Error("Expected *.db pattern to be added")
+	}
+	// Should only contain .dolt/ once (the original)
+	count := strings.Count(contentStr, ".dolt/")
+	if count != 1 {
+		t.Errorf("Expected .dolt/ to appear once, found %d times", count)
+	}
+}
+
+func TestFixGitignore_FollowsRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Simulate a rig layout:
+	//   tmpDir/
+	//     mayor/rig/.beads/          ← canonical beads dir (redirect target)
+	//     crew/worker/.beads/redirect ← redirect-only dir (cwd context)
+	rigBeads := filepath.Join(tmpDir, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the local redirect-only .beads dir
+	localBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(localBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write redirect file pointing to the rig's .beads
+	// Redirect is resolved relative to the project root (parent of .beads)
+	redirectContent := "mayor/rig/.beads"
+	if err := os.WriteFile(filepath.Join(localBeads, "redirect"), []byte(redirectContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run FixGitignore - should write to the rig's .beads, NOT the local one
+	if err := FixGitignore("."); err != nil {
+		t.Fatalf("FixGitignore failed: %v", err)
+	}
+
+	// Verify: .gitignore was written at the redirect target
+	targetGitignore := filepath.Join(rigBeads, ".gitignore")
+	content, err := os.ReadFile(targetGitignore)
+	if err != nil {
+		t.Fatalf("Expected .gitignore at redirect target %s, got error: %v", targetGitignore, err)
+	}
+	if string(content) != GitignoreTemplate {
+		t.Errorf("Expected canonical template at redirect target, got:\n%s", string(content))
+	}
+
+	// Verify: NO .gitignore was created in the local redirect-only dir
+	localGitignore := filepath.Join(localBeads, ".gitignore")
+	if _, err := os.Stat(localGitignore); !os.IsNotExist(err) {
+		t.Errorf("FixGitignore should NOT have created .gitignore in the redirect-only .beads dir at %s", localGitignore)
+	}
+}
+
+func TestCheckGitignore_FollowsRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Set up rig with canonical .beads containing an up-to-date .gitignore
+	rigBeads := filepath.Join(tmpDir, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, ".gitignore"), []byte(GitignoreTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up local redirect-only .beads
+	localBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(localBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localBeads, "redirect"), []byte("mayor/rig/.beads"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// CheckGitignore should report OK by reading the redirect target
+	check := CheckGitignore(".")
+	if check.Status != "ok" {
+		t.Errorf("Expected status ok when redirect target has valid .gitignore, got %s: %s", check.Status, check.Message)
+	}
+}
+
+func TestFixGitignore_RedirectRoundTrip(t *testing.T) {
+	// Verifies the full bug scenario: CheckGitignore detects outdated at redirect target,
+	// FixGitignore fixes it AT the redirect target, and re-check passes.
+	tmpDir := t.TempDir()
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Set up rig with outdated .gitignore (missing required patterns)
+	rigBeads := filepath.Join(tmpDir, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(rigBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+	oldContent := "*.db\ndaemon.log\n"
+	if err := os.WriteFile(filepath.Join(rigBeads, ".gitignore"), []byte(oldContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up local redirect-only .beads
+	localBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(localBeads, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localBeads, "redirect"), []byte("mayor/rig/.beads"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 1: Check should detect outdated
+	check := CheckGitignore(".")
+	if check.Status != "warning" {
+		t.Fatalf("Expected warning for outdated .gitignore at redirect target, got %s", check.Status)
+	}
+
+	// Step 2: Fix should update the redirect target
+	if err := FixGitignore("."); err != nil {
+		t.Fatalf("FixGitignore failed: %v", err)
+	}
+
+	// Step 3: Re-check should pass
+	check = CheckGitignore(".")
+	if check.Status != "ok" {
+		t.Errorf("Expected ok after fix, got %s: %s", check.Status, check.Message)
+	}
+
+	// Step 4: No .gitignore in redirect-only dir (the original bug)
+	localGitignore := filepath.Join(localBeads, ".gitignore")
+	if _, err := os.Stat(localGitignore); !os.IsNotExist(err) {
+		t.Errorf("FixGitignore must NOT create .gitignore in redirect-only .beads dir (the original bug)")
+	}
+}
+
+func TestFixGitignore_BareParentWorktreeFallback(t *testing.T) {
+	bareDir, featureWorktreeDir := setupBareParentWorktreeForGitignoreTest(t)
+	bareBeadsDir := filepath.Join(bareDir, ".beads")
+	if err := os.MkdirAll(bareBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	featureBeadsDir := filepath.Join(featureWorktreeDir, ".beads")
+	if _, err := os.Stat(featureBeadsDir); !os.IsNotExist(err) {
+		t.Fatalf("expected no local .beads in worktree, got err=%v", err)
+	}
+
+	if err := FixGitignore(featureWorktreeDir); err != nil {
+		t.Fatalf("FixGitignore failed: %v", err)
+	}
+
+	targetGitignore := filepath.Join(bareBeadsDir, ".gitignore")
+	content, err := os.ReadFile(targetGitignore)
+	if err != nil {
+		t.Fatalf("expected .gitignore in bare-parent .beads, got error: %v", err)
+	}
+	if string(content) != GitignoreTemplate {
+		t.Errorf("expected canonical template at bare-parent target, got:\n%s", string(content))
+	}
+	if _, err := os.Stat(filepath.Join(featureBeadsDir, ".gitignore")); !os.IsNotExist(err) {
+		t.Errorf("FixGitignore should not create a local worktree .beads/.gitignore")
+	}
+}
+
+func TestCheckGitignore_BareParentWorktreeFallback(t *testing.T) {
+	bareDir, featureWorktreeDir := setupBareParentWorktreeForGitignoreTest(t)
+	bareBeadsDir := filepath.Join(bareDir, ".beads")
+	if err := os.MkdirAll(bareBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bareBeadsDir, ".gitignore"), []byte(GitignoreTemplate), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckGitignore(featureWorktreeDir)
+	if check.Status != "ok" {
+		t.Errorf("expected status ok when bare-parent .beads has valid .gitignore, got %s: %s", check.Status, check.Message)
+	}
+}
+
+func setupBareParentWorktreeForGitignoreTest(t *testing.T) (string, string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	bareDir := filepath.Join(tmpDir, "repo.git")
+	mainWorktreeDir := filepath.Join(tmpDir, "main")
+	featureWorktreeDir := filepath.Join(tmpDir, "feature")
+
+	runGitInDirForGitignoreTest(t, tmpDir, "init", "--bare", bareDir)
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "config", "user.email", "test@example.com")
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "config", "user.name", "Test User")
+	emptyTree := runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "hash-object", "-t", "tree", "/dev/null")
+	initCommit := runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "commit-tree", "-m", "Initial commit", emptyTree)
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "update-ref", "HEAD", initCommit)
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "worktree", "add", mainWorktreeDir, "main")
+	runGitInDirForGitignoreTest(t, mainWorktreeDir, "branch", "feature")
+	runGitInDirForGitignoreTest(t, tmpDir, "--git-dir", bareDir, "worktree", "add", featureWorktreeDir, "feature")
+
+	return bareDir, featureWorktreeDir
+}
+
+func runGitInDirForGitignoreTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed in %s: %v\n%s", args, dir, err, output)
+	}
+
+	return strings.TrimSpace(string(output))
+}
+
+func TestEnsureProjectGitignore_FilePermissions(t *testing.T) {
+	// Verify that project .gitignore is created with 0644 permissions.
+	// Unlike .beads/.gitignore (0600), the project .gitignore must be
+	// readable by git and collaborators — this justifies the #nosec G306.
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping file permissions test on Windows")
+	}
+
+	tests := []struct {
+		name          string
+		setupFunc     func(t *testing.T, tmpDir string)
+		expectedPerms os.FileMode
+	}{
+		{
+			name: "creates new file with 0644 permissions",
+			setupFunc: func(t *testing.T, tmpDir string) {
+				// No .gitignore exists yet
+			},
+			expectedPerms: 0644,
+		},
+		{
+			name: "preserves restrictive permissions on existing file",
+			setupFunc: func(t *testing.T, tmpDir string) {
+				// Create .gitignore with restrictive permissions
+				if err := os.WriteFile(filepath.Join(tmpDir, ".gitignore"), []byte("node_modules/\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			expectedPerms: 0600, // os.WriteFile preserves existing perms
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+
+			oldDir, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chdir(tmpDir); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.Chdir(oldDir); err != nil {
+					t.Error(err)
+				}
+			}()
+
+			tt.setupFunc(t, tmpDir)
+
+			if err := EnsureProjectGitignore("."); err != nil {
+				t.Fatalf("EnsureProjectGitignore failed: %v", err)
+			}
+
+			info, err := os.Stat(".gitignore")
+			if err != nil {
+				t.Fatalf("Failed to stat .gitignore: %v", err)
+			}
+
+			actualPerms := info.Mode().Perm()
+			if actualPerms != tt.expectedPerms {
+				t.Errorf("Expected permissions %o, got %o", tt.expectedPerms, actualPerms)
+			}
+		})
+	}
+}
+
+func TestEnsureProjectGitignore_DoesNotLoosenPermissions(t *testing.T) {
+	// Verify that appending to an existing project .gitignore does not
+	// widen its permissions (e.g., 0600 should not become 0644).
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping file permissions test on Windows")
+	}
+
+	tmpDir := t.TempDir()
+
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Create file with restrictive permissions
+	if err := os.WriteFile(".gitignore", []byte("node_modules/\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeInfo, err := os.Stat(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePerms := beforeInfo.Mode().Perm()
+
+	if err := EnsureProjectGitignore("."); err != nil {
+		t.Fatalf("EnsureProjectGitignore failed: %v", err)
+	}
+
+	afterInfo, err := os.Stat(".gitignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterPerms := afterInfo.Mode().Perm()
+
+	if afterPerms > beforePerms {
+		t.Errorf("Permissions were loosened: before=%o, after=%o", beforePerms, afterPerms)
+	}
+}
+
+func TestGitignoreTemplate_NoSensitivePatterns(t *testing.T) {
+	// Verify the gitignore template itself doesn't contain patterns
+	// that could leak information about secrets or sensitive paths.
+	// The template should only contain infrastructure/runtime patterns.
+	sensitiveKeywords := []string{
+		"password",
+		"secret",
+		"token",
+		"private_key",
+		"api_key",
+	}
+
+	// .beads-credential-key is intentionally in the template to prevent the
+	// encryption key from being committed. Strip it before checking for
+	// accidental credential-related patterns.
+	stripped := strings.ReplaceAll(strings.ToLower(GitignoreTemplate), ".beads-credential-key", "")
+
+	for _, keyword := range sensitiveKeywords {
+		if strings.Contains(stripped, keyword) {
+			t.Errorf("GitignoreTemplate contains sensitive keyword %q — review for information leakage", keyword)
+		}
+	}
+}
+
+// TestGitignoreTemplate_ContainsCredentialKey verifies that the .beads/.gitignore template
+// includes .beads-credential-key to prevent the encryption key from being committed.
+func TestGitignoreTemplate_ContainsCredentialKey(t *testing.T) {
+	if !strings.Contains(GitignoreTemplate, ".beads-credential-key") {
+		t.Error("GitignoreTemplate should contain '.beads-credential-key' pattern")
+	}
+}
+
+// TestRequiredPatterns_ContainsCredentialKey verifies that bd doctor validates
+// the presence of the .beads-credential-key pattern in .beads/.gitignore.
+func TestRequiredPatterns_ContainsCredentialKey(t *testing.T) {
+	found := false
+	for _, pattern := range requiredPatterns {
+		if pattern == ".beads-credential-key" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("requiredPatterns should include '.beads-credential-key'")
+	}
+}
+
+// TestProjectGitignorePatterns_ContainsCredentialKey verifies that the
+// project-root .gitignore patterns include .beads-credential-key to prevent
+// the credential encryption key from being committed even outside .beads/.
+func TestProjectGitignorePatterns_ContainsCredentialKey(t *testing.T) {
+	found := false
+	for _, pattern := range ProjectGitignorePatterns {
+		if pattern == ".beads-credential-key" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("ProjectGitignorePatterns should include '.beads-credential-key'")
+	}
+}
+
+func TestContainsGitignorePattern(t *testing.T) {
+	tests := []struct {
+		content  string
+		pattern  string
+		expected bool
+	}{
+		{"*.db\n.dolt/\n", "*.db", true},
+		{"*.db\n.dolt/\n", ".dolt/", true},
+		{"node_modules/\n", ".dolt/", false},
+		{"# .dolt/ is ignored\n", ".dolt/", false}, // comment, not pattern
+		{"  .dolt/  \n", ".dolt/", true},           // whitespace trimmed
+		{"", ".dolt/", false},
+		{".dolt/foo\n", ".dolt/", false}, // not exact match
+	}
+
+	for _, tt := range tests {
+		result := containsGitignorePattern(tt.content, tt.pattern)
+		if result != tt.expected {
+			t.Errorf("containsGitignorePattern(%q, %q) = %v, want %v",
+				tt.content, tt.pattern, result, tt.expected)
+		}
+	}
+}
+
+// TestParseRedirectTarget verifies redirect file parsing.
+func TestParseRedirectTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     string
+		expected string
+	}{
+		{"simple path", "../main-repo/.beads", "../main-repo/.beads"},
+		{"absolute path", "/home/user/project/.beads", "/home/user/project/.beads"},
+		{"with whitespace", "  ../main-repo/.beads  \n", "../main-repo/.beads"},
+		{"with comment", "# redirect target\n../main-repo/.beads", "../main-repo/.beads"},
+		{"multiple comments", "# comment1\n# comment2\n../main/.beads", "../main/.beads"},
+		{"empty", "", ""},
+		{"only comments", "# comment\n# another", ""},
+		{"only whitespace", "   \n  \n", ""},
+		{"with BOM", "\ufeff../main-repo/.beads", "../main-repo/.beads"},
+		{"BOM in middle line", "# comment\n\ufeff../path", "../path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseRedirectTarget([]byte(tt.data))
+			if result != tt.expected {
+				t.Errorf("parseRedirectTarget(%q) = %q, want %q", tt.data, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestResolveRedirectTarget verifies redirect target path resolution.
+func TestResolveRedirectTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		beadsDir string
+		target   string
+		wantAbs  bool
+	}{
+		{"empty target", "/project/.beads", "", false},
+		{"relative path", "/project/.beads", "../other-repo/.beads", true},
+		{"absolute path", "/project/.beads", "/absolute/path/.beads", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resolveRedirectTarget(tt.beadsDir, tt.target)
+			if tt.target == "" {
+				if result != "" {
+					t.Errorf("resolveRedirectTarget(%q, %q) = %q, want empty", tt.beadsDir, tt.target, result)
+				}
+				return
+			}
+			if tt.wantAbs && !filepath.IsAbs(result) {
+				t.Errorf("resolveRedirectTarget(%q, %q) = %q, want absolute path", tt.beadsDir, tt.target, result)
+			}
+		})
+	}
+}
+
+// TestCheckRedirectTargetValid_NoRedirect verifies handling when no redirect file exists.
+func TestCheckRedirectTargetValid_NoRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create .beads dir but no redirect file
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckRedirectTargetValid(".")
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+	}
+	if check.Message != "No redirect configured" {
+		t.Errorf("Message = %q, want %q", check.Message, "No redirect configured")
+	}
+}
+
+// TestCheckRedirectTargetValid_EmptyRedirect verifies handling when redirect file is empty.
+func TestCheckRedirectTargetValid_EmptyRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckRedirectTargetValid(".")
+	if check.Status != StatusWarning {
+		t.Errorf("Status = %q, want %q", check.Status, StatusWarning)
+	}
+	if !strings.Contains(check.Message, "empty") {
+		t.Errorf("Message = %q, want it to contain 'empty'", check.Message)
+	}
+}
+
+// TestCheckRedirectTargetValid_NonExistentTarget verifies error when redirect points to
+// a path that doesn't exist.
+func TestCheckRedirectTargetValid_NonExistentTarget(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte("/nonexistent/path/.beads"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckRedirectTargetValid(".")
+	if check.Status != StatusError {
+		t.Errorf("Status = %q, want %q", check.Status, StatusError)
+	}
+	if !strings.Contains(check.Message, "does not exist") {
+		t.Errorf("Message = %q, want it to contain 'does not exist'", check.Message)
+	}
+}
+
+// TestCheckRedirectTargetValid_TargetIsFile verifies error when redirect target is
+// a file instead of a directory.
+func TestCheckRedirectTargetValid_TargetIsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Create a file (not a directory) as the target
+	targetFile := filepath.Join(tmpDir, "target-file")
+	if err := os.WriteFile(targetFile, []byte("not a dir"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(targetFile), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckRedirectTargetValid(".")
+	if check.Status != StatusError {
+		t.Errorf("Status = %q, want %q", check.Status, StatusError)
+	}
+	if !strings.Contains(check.Message, "not a directory") {
+		t.Errorf("Message = %q, want it to contain 'not a directory'", check.Message)
+	}
+}
+
+// TestCheckRedirectTargetSyncWorktree_NoRedirect verifies handling when no redirect exists.
+func TestCheckRedirectTargetSyncWorktree_NoRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckRedirectTargetSyncWorktree(".")
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+	}
+	if check.Message != "No redirect configured" {
+		t.Errorf("Message = %q, want %q", check.Message, "No redirect configured")
+	}
+}
+
+// TestCheckNoVestigialSyncWorktrees_NoRedirect verifies the check is N/A
+// when no redirect file exists.
+func TestCheckNoVestigialSyncWorktrees_NoRedirect(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckNoVestigialSyncWorktrees(".")
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+	}
+	if !strings.Contains(check.Message, "N/A") {
+		t.Errorf("Message = %q, want it to contain 'N/A'", check.Message)
+	}
+}
+
+// TestCheckNoVestigialSyncWorktrees_WithRedirectNoWorktree verifies OK
+// when redirect exists but no vestigial .beads-sync worktree.
+func TestCheckNoVestigialSyncWorktrees_WithRedirectNoWorktree(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a git repo so the git root detection works
+	cmd := exec.Command("git", "init", tmpDir)
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git init failed: %v", err)
+	}
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Create redirect file
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte("../other/.beads"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckNoVestigialSyncWorktrees(".")
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+	}
+	if check.Message != "No vestigial sync worktrees found" {
+		t.Errorf("Message = %q, want %q", check.Message, "No vestigial sync worktrees found")
+	}
+}
+
+// TestCheckNoVestigialSyncWorktrees_VestigialDetected verifies warning
+// when redirect exists AND a .beads-sync worktree exists locally.
+func TestCheckNoVestigialSyncWorktrees_VestigialDetected(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a git repo
+	cmd := exec.Command("git", "init", tmpDir)
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git init failed: %v", err)
+	}
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Create redirect file
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte("../other/.beads"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create vestigial .beads-sync directory
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads-sync"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := CheckNoVestigialSyncWorktrees(".")
+	if check.Status != StatusWarning {
+		t.Errorf("Status = %q, want %q", check.Status, StatusWarning)
+	}
+	if !strings.Contains(check.Message, "Vestigial") {
+		t.Errorf("Message = %q, want it to contain 'Vestigial'", check.Message)
 	}
 }

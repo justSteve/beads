@@ -1,13 +1,18 @@
+//go:build cgo
+
 package main
 
 import (
 	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/memory"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -24,11 +29,14 @@ func TestIssueIDCompletion(t *testing.T) {
 	ctx := context.Background()
 	rootCtx = ctx
 
-	// Create in-memory store for testing
-	memStore := memory.New("")
-	store = memStore
+	// Create dolt store for testing
+	tmpDir := t.TempDir()
+	testDB := filepath.Join(tmpDir, "test.db")
+	testStore := newTestStoreWithPrefix(t, testDB, "bd")
+	store = testStore
 
 	// Create test issues
+	now := time.Now()
 	testIssues := []*types.Issue{
 		{
 			ID:        "bd-abc1",
@@ -57,12 +65,12 @@ func TestIssueIDCompletion(t *testing.T) {
 			Status:    types.StatusClosed,
 			Priority:  3,
 			IssueType: types.TypeTask,
-			ClosedAt:  &[]time.Time{time.Now()}[0],
+			ClosedAt:  &now,
 		},
 	}
 
 	for _, issue := range testIssues {
-		if err := memStore.CreateIssue(ctx, issue, "test"); err != nil {
+		if err := testStore.CreateIssue(ctx, issue, "test"); err != nil {
 			t.Fatalf("Failed to create test issue: %v", err)
 		}
 	}
@@ -210,6 +218,90 @@ func TestIssueIDCompletion_NoStore(t *testing.T) {
 	}
 }
 
+func TestIssueIDCompletion_UsesWorktreeFallbackWhenStoreNil(t *testing.T) {
+	originalStore := store
+	originalDBPath := dbPath
+	originalRootCtx := rootCtx
+	defer func() {
+		store = originalStore
+		dbPath = originalDBPath
+		rootCtx = originalRootCtx
+	}()
+
+	ctx := context.Background()
+	rootCtx = ctx
+
+	tmpDir := t.TempDir()
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir main repo: %v", err)
+	}
+
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+
+	run(mainRepoDir, "init")
+	run(mainRepoDir, "config", "user.email", "test@example.com")
+	run(mainRepoDir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	run(mainRepoDir, "add", "README.md")
+	run(mainRepoDir, "commit", "-m", "Initial commit")
+
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd := exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add failed: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		cleanupCmd := exec.Command("git", "worktree", "remove", "--force", worktreeDir)
+		cleanupCmd.Dir = mainRepoDir
+		_ = cleanupCmd.Run()
+	})
+
+	testDB := filepath.Join(mainRepoDir, ".beads", "beads.db")
+	testStore := newTestStoreWithPrefix(t, testDB, "wt")
+	if err := testStore.CreateIssue(ctx, &types.Issue{
+		ID:        "wt-abc1",
+		Title:     "Worktree completion target",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}, "test"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	store = nil
+	dbPath = ""
+
+	t.Chdir(worktreeDir)
+	beads.ResetCaches()
+	git.ResetCaches()
+	t.Cleanup(func() {
+		beads.ResetCaches()
+		git.ResetCaches()
+	})
+
+	completions, directive := issueIDCompletion(&cobra.Command{}, nil, "wt-a")
+	if directive != cobra.ShellCompDirectiveNoFileComp {
+		t.Fatalf("directive = %d, want %d", directive, cobra.ShellCompDirectiveNoFileComp)
+	}
+	if len(completions) != 1 {
+		t.Fatalf("len(completions) = %d, want 1 (%v)", len(completions), completions)
+	}
+	if len(completions[0]) < len("wt-abc1") || completions[0][:len("wt-abc1")] != "wt-abc1" {
+		t.Fatalf("completion = %q, want prefix %q", completions[0], "wt-abc1")
+	}
+}
+
 func TestCompleteCommandWorksWithoutDatabase(t *testing.T) {
 	// This test verifies that shell completions work even without a beads database.
 	// The __complete command must be in noDbCommands list so that PersistentPreRun
@@ -232,6 +324,14 @@ func TestCompleteCommandWorksWithoutDatabase(t *testing.T) {
 	// Reset state to simulate no database
 	store = nil
 	dbPath = ""
+
+	// Reset caches so FindDatabasePath won't use stale git worktree info
+	beads.ResetCaches()
+	git.ResetCaches()
+	defer func() {
+		beads.ResetCaches()
+		git.ResetCaches()
+	}()
 
 	// Change to temp directory (no database present)
 	originalWd, err := os.Getwd()
@@ -293,16 +393,13 @@ func TestCompleteCommandInNoDbCommandsList(t *testing.T) {
 	// Save and reset global state
 	originalDBPath := dbPath
 	originalStore := store
-	originalDaemonClient := daemonClient
 	defer func() {
 		dbPath = originalDBPath
 		store = originalStore
-		daemonClient = originalDaemonClient
 	}()
 
 	store = nil
 	dbPath = ""
-	daemonClient = nil
 
 	// Capture stdout/stderr
 	oldStdout := os.Stdout
@@ -345,9 +442,11 @@ func TestIssueIDCompletion_EmptyDatabase(t *testing.T) {
 	ctx := context.Background()
 	rootCtx = ctx
 
-	// Create empty in-memory store
-	memStore := memory.New("")
-	store = memStore
+	// Create empty dolt store
+	tmpDir := t.TempDir()
+	testDB := filepath.Join(tmpDir, "test.db")
+	testStore := newTestStoreWithPrefix(t, testDB, "bd")
+	store = testStore
 
 	cmd := &cobra.Command{}
 	args := []string{}

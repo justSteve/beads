@@ -6,7 +6,7 @@ Integration for [Junie](https://www.jetbrains.com/junie/) (JetBrains AI Agent) w
 
 ```bash
 # Install beads
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
 # Initialize beads in your project
 bd init
@@ -82,7 +82,7 @@ bd setup junie --remove
 
 - `bd prime` - Get full workflow context
 - `bd ready` - Find unblocked work
-- `bd sync` - Sync changes to git (run at session end)
+- `bd dolt push` - Push issue changes to Dolt remote (run at session end)
 
 ## License
 

@@ -6,28 +6,27 @@ Thank you for your interest in contributing to bd! This document provides guidel
 
 ### Prerequisites
 
-- Go 1.24 or later
+- Go (see `go.mod` for the required version; currently 1.26+)
 - Git
+- A C compiler (CGO is required for the embedded Dolt database)
 - (Optional) golangci-lint for local linting
+- ICU headers are **not required** for building -- see [docs/ICU-POLICY.md](docs/ICU-POLICY.md)
 
 ### Getting Started
 
 ```bash
 # Clone the repository
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
 
-# Build the project
-go build -o bd ./cmd/bd
+# Build the project (uses gms_pure_go tag via Makefile)
+make build
 
-# Run tests
-go test ./...
+# Run tests (uses correct build tags automatically)
+make test
 
-# Run with race detection
-go test -race ./...
-
-# Build and install locally
-go install ./cmd/bd
+# Build and install locally to ~/.local/bin
+make install
 ```
 
 ## Project Structure
@@ -38,7 +37,7 @@ beads/
 ├── internal/
 │   ├── types/           # Core data types (Issue, Dependency, etc.)
 │   └── storage/         # Storage interface and implementations
-│       └── sqlite/      # SQLite backend
+│       └── dolt/        # Dolt database backend
 ├── .golangci.yml        # Linter configuration
 └── .github/workflows/   # CI/CD pipelines
 ```
@@ -46,18 +45,18 @@ beads/
 ## Running Tests
 
 ```bash
-# Run all tests
-go test ./...
+# Run all tests (recommended — uses correct build tags)
+make test
 
 # Run tests with coverage
-go test -v -coverprofile=coverage.out ./...
+go test -tags gms_pure_go -v -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Run specific package tests
-go test ./internal/storage/sqlite -v
+go test -tags gms_pure_go ./internal/storage/dolt/ -v
 
 # Run tests with race detection
-go test -race ./...
+go test -tags gms_pure_go -race ./...
 ```
 
 ## Code Style
@@ -113,26 +112,23 @@ Add cycle detection for dependency graphs
 - Update documentation with examples
 ```
 
-### Important: Don't Include .beads/issues.jsonl Changes
+### Pull Request Hygiene
 
-The `.beads/issues.jsonl` file is the project's issue database. **Do not include changes to this file in your PR.** CI will fail if this file is modified.
-
-If you accidentally committed changes to this file, fix it with:
-
-```bash
-git checkout origin/main -- .beads/issues.jsonl
-git commit --amend
-git push --force
-```
-
-### Pull Requests
+**One issue per PR, and one PR per issue.** No piggybacking or riders — each PR should address exactly one thing.
 
 - Keep PRs focused on a single feature or fix
+- Do not include unrelated changes, cleanup, or "while I'm here" improvements
+- Do not include `.beads/` data (database, JSONL) in your PR
+- Make sure there are no extra generated or garbage files in your diff
 - Include tests for new functionality
 - Update documentation as needed
 - Ensure CI passes before requesting review
 - Respond to review feedback promptly
-- **Do not include `.beads/issues.jsonl` changes** (see above)
+- Lead the PR with a brief plain-language `What` and `Why` so reviewers can grasp the goal without reading the diff. `.github/PULL_REQUEST_TEMPLATE.md` is a starting scaffold — replace, expand, or delete sections to fit your change.
+
+### ZFC (Zero Framework Cognition)
+
+If you are contributing code that involves AI decision-making or orchestration, understand and follow the [ZFC principles](https://steve-yegge.medium.com/zero-framework-cognition-a-way-to-build-resilient-ai-applications-56b090ed3e69). In short: keep the smarts in the AI models, keep the code as dumb orchestration. Do not add heuristics, keyword matching, ranking logic, or semantic analysis in application code — delegate cognitive decisions to AI.
 
 ## Testing Guidelines
 
@@ -150,14 +146,14 @@ Slow tests use `testing.Short()` to skip when `-short` flag is present.
 ```bash
 # Fast tests (recommended for development - skips slow tests)
 # Use this for rapid iteration during development
-go test -short ./...
+make test
 
 # Full test suite (before committing - includes all tests)
 # Run this before pushing to ensure nothing breaks
-go test ./...
+make test
 
 # With race detection and coverage
-go test -race -coverprofile=coverage.out ./...
+CGO_ENABLED=1 go test -tags gms_pure_go -race -coverprofile=coverage.out ./...
 ```
 
 **When to use `-short`:**
@@ -178,57 +174,59 @@ go test -race -coverprofile=coverage.out ./...
 - Use `t.Run()` for subtests to organize related test cases
 - Mark slow tests with `if testing.Short() { t.Skip("slow test") }`
 
-### Dual-Mode Testing Pattern
+### CGO vs Non-CGO Tests
 
-**IMPORTANT**: bd supports two execution modes: *direct mode* (SQLite access) and *daemon mode* (RPC via background process). Commands must work identically in both modes. To prevent bugs like GH#719, GH#751, and bd-fu83, use the dual-mode test framework for testing commands.
+Tests are split into two categories based on whether they need the embedded Dolt database (which requires CGO):
+
+- **Non-CGO tests** (no build tag): Unit tests for CLI parsing, helpers, and pure logic. These run everywhere.
+- **CGO tests** (`//go:build cgo`): Integration tests that create a real Dolt database. Files often use the `_embedded_test.go` suffix.
+
+```bash
+# Fast non-CGO tests (recommended for development)
+make test                     # or: ./scripts/test.sh
+
+# Opt-in ICU regex path (maintainer-only)
+make test-icu-path            # or: ./scripts/test-icu-path.sh ./...
+
+# Run a specific package or test with shipped config
+CGO_ENABLED=1 go test -tags gms_pure_go ./cmd/bd/...
+CGO_ENABLED=1 go test -tags gms_pure_go -run '^TestMyFeature$' ./cmd/bd/...
+```
+
+On macOS, use the Make target or script for the opt-in ICU regex path -- they configure the required ICU linker flags automatically.
+
+### ICU and Build Tags
+
+All production builds use `-tags gms_pure_go` to avoid ICU runtime dependencies.
+**Do not add ICU linker flags to the Makefile or `.buildflags`.**
+See [docs/ICU-POLICY.md](docs/ICU-POLICY.md) for the full policy and rationale.
+
+### Test Isolation with `t.TempDir()`
+
+Database tests use `t.TempDir()` for isolation so each test gets a clean environment and nothing touches the production database:
 
 ```go
-// cmd/bd/dual_mode_test.go provides the framework
+func TestMyFeature(t *testing.T) {
+    tmpDir := t.TempDir()
+    dbPath := filepath.Join(tmpDir, "test.db")
+    store := newTestStoreWithPrefix(t, dbPath, "bd")
 
-func TestMyCommand(t *testing.T) {
-    // This test runs TWICE: once in direct mode, once with a live daemon
-    RunDualModeTest(t, "my_test", func(t *testing.T, env *DualModeTestEnv) {
-        // Create test data using mode-agnostic helpers
-        issue := &types.Issue{
-            Title:     "Test issue",
-            IssueType: types.TypeTask,
-            Status:    types.StatusOpen,
-            Priority:  2,
-        }
-        if err := env.CreateIssue(issue); err != nil {
-            t.Fatalf("[%s] CreateIssue failed: %v", env.Mode(), err)
-        }
-
-        // Verify behavior - works in both modes
-        got, err := env.GetIssue(issue.ID)
-        if err != nil {
-            t.Fatalf("[%s] GetIssue failed: %v", env.Mode(), err)
-        }
-        if got.Title != "Test issue" {
-            t.Errorf("[%s] wrong title: got %q", env.Mode(), got.Title)
-        }
-    })
+    ctx := context.Background()
+    issue := &types.Issue{
+        ID:     "bd-1",
+        Title:  "Test issue",
+        Status: types.StatusOpen,
+    }
+    if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+        t.Fatalf("CreateIssue failed: %v", err)
+    }
+    // ... assertions ...
 }
 ```
 
-Available `DualModeTestEnv` helper methods:
-- `CreateIssue(issue)` - Create an issue
-- `GetIssue(id)` - Retrieve an issue by ID
-- `UpdateIssue(id, updates)` - Update issue fields
-- `DeleteIssue(id, force)` - Delete (tombstone) an issue
-- `AddDependency(from, to, type)` - Add a dependency
-- `ListIssues(filter)` - List issues matching filter
-- `GetReadyWork()` - Get issues ready for work
-- `AddLabel(id, label)` - Add a label to an issue
-- `Mode()` - Returns "direct" or "daemon" for error messages
+Test helpers in `cmd/bd/test_helpers_test.go` provide database setup functions like `newTestStore`, `newTestStoreWithPrefix`, and `newTestStoreSharedBranch` (which uses branch-per-test isolation to avoid expensive CREATE/DROP DATABASE overhead).
 
-Run dual-mode tests:
-```bash
-# Run dual-mode tests (requires integration tag)
-go test -v -tags integration -run "TestDualMode" ./cmd/bd/
-```
-
-Example:
+### Table-Driven Test Example
 
 ```go
 func TestIssueValidation(t *testing.T) {
@@ -286,6 +284,53 @@ When proposing new features:
 - Consider backwards compatibility
 - Discuss alternatives you've considered
 
+## Your PR Will Not Be Overwritten
+
+This project uses AI agents for maintenance. We've established strict rules to protect contributor work:
+
+- **Your PR has priority.** If you've submitted a PR, agents must review and build on your work — not rewrite it from scratch.
+- **Your tests matter.** Agents must preserve contributor tests unless they're actually wrong.
+- **You'll get attribution.** Your commits and `Co-authored-by:` will be preserved.
+- **No silent closes.** Your PR will never be auto-closed by a parallel rewrite. If changes are needed, they'll be discussed on your PR.
+
+If any of this goes wrong, please open an issue — we take contributor experience seriously.
+
+Maintainers and agents follow [PR_MAINTAINER_GUIDELINES.md](PR_MAINTAINER_GUIDELINES.md) when triaging, landing, transforming, or closing PRs.
+
+### Refactoring Campaign PR Intake Checklist
+
+Before starting a rewrite, cleanup, or large refactoring pass, maintainers and agents must review open contributor PRs that touch the same area. Use this checklist to decide whether to merge, rebase, incorporate, or close each PR.
+
+1. Identify overlap:
+   - Read the PR description, changed files, linked issues, and latest review comments.
+   - Compare the PR scope with the planned refactor and note any shared files, commands, migrations, tests, docs, or release paths.
+   - If the PR is unrelated, leave it alone unless the refactor would still create a merge conflict.
+
+2. Prefer clean merges:
+   - If the PR is focused, passing CI, and aligned with current design, review it as the first option.
+   - Merge it before the refactor when that reduces conflict risk.
+   - Preserve the contributor's commits and attribution unless the contributor agrees to a squash or rework.
+
+3. Request a rebase when needed:
+   - Ask for a rebase if the PR is still valid but conflicts with main or depends on code that has moved.
+   - Give concrete instructions about the new target files or APIs.
+   - Do not rewrite the same work in parallel while waiting unless there is a release blocker or security issue.
+
+4. Preserve tests and intent:
+   - Treat contributor tests as part of the contribution, not optional scaffolding.
+   - If a refactor supersedes implementation code, port the tests or explain why they are invalid.
+   - Keep user-facing behavior, docs examples, and regression coverage intact unless the PR is explicitly changing the contract.
+
+5. Close superseded PRs with explicit rationale:
+   - Close only after commenting with the replacement commit, PR, or issue.
+   - Explain what was preserved, what changed, and why the original branch will not be merged.
+   - Thank the contributor and invite follow-up if their use case was not fully covered.
+
+6. Leave an audit trail:
+   - Link the intake decision from the refactor PR or Beads issue.
+   - Record any follow-up work as Beads issues instead of hidden notes.
+   - Call out contributor-owned tests or behavior in the refactor PR summary.
+
 ## Code Review Process
 
 All contributions go through code review:
@@ -300,26 +345,42 @@ All contributions go through code review:
 ### Testing Locally
 
 ```bash
-# Build and test your changes quickly
-go build -o bd ./cmd/bd && ./bd init --prefix test
+# Build and install your changes
+make install
 
 # Test specific functionality
-./bd create "Test issue" -p 1 -t bug
-./bd dep add test-2 test-1
-./bd ready
+bd init --prefix test
+bd create "Test issue" -p 1 -t bug
+bd dep add test-2 test-1
+bd ready
 ```
 
 ### Database Inspection
 
 ```bash
-# Inspect the SQLite database directly
-sqlite3 .beads/test.db
-
-# Useful queries
-SELECT * FROM issues;
-SELECT * FROM dependencies;
-SELECT * FROM events WHERE issue_id = 'test-1';
+# Inspect the Dolt database directly
+bd query "SELECT * FROM issues"
+bd query "SELECT * FROM dependencies"
+bd query "SELECT * FROM events WHERE issue_id = 'test-1'"
 ```
+
+### Updating Nix flake.lock (without nix installed)
+
+The `flake.lock` file pins a specific nixpkgs revision. When `go.mod` bumps the Go version beyond what's in the pinned nixpkgs, the Nix CI job will fail. To update `flake.lock` without installing nix locally, use Docker:
+
+```bash
+# Update flake.lock
+docker run --rm -v $(pwd):/workspace -w /workspace nixos/nix \
+  sh -c 'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && nix flake update'
+
+# Verify the build works
+docker run --rm -v $(pwd):/workspace -w /workspace nixos/nix \
+  sh -c 'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && nix build .#default && ./result/bin/bd version'
+```
+
+If the build fails with a `vendorHash` mismatch, update `default.nix` with the `got:` hash from the error message and rebuild.
+
+The `nix build` CI job (`.github/workflows/nix-build.yml`) runs on any PR that touches `go.mod`, `go.sum`, `default.nix`, `flake.nix`, or `flake.lock`, so dependabot bumps that invalidate `vendorHash` fail loudly instead of silently breaking Nix users on main.
 
 ### Debugging
 
@@ -345,7 +406,7 @@ dlv debug ./cmd/bd -- create "Test issue"
 
 ## Questions?
 
-- Check existing [issues](https://github.com/steveyegge/beads/issues)
+- Check existing [issues](https://github.com/gastownhall/beads/issues)
 - Open a new issue for questions
 - Review [README.md](README.md) and other documentation
 

@@ -46,12 +46,16 @@ const (
 	// TypeAspect is a cross-cutting concern that can be applied to other formulas.
 	// Examples: add logging steps, add approval gates.
 	TypeAspect FormulaType = "aspect"
+
+	// TypeConvoy is a multi-agent workflow that coordinates parallel workers.
+	// Examples: code review with multiple reviewers, design review sessions.
+	TypeConvoy FormulaType = "convoy"
 )
 
 // IsValid checks if the formula type is recognized.
 func (t FormulaType) IsValid() bool {
 	switch t {
-	case TypeWorkflow, TypeExpansion, TypeAspect:
+	case TypeWorkflow, TypeExpansion, TypeAspect, TypeConvoy:
 		return true
 	}
 	return false
@@ -104,6 +108,13 @@ type Formula struct {
 	// Patrol and release workflows should typically use "vapor" since they're operational.
 	Phase string `json:"phase,omitempty"`
 
+	// Pour controls whether steps are materialized as individual child issues.
+	// If true, each step becomes a DB row with dependency tracking (checkpoint recovery).
+	// If false (default), only the root issue is created; steps are read inline at prime time.
+	// Reserve pour=true for critical, infrequent work (e.g. releases) where step-level
+	// tracking is worth the DB overhead. Patrol formulas should NOT set this.
+	Pour bool `json:"pour,omitempty"`
+
 	// Source tracks where this formula was loaded from (set by parser).
 	Source string `json:"source,omitempty"`
 }
@@ -114,7 +125,9 @@ type VarDef struct {
 	Description string `json:"description,omitempty"`
 
 	// Default is the value to use if not provided.
-	Default string `json:"default,omitempty"`
+	// nil means no default (variable must be provided if referenced).
+	// Non-nil (including &"") means the variable has an explicit default.
+	Default *string `json:"default,omitempty"`
 
 	// Required indicates the variable must be provided (no default).
 	Required bool `json:"required,omitempty"`
@@ -129,6 +142,51 @@ type VarDef struct {
 	Type string `json:"type,omitempty"`
 }
 
+// UnmarshalTOML implements toml.Unmarshaler for VarDef.
+// This allows vars to be defined as either simple strings or tables:
+//
+//	[vars]
+//	wisp_type = "patrol"           # simple string -> Default = "patrol"
+//
+//	[vars.component]               # table with full definition
+//	description = "Component name"
+//	required = true
+func (v *VarDef) UnmarshalTOML(data interface{}) error {
+	switch val := data.(type) {
+	case string:
+		// Simple string value becomes the default
+		v.Default = &val
+		return nil
+	case map[string]interface{}:
+		// Table format - parse each field
+		if desc, ok := val["description"].(string); ok {
+			v.Description = desc
+		}
+		if def, ok := val["default"].(string); ok {
+			v.Default = &def
+		}
+		if req, ok := val["required"].(bool); ok {
+			v.Required = req
+		}
+		if enum, ok := val["enum"].([]interface{}); ok {
+			for _, e := range enum {
+				if s, ok := e.(string); ok {
+					v.Enum = append(v.Enum, s)
+				}
+			}
+		}
+		if pattern, ok := val["pattern"].(string); ok {
+			v.Pattern = pattern
+		}
+		if typ, ok := val["type"].(string); ok {
+			v.Type = typ
+		}
+		return nil
+	default:
+		return fmt.Errorf("type mismatch for formula.VarDef: expected string or table but found %T", data)
+	}
+}
+
 // Step defines a work item to create when the formula is instantiated.
 type Step struct {
 	// ID is the unique identifier within this formula.
@@ -141,6 +199,9 @@ type Step struct {
 	// Description is the issue description (supports substitution).
 	Description string `json:"description,omitempty"`
 
+	// Notes are additional notes for the issue (supports substitution).
+	Notes string `json:"notes,omitempty"`
+
 	// Type is the issue type: task, bug, feature, epic, chore.
 	Type string `json:"type,omitempty"`
 
@@ -150,17 +211,22 @@ type Step struct {
 	// Labels are applied to the created issue.
 	Labels []string `json:"labels,omitempty"`
 
+	// Metadata is carried through to the created issue's Metadata field as
+	// JSON. Lets formulas pre-declare keys that downstream tooling can project
+	// without a post-pour compose step.
+	Metadata map[string]interface{} `json:"metadata,omitempty" toml:"metadata,omitempty"`
+
 	// DependsOn lists step IDs this step blocks on (within the formula).
-	DependsOn []string `json:"depends_on,omitempty"`
+	DependsOn []string `json:"depends_on,omitempty" toml:"depends_on,omitempty"`
 
 	// Needs is a simpler alias for DependsOn - lists sibling step IDs that must complete first.
 	// Either Needs or DependsOn can be used; they are merged during cooking.
-	Needs []string `json:"needs,omitempty"`
+	Needs []string `json:"needs,omitempty" toml:"needs,omitempty"`
 
 	// WaitsFor specifies a fanout gate type for this step.
 	// Values: "all-children" (wait for all dynamic children) or "any-children" (wait for first).
 	// When set, the cooked issue gets a "gate:<value>" label.
-	WaitsFor string `json:"waits_for,omitempty"`
+	WaitsFor string `json:"waits_for,omitempty" toml:"waits_for,omitempty"`
 
 	// Assignee is the default assignee (supports substitution).
 	Assignee string `json:"assignee,omitempty"`
@@ -172,7 +238,7 @@ type Step struct {
 
 	// ExpandVars are variable overrides for the expansion.
 	// Merged with the expansion formula's default vars during inline expansion.
-	ExpandVars map[string]string `json:"expand_vars,omitempty"`
+	ExpandVars map[string]string `json:"expand_vars,omitempty" toml:"expand_vars,omitempty"`
 
 	// Condition makes this step optional based on a variable.
 	// Format: "{{var}}" (truthy), "!{{var}}" (negated), "{{var}} == value", "{{var}} != value".
@@ -193,7 +259,7 @@ type Step struct {
 
 	// OnComplete defines actions triggered when this step completes.
 	// Used for runtime expansion over step output (the for-each construct).
-	OnComplete *OnCompleteSpec `json:"on_complete,omitempty"`
+	OnComplete *OnCompleteSpec `json:"on_complete,omitempty" toml:"on_complete,omitempty"`
 
 	// Source tracing fields: track where this step came from.
 	// These are set during parsing/transformation and copied to Issues during cooking.
@@ -216,6 +282,10 @@ type Gate struct {
 
 	// ID is the condition identifier (e.g., workflow name for gh:run).
 	ID string `json:"id,omitempty"`
+
+	// AwaitID is the runtime condition identifier. This is preferred by
+	// formula authors because it maps directly to Issue.AwaitID.
+	AwaitID string `json:"await_id,omitempty" toml:"await_id,omitempty"`
 
 	// Timeout is how long to wait before escalation (e.g., "1h", "24h").
 	Timeout string `json:"timeout,omitempty"`
@@ -260,17 +330,17 @@ type LoopSpec struct {
 //
 //	step: survey-workers
 //	on_complete:
-//	  for_each: output.polecats
-//	  bond: mol-polecat-arm
+//	  for_each: output.workers
+//	  bond: mol-worker-arm
 //	  vars:
-//	    polecat_name: "{item.name}"
+//	    worker_name: "{item.name}"
 //	    rig: "{item.rig}"
 //	  parallel: true
 type OnCompleteSpec struct {
 	// ForEach is the path to the iterable collection in step output.
 	// Format: "output.<field>" or "output.<field>.<nested>"
 	// The collection must be an array at runtime.
-	ForEach string `json:"for_each,omitempty"`
+	ForEach string `json:"for_each,omitempty" toml:"for_each,omitempty"`
 
 	// Bond is the formula to instantiate for each item.
 	// A new molecule is created for each element in the ForEach collection.
@@ -324,7 +394,7 @@ type GateRule struct {
 // ComposeRules define how formulas can be bonded together.
 type ComposeRules struct {
 	// BondPoints are named locations where other formulas can attach.
-	BondPoints []*BondPoint `json:"bond_points,omitempty"`
+	BondPoints []*BondPoint `json:"bond_points,omitempty" toml:"bond_points,omitempty"`
 
 	// Hooks are automatic attachments triggered by labels or conditions.
 	Hooks []*Hook `json:"hooks,omitempty"`
@@ -387,11 +457,11 @@ type BondPoint struct {
 
 	// AfterStep is the step ID after which to attach.
 	// Mutually exclusive with BeforeStep.
-	AfterStep string `json:"after_step,omitempty"`
+	AfterStep string `json:"after_step,omitempty" toml:"after_step,omitempty"`
 
 	// BeforeStep is the step ID before which to attach.
 	// Mutually exclusive with AfterStep.
-	BeforeStep string `json:"before_step,omitempty"`
+	BeforeStep string `json:"before_step,omitempty" toml:"before_step,omitempty"`
 
 	// Parallel makes attached steps run in parallel with the anchor step.
 	Parallel bool `json:"parallel,omitempty"`
@@ -497,7 +567,7 @@ func (f *Formula) Validate() error {
 			errs = append(errs, "vars: variable name cannot be empty")
 			continue
 		}
-		if v.Required && v.Default != "" {
+		if v.Required && v.Default != nil {
 			errs = append(errs, fmt.Sprintf("vars.%s: cannot have both required:true and default", name))
 		}
 	}
@@ -768,6 +838,9 @@ func findStepByID(step *Step, id string) *Step {
 	}
 	return nil
 }
+
+// StringPtr returns a pointer to s. Useful for constructing VarDef literals.
+func StringPtr(s string) *string { return &s }
 
 // GetBondPoint finds a bond point by ID.
 func (f *Formula) GetBondPoint(id string) *BondPoint {

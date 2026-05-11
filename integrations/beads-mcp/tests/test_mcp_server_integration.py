@@ -79,9 +79,6 @@ async def mcp_client(bd_executable, temp_db, monkeypatch):
     # The workspace root is the parent directory
     workspace_root = os.path.dirname(temp_db)
 
-    # Disable daemon mode for tests (prevents daemon accumulation and timeouts)
-    os.environ["BEADS_NO_DAEMON"] = "1"
-
     # Create test client
     async with Client(mcp) as client:
         # Automatically set context for the tests
@@ -94,7 +91,6 @@ async def mcp_client(bd_executable, temp_db, monkeypatch):
     os.environ.pop("BEADS_WORKING_DIR", None)
     os.environ.pop("BEADS_DB", None)
     os.environ.pop("BEADS_DIR", None)
-    os.environ.pop("BEADS_NO_DAEMON", None)
 
 
 @pytest.mark.asyncio
@@ -199,7 +195,7 @@ async def test_update_issue_tool(mcp_client):
         "update",
         {
             "issue_id": issue_id,
-            "status": "in_progress",
+            "status": "blocked",
             "priority": 0,
             "title": "Updated title",
             "brief": False,  # Get full Issue object
@@ -208,9 +204,28 @@ async def test_update_issue_tool(mcp_client):
 
     updated = json.loads(update_result.content[0].text)
     assert updated["id"] == issue_id
-    assert updated["status"] == "in_progress"
+    assert updated["status"] == "blocked"
     assert updated["priority"] == 0
     assert updated["title"] == "Updated title"
+
+
+@pytest.mark.asyncio
+async def test_claim_issue_tool(mcp_client):
+    """Test claim_issue tool."""
+    import json
+
+    create_result = await mcp_client.call_tool(
+        "create", {"title": "Issue to claim", "priority": 2, "issue_type": "task", "brief": False}
+    )
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id, "brief": False})
+    claimed = json.loads(claim_result.content[0].text)
+
+    assert claimed["id"] == issue_id
+    assert claimed["status"] == "in_progress"
+    assert claimed["assignee"] is not None
 
 
 @pytest.mark.asyncio
@@ -506,10 +521,10 @@ async def test_update_partial_fields(mcp_client):
 
     # Update only status with brief=False to get full Issue
     update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress", "brief": False}
+        "update", {"issue_id": issue_id, "status": "blocked", "brief": False}
     )
     updated = json.loads(update_result.content[0].text)
-    assert updated["status"] == "in_progress"
+    assert updated["status"] == "blocked"
     assert updated["title"] == "Original title"  # Unchanged
     assert updated["priority"] == 2  # Unchanged
 
@@ -558,9 +573,10 @@ async def test_stats_tool(mcp_client):
     result = await mcp_client.call_tool("stats", {})
     stats = json.loads(result.content[0].text)
 
-    assert "total_issues" in stats
-    assert "open_issues" in stats
-    assert stats["total_issues"] >= 2
+    assert "summary" in stats
+    assert "total_issues" in stats["summary"]
+    assert "open_issues" in stats["summary"]
+    assert stats["summary"]["total_issues"] >= 2
 
 
 @pytest.mark.asyncio
@@ -622,7 +638,6 @@ async def test_context_init_action(bd_executable):
     os.environ.pop("BEADS_WORKING_DIR", None)
     os.environ.pop("BEADS_DB", None)
     os.environ.pop("BEADS_DIR", None)
-    os.environ["BEADS_NO_DAEMON"] = "1"
 
     # Create a fresh temp directory without any beads database
     temp_dir = tempfile.mkdtemp(prefix="beads_init_test_")
@@ -735,7 +750,7 @@ async def test_update_brief_default(mcp_client):
 
     # Update with default brief=True
     update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress"}
+        "update", {"issue_id": issue_id, "status": "blocked"}
     )
 
     data = json.loads(update_result.content[0].text)
@@ -758,13 +773,48 @@ async def test_update_brief_false(mcp_client):
 
     # Update with brief=False
     update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress", "brief": False}
+        "update", {"issue_id": issue_id, "status": "blocked", "brief": False}
     )
 
     data = json.loads(update_result.content[0].text)
     assert data["id"] == issue_id
-    assert data["status"] == "in_progress"
+    assert data["status"] == "blocked"
     assert data["title"] == "Update full test"
+
+
+@pytest.mark.asyncio
+async def test_claim_brief_default(mcp_client):
+    """Test claim returns OperationResult by default (brief=True)."""
+    import json
+
+    create_result = await mcp_client.call_tool(
+        "create", {"title": "Claim brief test", "brief": False}
+    )
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id})
+    data = json.loads(claim_result.content[0].text)
+    assert data["id"] == issue_id
+    assert data["action"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_claim_brief_false(mcp_client):
+    """Test claim returns full Issue when brief=False."""
+    import json
+
+    create_result = await mcp_client.call_tool(
+        "create", {"title": "Claim full test", "brief": False}
+    )
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id, "brief": False})
+    data = json.loads(claim_result.content[0].text)
+    assert data["id"] == issue_id
+    assert data["status"] == "in_progress"
+    assert data["assignee"] is not None
 
 
 @pytest.mark.asyncio

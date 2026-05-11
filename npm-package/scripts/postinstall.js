@@ -64,14 +64,37 @@ function downloadFile(url, dest) {
       if (response.statusCode === 301 || response.statusCode === 302) {
         const redirectUrl = response.headers.location;
         console.log(`Following redirect to: ${redirectUrl}`);
-        downloadFile(redirectUrl, dest).then(resolve).catch(reject);
+        response.destroy();
+        request.destroy();
+        file.close((closeErr) => {
+          if (closeErr) {
+            fs.unlink(dest, () => {});
+            reject(closeErr);
+            return;
+          }
+          fs.unlink(dest, () => {});
+          downloadFile(redirectUrl, dest).then(resolve).catch(reject);
+        });
         return;
       }
 
       if (response.statusCode !== 200) {
-        reject(new Error(`Failed to download: HTTP ${response.statusCode}`));
+        const error = new Error(`Failed to download: HTTP ${response.statusCode}`);
+        response.destroy();
+        request.destroy();
+        file.close(() => {
+          fs.unlink(dest, () => {});
+          reject(error);
+        });
         return;
       }
+
+      response.on('error', (err) => {
+        file.close(() => {
+          fs.unlink(dest, () => {});
+          reject(err);
+        });
+      });
 
       response.pipe(file);
 
@@ -80,7 +103,10 @@ function downloadFile(url, dest) {
         // This is critical on Windows where the file may still be locked
         file.close((err) => {
           if (err) reject(err);
-          else resolve();
+          else {
+            response.destroy();
+            resolve();
+          }
         });
       });
     });
@@ -128,6 +154,30 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Wait for a file to become accessible (Windows file lock workaround).
+// After fs.createWriteStream closes, Windows may hold the file lock for a
+// short period. This function polls until the file can be opened exclusively.
+async function waitForFileAccess(filePath, timeoutMs = 30000) {
+  const intervalMs = 200;
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const fd = fs.openSync(filePath, 'r+');
+      fs.closeSync(fd);
+      return; // File is accessible
+    } catch (err) {
+      if (err.code === 'EBUSY' || err.code === 'EPERM') {
+        await sleep(intervalMs);
+      } else {
+        return; // Not a lock error — let extraction attempt handle it
+      }
+    }
+  }
+  // Timed out, but proceed anyway — extractZip has its own retry logic
+  console.warn(`Warning: file ${path.basename(filePath)} may still be locked after ${timeoutMs}ms, attempting extraction anyway...`);
+}
+
 // Extract zip file (for Windows) with retry logic
 async function extractZip(zipPath, destDir, binaryName) {
   console.log(`Extracting ${zipPath}...`);
@@ -139,35 +189,55 @@ async function extractZip(zipPath, destDir, binaryName) {
     try {
       // Use unzip command or powershell on Windows
       if (os.platform() === 'win32') {
-        execSync(`powershell -command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'inherit' });
+        // Use stdio: 'pipe' to capture error output for file-lock detection
+        execSync(`powershell -command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'pipe' });
       } else {
-        execSync(`unzip -o "${zipPath}" -d "${destDir}"`, { stdio: 'inherit' });
+        execSync(`unzip -o "${zipPath}" -d "${destDir}"`, { stdio: 'pipe' });
       }
 
       // The binary should now be in destDir
       const extractedBinary = path.join(destDir, binaryName);
 
-      if (!fs.existsSync(extractedBinary)) {
+      // Windows NTFS metadata visibility lag: fs.existsSync may return false
+      // immediately after Expand-Archive returns (GH#2741, same class as #1683).
+      // Poll with short delay before concluding the binary is missing.
+      let found = fs.existsSync(extractedBinary);
+      if (!found && os.platform() === 'win32') {
+        for (let poll = 0; poll < 10; poll++) {
+          await sleep(200);
+          if (fs.existsSync(extractedBinary)) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) {
         throw new Error(`Binary not found after extraction: ${extractedBinary}`);
       }
 
       console.log(`Binary extracted to: ${extractedBinary}`);
       return; // Success
     } catch (err) {
-      const isFileLockError = err.message && (
-        err.message.includes('being used by another process') ||
-        err.message.includes('Access is denied') ||
-        err.message.includes('cannot access the file')
-      );
+      // Combine all available error output for reliable detection.
+      // With stdio: 'pipe', the PowerShell error text is in err.stderr,
+      // while err.message only contains "Command failed: ...".
+      const stderr = err.stderr ? err.stderr.toString() : '';
+      const errorText = `${err.message} ${stderr}`;
+
+      const isFileLockError =
+        errorText.includes('being used by another process') ||
+        errorText.includes('Access is denied') ||
+        errorText.includes('cannot access the file') ||
+        errorText.includes('EBUSY');
 
       if (isFileLockError && attempt < maxRetries) {
         const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
-        console.log(`File may be locked (attempt ${attempt}/${maxRetries}). Retrying in ${delayMs}ms...`);
+        console.log(`File appears locked (attempt ${attempt}/${maxRetries}). Retrying in ${delayMs}ms...`);
         await sleep(delayMs);
       } else if (attempt === maxRetries) {
-        throw new Error(`Failed to extract archive after ${maxRetries} attempts: ${err.message}`);
+        throw new Error(`Failed to extract archive after ${maxRetries} attempts: ${err.message}\n${stderr}`);
       } else {
-        throw new Error(`Failed to extract archive: ${err.message}`);
+        throw new Error(`Failed to extract archive: ${err.message}\n${stderr}`);
       }
     }
   }
@@ -190,16 +260,22 @@ async function install() {
     }
 
     // Construct download URL
-    // Format: https://github.com/steveyegge/beads/releases/download/v0.21.5/beads_0.21.5_darwin_amd64.tar.gz
+    // Format: https://github.com/gastownhall/beads/releases/download/v0.21.5/beads_0.21.5_darwin_amd64.tar.gz
     const releaseVersion = VERSION;
     const archiveExt = platformName === 'windows' ? 'zip' : 'tar.gz';
     const archiveName = `beads_${releaseVersion}_${platformName}_${archName}.${archiveExt}`;
-    const downloadUrl = `https://github.com/steveyegge/beads/releases/download/v${releaseVersion}/${archiveName}`;
+    const downloadUrl = `https://github.com/gastownhall/beads/releases/download/v${releaseVersion}/${archiveName}`;
     const archivePath = path.join(binDir, archiveName);
 
     // Download the archive
     console.log(`Downloading bd binary...`);
     await downloadFile(downloadUrl, archivePath);
+
+    // On Windows, wait for the OS to release the file lock before extracting.
+    // Windows may hold the file handle for a short time after close().
+    if (process.platform === 'win32') {
+      await waitForFileAccess(archivePath);
+    }
 
     // Extract the archive based on platform
     if (platformName === 'windows') {
@@ -223,9 +299,9 @@ async function install() {
     console.error(`Error installing bd: ${err.message}`);
     console.error('');
     console.error('Installation failed. You can try:');
-    console.error('1. Installing manually from: https://github.com/steveyegge/beads/releases');
-    console.error('2. Using the install script: curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash');
-    console.error('3. Opening an issue: https://github.com/steveyegge/beads/issues');
+    console.error('1. Installing manually from: https://github.com/gastownhall/beads/releases');
+    console.error('2. Using the install script: curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash');
+    console.error('3. Opening an issue: https://github.com/gastownhall/beads/issues');
     process.exit(1);
   }
 }

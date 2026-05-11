@@ -2,20 +2,21 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 var vcCmd = &cobra.Command{
 	Use:     "vc",
 	GroupID: "sync",
-	Short:   "Version control operations (requires Dolt backend)",
+	Short:   "Version control operations",
 	Long: `Version control operations for the beads database.
 
-These commands require the Dolt storage backend. They provide git-like
-version control for your issue data, including branching, merging, and
+These commands provide git-like version control for your issue data, including branching, merging, and
 viewing history.
 
 Note: 'bd history', 'bd diff', and 'bd branch' also work for quick access.
@@ -41,14 +42,8 @@ Examples:
 		ctx := rootCtx
 		branchName := args[0]
 
-		// Check if storage supports versioning
-		vs, ok := storage.AsVersioned(store)
-		if !ok {
-			FatalErrorRespectJSON("merge requires Dolt backend (current backend does not support versioning)")
-		}
-
 		// Perform merge
-		conflicts, err := vs.Merge(ctx, branchName)
+		conflicts, err := store.Merge(ctx, branchName)
 		if err != nil {
 			FatalErrorRespectJSON("failed to merge branch: %v", err)
 		}
@@ -62,7 +57,7 @@ Examples:
 					if table == "" {
 						table = "issues" // Default to issues table
 					}
-					if err := vs.ResolveConflicts(ctx, table, vcMergeStrategy); err != nil {
+					if err := store.ResolveConflicts(ctx, table, vcMergeStrategy); err != nil {
 						FatalErrorRespectJSON("failed to resolve conflicts: %v", err)
 					}
 				}
@@ -109,6 +104,7 @@ Examples:
 }
 
 var vcCommitMessage string
+var vcCommitStdin bool
 
 var vcCommitCmd = &cobra.Command{
 	Use:   "commit",
@@ -117,28 +113,42 @@ var vcCommitCmd = &cobra.Command{
 
 Examples:
   bd vc commit -m "Added new feature issues"
-  bd vc commit --message "Fixed priority on several issues"`,
+  bd vc commit --message "Fixed priority on several issues"
+  echo "Multi-line message" | bd vc commit --stdin`,
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := rootCtx
 
-		if vcCommitMessage == "" {
-			FatalErrorRespectJSON("commit message is required (use -m or --message)")
+		if vcCommitStdin {
+			if vcCommitMessage != "" {
+				FatalErrorRespectJSON("cannot specify both --stdin and -m/--message")
+			}
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				FatalErrorRespectJSON("failed to read commit message from stdin: %v", err)
+			}
+			vcCommitMessage = strings.TrimRight(string(b), "\n")
 		}
 
-		// Check if storage supports versioning
-		vs, ok := storage.AsVersioned(store)
-		if !ok {
-			FatalErrorRespectJSON("commit requires Dolt backend (current backend does not support versioning)")
+		if vcCommitMessage == "" {
+			FatalErrorRespectJSON("commit message is required (use -m, --message, or --stdin)")
 		}
 
 		// We are explicitly creating a Dolt commit; avoid redundant auto-commit in PersistentPostRun.
 		commandDidExplicitDoltCommit = true
-		if err := vs.Commit(ctx, vcCommitMessage); err != nil {
+		if err := store.Commit(ctx, vcCommitMessage); err != nil {
+			if isDoltNothingToCommit(err) {
+				if jsonOutput {
+					outputJSON(map[string]interface{}{"committed": false, "message": "nothing to commit"})
+				} else {
+					fmt.Println("Nothing to commit")
+				}
+				return
+			}
 			FatalErrorRespectJSON("failed to commit: %v", err)
 		}
 
 		// Get the new commit hash
-		hash, err := vs.GetCurrentCommit(ctx)
+		hash, err := store.GetCurrentCommit(ctx)
 		if err != nil {
 			hash = "(unknown)"
 		}
@@ -166,18 +176,12 @@ Examples:
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := rootCtx
 
-		// Check if storage supports versioning
-		vs, ok := storage.AsVersioned(store)
-		if !ok {
-			FatalErrorRespectJSON("status requires Dolt backend (current backend does not support versioning)")
-		}
-
-		currentBranch, err := vs.CurrentBranch(ctx)
+		currentBranch, err := store.CurrentBranch(ctx)
 		if err != nil {
 			FatalErrorRespectJSON("failed to get current branch: %v", err)
 		}
 
-		currentCommit, err := vs.GetCurrentCommit(ctx)
+		currentCommit, err := store.GetCurrentCommit(ctx)
 		if err != nil {
 			currentCommit = "(unknown)"
 		}
@@ -200,6 +204,7 @@ Examples:
 func init() {
 	vcMergeCmd.Flags().StringVar(&vcMergeStrategy, "strategy", "", "Conflict resolution strategy: 'ours' or 'theirs'")
 	vcCommitCmd.Flags().StringVarP(&vcCommitMessage, "message", "m", "", "Commit message")
+	vcCommitCmd.Flags().BoolVar(&vcCommitStdin, "stdin", false, "Read commit message from stdin")
 
 	vcCmd.AddCommand(vcMergeCmd)
 	vcCmd.AddCommand(vcCommitCmd)

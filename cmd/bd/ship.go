@@ -1,14 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -53,44 +49,15 @@ func runShip(cmd *cobra.Command, args []string) {
 	var issues []*types.Issue
 	var err error
 
-	// Ship requires direct store access for label operations
-	// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
-	if daemonClient != nil && store == nil {
-		beadsDir := filepath.Dir(dbPath)
-		store, err = factory.NewFromConfig(ctx, beadsDir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
-			os.Exit(1)
-		}
-		defer func() { _ = store.Close() }()
-	}
-
-	if daemonClient != nil {
-		// Use RPC to list issues with the export label
-		listArgs := &rpc.ListArgs{
-			LabelsAny: []string{exportLabel},
-		}
-		resp, err := daemonClient.List(listArgs)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
-			os.Exit(1)
-		}
-		if err := json.Unmarshal(resp.Data, &issues); err != nil {
-			fmt.Fprintf(os.Stderr, "Error unmarshaling issues: %v\n", err)
-			os.Exit(1)
-		}
-	} else {
-		issues, err = store.GetIssuesByLabel(ctx, exportLabel)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error listing issues: %v\n", err)
-			os.Exit(1)
-		}
+	issues, err = store.GetIssuesByLabel(ctx, exportLabel)
+	if err != nil {
+		FatalError("listing issues: %v", err)
 	}
 
 	if len(issues) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: no issue found with label '%s'\n", exportLabel)
-		fmt.Fprintf(os.Stderr, "Hint: add the label first: bd label add <issue-id> %s\n", exportLabel)
-		os.Exit(1)
+		FatalErrorWithHint(
+			fmt.Sprintf("no issue found with label '%s'", exportLabel),
+			fmt.Sprintf("add the label first: bd label add <issue-id> %s", exportLabel))
 	}
 
 	if len(issues) > 1 {
@@ -98,25 +65,23 @@ func runShip(cmd *cobra.Command, args []string) {
 		for _, issue := range issues {
 			fmt.Fprintf(os.Stderr, "  %s: %s (%s)\n", issue.ID, issue.Title, issue.Status)
 		}
-		fmt.Fprintf(os.Stderr, "Hint: only one issue should have this label\n")
-		os.Exit(1)
+		FatalError("only one issue should have this label")
 	}
 
 	issue := issues[0]
 
 	// Validate issue is closed (unless --force)
 	if issue.Status != types.StatusClosed && !force {
-		fmt.Fprintf(os.Stderr, "Error: issue %s is not closed (status: %s)\n", issue.ID, issue.Status)
-		fmt.Fprintf(os.Stderr, "Hint: close the issue first, or use --force to override\n")
-		os.Exit(1)
+		FatalErrorWithHint(
+			fmt.Sprintf("issue %s is not closed (status: %s)", issue.ID, issue.Status),
+			"close the issue first, or use --force to override")
 	}
 
 	// Check if already shipped (use direct store access)
 	hasProvides := false
 	labels, err := store.GetLabels(ctx, issue.ID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting labels: %v\n", err)
-		os.Exit(1)
+		FatalError("getting labels: %v", err)
 	}
 	for _, l := range labels {
 		if l == providesLabel {
@@ -156,10 +121,8 @@ func runShip(cmd *cobra.Command, args []string) {
 
 	// Add provides:<capability> label (use direct store access)
 	if err := store.AddLabel(ctx, issue.ID, providesLabel, actor); err != nil {
-		fmt.Fprintf(os.Stderr, "Error adding label: %v\n", err)
-		os.Exit(1)
+		FatalError("adding label: %v", err)
 	}
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(map[string]interface{}{
@@ -175,6 +138,8 @@ func runShip(cmd *cobra.Command, args []string) {
 		fmt.Printf("\nExternal projects can now depend on: external:%s:%s\n",
 			"<this-project>", capability)
 	}
+
+	commandDidWrite.Store(true)
 }
 
 func init() {

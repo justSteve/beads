@@ -39,7 +39,7 @@ AGENT_NAME="${BEADS_AGENT_NAME:-bash-agent-$$}"
 # Check if bd is installed
 if ! command -v bd &> /dev/null; then
     log_error "bd is not installed"
-    echo "Install with: go install github.com/steveyegge/beads/cmd/bd@latest"
+    echo "Install with: curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash"
     exit 1
 fi
 
@@ -67,7 +67,7 @@ claim_task() {
     local issue_id="$1"
 
     log_info "Claiming task: $issue_id"
-    bd update "$issue_id" --status in_progress --json > /dev/null
+    bd update "$issue_id" --claim --json > /dev/null
 
     log_success "Task claimed"
     return 0

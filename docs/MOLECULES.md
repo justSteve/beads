@@ -56,7 +56,7 @@ bd dep add <B-id> <A-id>   # B depends on A (B needs A)
 
 An agent works through a molecule by:
 1. Getting ready work (`bd ready`)
-2. Claiming it (`bd update <id> --status in_progress`)
+2. Claiming it (`bd update <id> --claim`)
 3. Doing the work
 4. Closing it (`bd close <id>`)
 5. Repeat until molecule is done
@@ -114,6 +114,9 @@ bd mol bond A B --type conditional # B runs only if A fails
 - The compound work graph can span days
 
 This is how orchestrators run autonomous workflows - agents follow the dependency graph, handing off between sessions, until all work closes.
+
+Ordinary epics stay open when the last child closes. They become close-eligible
+work that can be closed explicitly once the parent outcome is actually done.
 
 ## Phase Metaphor (Templates)
 
@@ -173,9 +176,9 @@ bd dep add <aggregate> <fileA> --type waits-for
 When the number of children isn't known until runtime:
 
 ```bash
-# In a survey step, discover polecats and bond arms dynamically
-for polecat in $(gt polecat list); do
-  bd mol bond mol-polecat-arm $PATROL_ID --ref arm-$polecat --var name=$polecat
+# In a survey step, discover workers and bond arms dynamically
+for worker in $(bd agent list); do
+  bd mol bond mol-worker-arm $PATROL_ID --ref arm-$worker --var name=$worker
 done
 ```
 
@@ -231,6 +234,7 @@ bd mol wisp list        # Check for orphans
 bd mol squash <id>      # Create digest
 bd mol burn <id>        # Or discard
 bd mol wisp gc          # Garbage collect old wisps
+bd mol wisp gc --closed --force  # Purge all closed wisps
 ```
 
 ## Layer Cake Architecture
@@ -246,7 +250,7 @@ Molecules (bond, squash, burn)            ← workflow operations
     ↓
 Epics (parent-child, dependencies)        ← DATA PLANE (the core)
     ↓
-Issues (JSONL, git-backed)                ← STORAGE
+Issues (Dolt, version-controlled)          ← STORAGE
 ```
 
 **Most users only need the bottom two layers.** Protos and formulas are for reusable patterns and complex composition.
@@ -258,7 +262,7 @@ Issues (JSONL, git-backed)                ← STORAGE
 ```bash
 bd ready                         # What's ready to work
 bd blocked                       # What's blocked
-bd update <id> --status in_progress
+bd update <id> --claim
 bd close <id>
 ```
 

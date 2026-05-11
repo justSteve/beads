@@ -1,17 +1,9 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -41,7 +33,7 @@ var statusCmd = &cobra.Command{
 	Long: `Show a quick snapshot of the issue database state and statistics.
 
 This command provides a summary of issue counts by state (open, in_progress,
-blocked, closed), ready work, extended statistics (tombstones, pinned issues,
+blocked, closed), ready work, extended statistics (pinned issues,
 average lead time), and recent activity over the last 24 hours from git history.
 
 Similar to how 'git status' shows working tree state, 'bd status' gives you
@@ -74,44 +66,19 @@ Examples:
 		var stats *types.Statistics
 		var err error
 
-		// Check database freshness before reading (bd-2q6d, bd-c4rq)
-		// Skip check when using daemon (daemon auto-imports on staleness)
 		ctx := rootCtx
-		if daemonClient == nil {
-			if err := ensureDatabaseFresh(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		}
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			resp, rpcErr := daemonClient.Stats()
-			if rpcErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rpcErr)
-				os.Exit(1)
-			}
-
-			if err := json.Unmarshal(resp.Data, &stats); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			// Direct mode
-			ctx := rootCtx
-			stats, err = store.GetStatistics(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		// Direct mode
+		stats, err = store.GetStatistics(ctx)
+		if err != nil {
+			FatalErrorRespectJSON("%v", err)
 		}
 
 		// Filter by assignee if requested (overrides stats with filtered counts)
 		if showAssigned {
 			stats = getAssignedStatistics(actor)
 			if stats == nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to get assigned statistics\n")
-				os.Exit(1)
+				FatalErrorRespectJSON("failed to get assigned statistics")
 			}
 		}
 
@@ -143,13 +110,10 @@ Examples:
 		fmt.Printf("  Ready to Work:          %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.ReadyIssues)))
 
 		// Extended statistics (only show if non-zero)
-		hasExtended := stats.TombstoneIssues > 0 || stats.PinnedIssues > 0 ||
+		hasExtended := stats.PinnedIssues > 0 ||
 			stats.EpicsEligibleForClosure > 0 || stats.AverageLeadTime > 0
 		if hasExtended {
 			fmt.Printf("\nExtended:\n")
-			if stats.TombstoneIssues > 0 {
-				fmt.Printf("  Deleted:                %d (tombstones)\n", stats.TombstoneIssues)
-			}
 			if stats.PinnedIssues > 0 {
 				fmt.Printf("  Pinned:                 %d\n", stats.PinnedIssues)
 			}
@@ -180,112 +144,11 @@ Examples:
 	},
 }
 
-// getGitActivity calculates activity stats from git log of issues.jsonl.
-// GH#1110: Now uses RepoContext to ensure git commands run in beads repo.
-func getGitActivity(hours int) *RecentActivitySummary {
-	activity := &RecentActivitySummary{
-		HoursTracked: hours,
-	}
-
-	// Run git log to get patches for the last N hours
-	since := fmt.Sprintf("%d hours ago", hours)
-	var cmd *exec.Cmd
-	if rc, err := beads.GetRepoContext(); err == nil {
-		cmd = rc.GitCmd(context.Background(), "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl")
-	} else {
-		cmd = exec.Command("git", "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
-	}
-
-	output, err := cmd.Output()
-	if err != nil {
-		// Git log failed (might not be a git repo or no commits)
-		return nil
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	commitCount := 0
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Empty lines separate commits
-		if line == "" {
-			continue
-		}
-
-		// Commit hash line
-		if !strings.Contains(line, "\t") {
-			commitCount++
-			continue
-		}
-
-		// numstat line format: "additions\tdeletions\tfilename"
-		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
-			continue
-		}
-
-		// For JSONL files, each added line is a new/updated issue
-		// We need to analyze the actual diff to understand what changed
-	}
-
-	// Get detailed diff to analyze changes
-	if rc, err := beads.GetRepoContext(); err == nil {
-		cmd = rc.GitCmd(context.Background(), "log", "--since="+since, "-p", ".beads/issues.jsonl")
-	} else {
-		cmd = exec.Command("git", "log", "--since="+since, "-p", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
-	}
-	output, err = cmd.Output()
-	if err != nil {
-		return nil
-	}
-
-	scanner = bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Look for added lines in diff (lines starting with +)
-		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
-			continue
-		}
-
-		// Remove the + prefix
-		jsonLine := strings.TrimPrefix(line, "+")
-
-		// Skip empty lines
-		if strings.TrimSpace(jsonLine) == "" {
-			continue
-		}
-
-		// Try to parse as issue JSON
-		var issue types.Issue
-		if err := json.Unmarshal([]byte(jsonLine), &issue); err != nil {
-			continue
-		}
-
-		activity.TotalChanges++
-
-		// Analyze the change type based on timestamps and status
-		// Created recently if created_at is close to now
-		if time.Since(issue.CreatedAt) < time.Duration(hours)*time.Hour {
-			activity.IssuesCreated++
-		} else if issue.Status == types.StatusClosed && issue.ClosedAt != nil {
-			// Closed recently if closed_at is close to now
-			if time.Since(*issue.ClosedAt) < time.Duration(hours)*time.Hour {
-				activity.IssuesClosed++
-			} else {
-				activity.IssuesUpdated++
-			}
-		} else if issue.Status != types.StatusClosed {
-			// Check if this was a reopen (status changed from closed to open/in_progress)
-			// We'd need to look at the removed line to know for sure, but for now
-			// we'll just count it as an update
-			activity.IssuesUpdated++
-		}
-	}
-
-	activity.CommitCount = commitCount
-	return activity
+// getGitActivity returns recent activity statistics.
+// Previously calculated from git log of issues.jsonl; now returns nil
+// as activity tracking has moved to Dolt-native queries.
+func getGitActivity(_ int) *RecentActivitySummary {
+	return nil
 }
 
 // getAssignedStatistics returns statistics for issues assigned to a specific user

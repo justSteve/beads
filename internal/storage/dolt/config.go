@@ -4,111 +4,186 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
+	"log"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // SetConfig sets a configuration value
 func (s *DoltStore) SetConfig(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO config (` + "`key`" + `, value) VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE value = VALUES(value)
-	`, key, value)
-	if err != nil {
-		return fmt.Errorf("failed to set config %s: %w", key, err)
+	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		if err := issueops.SetConfigInTx(ctx, tx, key, value); err != nil {
+			return err
+		}
+		// Sync normalized tables when config keys change
+		switch key {
+		case "status.custom":
+			if err := issueops.SyncCustomStatusesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_statuses table: %w", err)
+			}
+		case "types.custom":
+			if err := issueops.SyncCustomTypesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_types table: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
+
+	// Invalidate caches for keys that affect cached data
+	s.cacheMu.Lock()
+	switch key {
+	case "status.custom":
+		s.customStatusCached = false
+		s.customStatusCache = nil
+		s.customStatusDetailedCache = nil
+	case "types.custom":
+		s.customTypeCached = false
+		s.customTypeCache = nil
+	case "types.infra":
+		s.infraTypeCached = false
+		s.infraTypeCache = nil
+	}
+	s.cacheMu.Unlock()
+
+	// Rebuild status views when custom statuses change
+	if key == "status.custom" {
+		if err := s.RebuildStatusViews(ctx); err != nil {
+			return fmt.Errorf("failed to rebuild status views: %w", err)
+		}
+	}
+
 	return nil
 }
 
 // GetConfig retrieves a configuration value
 func (s *DoltStore) GetConfig(ctx context.Context, key string) (string, error) {
 	var value string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to get config %s: %w", key, err)
-	}
-	return value, nil
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetConfigInTx(ctx, tx, key)
+		return err
+	})
+	return value, err
 }
 
 // GetAllConfig retrieves all configuration values
 func (s *DoltStore) GetAllConfig(ctx context.Context) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT `key`, value FROM config")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get all config: %w", err)
-	}
-	defer rows.Close()
-
-	config := make(map[string]string)
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			return nil, fmt.Errorf("failed to scan config: %w", err)
-		}
-		config[key] = value
-	}
-	return config, rows.Err()
+	var result map[string]string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetAllConfigInTx(ctx, tx)
+		return err
+	})
+	return result, err
 }
 
 // DeleteConfig removes a configuration value
 func (s *DoltStore) DeleteConfig(ctx context.Context, key string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM config WHERE `key` = ?", key)
-	if err != nil {
-		return fmt.Errorf("failed to delete config %s: %w", key, err)
-	}
-	return nil
+	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.DeleteConfigInTx(ctx, tx, key)
+	})
 }
 
 // SetMetadata sets a metadata value
 func (s *DoltStore) SetMetadata(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO metadata (` + "`key`" + `, value) VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE value = VALUES(value)
-	`, key, value)
-	if err != nil {
-		return fmt.Errorf("failed to set metadata %s: %w", key, err)
-	}
-	return nil
+	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.SetMetadataInTx(ctx, tx, key, value)
+	})
 }
 
 // GetMetadata retrieves a metadata value
 func (s *DoltStore) GetMetadata(ctx context.Context, key string) (string, error) {
 	var value string
-	err := s.db.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to get metadata %s: %w", key, err)
-	}
-	return value, nil
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetMetadataInTx(ctx, tx, key)
+		return err
+	})
+	return value, err
 }
 
-// GetCustomStatuses returns custom status values from config.
-// If the database doesn't have custom statuses configured, falls back to config.yaml.
-// Returns an empty slice if no custom statuses are configured.
+// SetLocalMetadata sets a value in the dolt-ignored local_metadata table.
+// Used for clone-local state that should not generate merge conflicts.
+func (s *DoltStore) SetLocalMetadata(ctx context.Context, key, value string) error {
+	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		return issueops.SetLocalMetadataInTx(ctx, tx, key, value)
+	})
+}
+
+// GetLocalMetadata retrieves a value from the dolt-ignored local_metadata table.
+// Returns ("", nil) if the key does not exist.
+func (s *DoltStore) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetLocalMetadataInTx(ctx, tx, key)
+		return err
+	})
+	return value, err
+}
+
+// GetCustomStatuses returns custom status name strings from config (backward-compatible API).
+// Callers that need category information should use GetCustomStatusesDetailed instead.
 func (s *DoltStore) GetCustomStatuses(ctx context.Context) ([]string, error) {
-	value, err := s.GetConfig(ctx, "status.custom")
+	s.cacheMu.Lock()
+	if s.customStatusCached {
+		result := s.customStatusCache
+		s.cacheMu.Unlock()
+		return result, nil
+	}
+	s.cacheMu.Unlock()
+
+	// Populate via detailed method which handles parsing and fallback
+	detailed, err := s.GetCustomStatusesDetailed(ctx)
 	if err != nil {
-		// On database error, try fallback to config.yaml
-		if yamlStatuses := config.GetCustomStatusesFromYAML(); len(yamlStatuses) > 0 {
-			return yamlStatuses, nil
-		}
 		return nil, err
 	}
-	if value != "" {
-		return parseCommaSeparatedList(value), nil
+	return types.CustomStatusNames(detailed), nil
+}
+
+// GetCustomStatusesDetailed returns typed custom statuses with category information.
+// Falls back to config.yaml if DB config is unavailable.
+// On parse errors (malformed config), logs a warning and returns nil (degraded mode).
+// Results are cached per DoltStore lifetime and invalidated when SetConfig
+// updates the "status.custom" key.
+func (s *DoltStore) GetCustomStatusesDetailed(ctx context.Context) ([]types.CustomStatus, error) {
+	s.cacheMu.Lock()
+	if s.customStatusCached {
+		result := s.customStatusDetailedCache
+		s.cacheMu.Unlock()
+		return result, nil
+	}
+	s.cacheMu.Unlock()
+
+	var detailed []types.CustomStatus
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		detailed, txErr = issueops.ResolveCustomStatusesDetailedInTx(ctx, tx)
+		return txErr
+	})
+	if err != nil {
+		// DB unavailable — fall back to config.yaml before giving up.
+		log.Printf("warning: failed to resolve custom statuses: %v. Custom statuses disabled. Fix with: bd config set status.custom \"valid,values\"", err)
+		if yamlStatuses := config.GetCustomStatusesFromYAML(); len(yamlStatuses) > 0 {
+			return issueops.ParseStatusFallback(yamlStatuses), nil
+		}
+		return nil, nil
 	}
 
-	// Fallback to config.yaml when database doesn't have status.custom set.
-	if yamlStatuses := config.GetCustomStatusesFromYAML(); len(yamlStatuses) > 0 {
-		return yamlStatuses, nil
+	s.cacheMu.Lock()
+	if !s.customStatusCached {
+		s.customStatusDetailedCache = detailed
+		s.customStatusCache = types.CustomStatusNames(detailed)
+		s.customStatusCached = true
 	}
+	s.cacheMu.Unlock()
 
-	return nil, nil
+	return detailed, nil
 }
 
 // GetCustomTypes returns custom issue type values from config.
@@ -116,42 +191,77 @@ func (s *DoltStore) GetCustomStatuses(ctx context.Context) ([]string, error) {
 // This fallback is essential during operations when the database connection is
 // temporarily unavailable or when types.custom hasn't been configured yet.
 // Returns an empty slice if no custom types are configured.
+// Results are cached per DoltStore lifetime and invalidated when SetConfig
+// updates the "types.custom" key.
 func (s *DoltStore) GetCustomTypes(ctx context.Context) ([]string, error) {
-	value, err := s.GetConfig(ctx, "types.custom")
+	s.cacheMu.Lock()
+	if s.customTypeCached {
+		result := s.customTypeCache
+		s.cacheMu.Unlock()
+		return result, nil
+	}
+	s.cacheMu.Unlock()
+
+	var result []string
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		result, txErr = issueops.ResolveCustomTypesInTx(ctx, tx)
+		return txErr
+	})
 	if err != nil {
-		// On database error, try fallback to config.yaml
+		// DB unavailable — fall back to config.yaml.
 		if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
 			return yamlTypes, nil
 		}
 		return nil, err
 	}
-	if value != "" {
-		return parseCommaSeparatedList(value), nil
-	}
 
-	// Fallback to config.yaml when database doesn't have types.custom set.
-	// This allows operations to work with custom types defined in config.yaml
-	// before they're persisted to the database.
-	if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
-		return yamlTypes, nil
-	}
+	s.cacheMu.Lock()
+	s.customTypeCache = result
+	s.customTypeCached = true
+	s.cacheMu.Unlock()
 
-	return nil, nil
+	return result, nil
 }
 
-// parseCommaSeparatedList splits a comma-separated string into a slice of trimmed entries.
-// Empty entries are filtered out.
-func parseCommaSeparatedList(value string) []string {
-	if value == "" {
-		return nil
+// GetInfraTypes returns infrastructure type names from config.
+// Infrastructure types are routed to the wisps table to keep the versioned
+// issues table clean. Defaults to ["agent", "rig", "role", "message"] if
+// no custom configuration exists.
+// Falls back: DB config "types.infra" → config.yaml types.infra → defaults.
+// Results are cached per DoltStore lifetime and invalidated when SetConfig
+// updates the "types.infra" key.
+func (s *DoltStore) GetInfraTypes(ctx context.Context) map[string]bool {
+	s.cacheMu.Lock()
+	if s.infraTypeCached {
+		result := s.infraTypeCache
+		s.cacheMu.Unlock()
+		return result
 	}
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		trimmed := strings.TrimSpace(p)
-		if trimmed != "" {
-			result = append(result, trimmed)
+	s.cacheMu.Unlock()
+
+	var result map[string]bool
+	if err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		result = issueops.ResolveInfraTypesInTx(ctx, tx)
+		return nil
+	}); err != nil || result == nil {
+		// DB unavailable — fall back to YAML then defaults.
+		var typeList []string
+		if yamlTypes := config.GetInfraTypesFromYAML(); len(yamlTypes) > 0 {
+			typeList = yamlTypes
+		} else {
+			typeList = storage.DefaultInfraTypes()
+		}
+		result = make(map[string]bool, len(typeList))
+		for _, t := range typeList {
+			result[t] = true
 		}
 	}
+
+	s.cacheMu.Lock()
+	s.infraTypeCache = result
+	s.infraTypeCached = true
+	s.cacheMu.Unlock()
+
 	return result
 }

@@ -47,11 +47,11 @@ type LoadResult struct {
 
 // Loader handles loading molecule catalogs from hierarchical locations.
 type Loader struct {
-	store storage.Storage
+	store storage.DoltStorage
 }
 
 // NewLoader creates a new molecule loader for the given storage.
-func NewLoader(store storage.Storage) *Loader {
+func NewLoader(store storage.DoltStorage) *Loader {
 	return &Loader{store: store}
 }
 

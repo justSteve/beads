@@ -1,20 +1,18 @@
 package doctor
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // validRoutingModes are the allowed values for routing.mode
@@ -22,12 +20,8 @@ var validRoutingModes = map[string]bool{
 	"auto":        true,
 	"maintainer":  true,
 	"contributor": true,
+	"explicit":    true,
 }
-
-// validBranchNameRegex validates git branch names
-// Git branch names can't contain: space, ~, ^, :, \, ?, *, [
-// Can't start with -, can't end with ., can't contain ..
-var validBranchNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$`)
 
 // validActorRegex validates actor names (alphanumeric with dashes, underscores, dots, and @ for emails)
 var validActorRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._@-]*$`)
@@ -37,6 +31,8 @@ var validCustomStatusRegex = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // CheckConfigValues validates configuration values in config.yaml and metadata.json
 // Returns issues found, or OK if all values are valid
+// CheckConfigValues validates configuration values across config.yaml, metadata.json, and the database.
+// Opens its own store; prefer CheckConfigValuesWithStore when a shared store is available.
 func CheckConfigValues(repoPath string) DoctorCheck {
 	var issues []string
 
@@ -52,6 +48,32 @@ func CheckConfigValues(repoPath string) DoctorCheck {
 	dbIssues := checkDatabaseConfigValues(repoPath)
 	issues = append(issues, dbIssues...)
 
+	return formatConfigValuesResult(issues)
+}
+
+// CheckConfigValuesWithStore validates config values using a shared store (GH#2636).
+func CheckConfigValuesWithStore(repoPath string, ss *SharedStore) DoctorCheck {
+	var issues []string
+
+	// Check config.yaml values
+	yamlIssues := checkYAMLConfigValues(repoPath)
+	issues = append(issues, yamlIssues...)
+
+	// Check metadata.json values
+	metadataIssues := checkMetadataConfigValues(repoPath)
+	issues = append(issues, metadataIssues...)
+
+	// Check database config values using shared store
+	store := ss.Store()
+	if store != nil {
+		dbIssues := checkDatabaseConfigValuesWithStore(store)
+		issues = append(issues, dbIssues...)
+	}
+
+	return formatConfigValuesResult(issues)
+}
+
+func formatConfigValuesResult(issues []string) DoctorCheck {
 	if len(issues) == 0 {
 		return DoctorCheck{
 			Name:    "Config Values",
@@ -71,7 +93,7 @@ func CheckConfigValues(repoPath string) DoctorCheck {
 
 // findConfigPath locates config.yaml in standard locations.
 func findConfigPath(repoPath string) string {
-	configPath := filepath.Join(repoPath, ".beads", "config.yaml")
+	configPath := filepath.Join(ResolveBeadsDirForRepo(repoPath), "config.yaml")
 	if _, err := os.Stat(configPath); err == nil {
 		return configPath
 	}
@@ -88,25 +110,6 @@ func findConfigPath(repoPath string) string {
 		}
 	}
 	return ""
-}
-
-// validateDurationConfig validates a duration config value.
-func validateDurationConfig(v *viper.Viper, key string, minDuration time.Duration) []string {
-	if !v.IsSet(key) {
-		return nil
-	}
-	durStr := v.GetString(key)
-	if durStr == "" {
-		return nil
-	}
-	d, err := time.ParseDuration(durStr)
-	if err != nil {
-		return []string{fmt.Sprintf("%s: invalid duration %q (expected format like \"30s\", \"1m\", \"500ms\")", key, durStr)}
-	}
-	if minDuration > 0 && d > 0 && d < minDuration {
-		return []string{fmt.Sprintf("%s: %q is too low (minimum %s)", key, durStr, minDuration)}
-	}
-	return nil
 }
 
 // validateBooleanConfigs validates boolean config values.
@@ -186,10 +189,6 @@ func checkYAMLConfigValues(repoPath string) []string {
 		return issues
 	}
 
-	// Validate duration configs
-	issues = append(issues, validateDurationConfig(v, "flush-debounce", 0)...)
-	issues = append(issues, validateDurationConfig(v, "remote-sync-interval", 5*time.Second)...)
-
 	// Validate issue-prefix (should be alphanumeric with dashes/underscores, reasonably short)
 	if v.IsSet("issue-prefix") {
 		prefix := v.GetString("issue-prefix")
@@ -265,16 +264,6 @@ func checkYAMLConfigValues(repoPath string) []string {
 		}
 	}
 
-	// Validate sync-branch (should be a valid git branch name if set)
-	if v.IsSet("sync-branch") {
-		branch := v.GetString("sync-branch")
-		if branch != "" {
-			if !isValidBranchName(branch) {
-				issues = append(issues, fmt.Sprintf("sync-branch: %q is not a valid git branch name", branch))
-			}
-		}
-	}
-
 	// Validate routing paths exist if set
 	issues = append(issues, validateRoutingPaths(v)...)
 
@@ -294,15 +283,11 @@ func checkYAMLConfigValues(repoPath string) []string {
 			if strings.ContainsAny(dbPath, "\x00") {
 				issues = append(issues, fmt.Sprintf("db: %q contains invalid characters", dbPath))
 			}
-			// Check if it has a valid database extension
-			if !strings.HasSuffix(dbPath, ".db") && !strings.HasSuffix(dbPath, ".sqlite") && !strings.HasSuffix(dbPath, ".sqlite3") {
-				issues = append(issues, fmt.Sprintf("db: %q has unusual extension (expected .db, .sqlite, or .sqlite3)", dbPath))
-			}
 		}
 	}
 
 	// Validate boolean config values
-	boolKeys := []string{"json", "no-daemon", "no-auto-flush", "no-auto-import", "no-db", "auto-start-daemon", "sync.require_confirmation_on_mass_delete"}
+	boolKeys := []string{"json", "no-db", "sync.require_confirmation_on_mass_delete"}
 	issues = append(issues, validateBooleanConfigs(v, boolKeys)...)
 
 	// Validate repos paths
@@ -337,7 +322,7 @@ func expandPath(path string) string {
 func checkMetadataConfigValues(repoPath string) []string {
 	var issues []string
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		issues = append(issues, fmt.Sprintf("metadata.json: failed to load: %v", err))
@@ -355,11 +340,7 @@ func checkMetadataConfigValues(repoPath string) []string {
 			issues = append(issues, fmt.Sprintf("metadata.json database: %q should be a filename, not a path", cfg.Database))
 		}
 		backend := cfg.GetBackend()
-		if backend == configfile.BackendSQLite {
-			if !strings.HasSuffix(cfg.Database, ".db") && !strings.HasSuffix(cfg.Database, ".sqlite") && !strings.HasSuffix(cfg.Database, ".sqlite3") {
-				issues = append(issues, fmt.Sprintf("metadata.json database: %q has unusual extension (expected .db, .sqlite, or .sqlite3)", cfg.Database))
-			}
-		} else if backend == configfile.BackendDolt {
+		if backend == configfile.BackendDolt {
 			// Dolt is directory-backed; `database` should point to a directory (typically "dolt").
 			if strings.HasSuffix(cfg.Database, ".db") || strings.HasSuffix(cfg.Database, ".sqlite") || strings.HasSuffix(cfg.Database, ".sqlite3") {
 				issues = append(issues, fmt.Sprintf("metadata.json database: %q looks like a SQLite file, but backend is dolt (expected a directory like %q)", cfg.Database, "dolt"))
@@ -370,17 +351,18 @@ func checkMetadataConfigValues(repoPath string) []string {
 		}
 	}
 
-	// Validate jsonl_export filename
-	if cfg.JSONLExport != "" {
-		switch cfg.JSONLExport {
-		case "deletions.jsonl", "interactions.jsonl", "molecules.jsonl":
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q is a system file and should not be configured as a JSONL export (expected issues.jsonl)", cfg.JSONLExport))
-		}
-		if strings.Contains(cfg.JSONLExport, string(os.PathSeparator)) || strings.Contains(cfg.JSONLExport, "/") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should be a filename, not a path", cfg.JSONLExport))
-		}
-		if !strings.HasSuffix(cfg.JSONLExport, ".jsonl") {
-			issues = append(issues, fmt.Sprintf("metadata.json jsonl_export: %q should have .jsonl extension", cfg.JSONLExport))
+	// Validate dolt_database for embedded-mode compatibility (GH#3231).
+	// Hyphens and dots are allowed by server mode but rejected by the
+	// embedded Dolt engine because database names are interpolated into
+	// system variable identifiers (@@<db>_head_ref) where only
+	// [a-zA-Z_][a-zA-Z0-9_]* is valid.
+	if cfg.DoltDatabase != "" && !cfg.IsDoltServerMode() {
+		sanitized := strings.ReplaceAll(cfg.DoltDatabase, "-", "_")
+		sanitized = strings.ReplaceAll(sanitized, ".", "_")
+		if sanitized != cfg.DoltDatabase {
+			issues = append(issues, fmt.Sprintf(
+				"metadata.json dolt_database: %q contains characters invalid in embedded mode — "+
+					"replace with %q or set dolt_mode to \"server\" (GH#3231)", cfg.DoltDatabase, sanitized))
 		}
 	}
 
@@ -396,37 +378,50 @@ func checkMetadataConfigValues(repoPath string) []string {
 func checkDatabaseConfigValues(repoPath string) []string {
 	var issues []string
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return issues // No .beads directory, nothing to check
 	}
 
-	// Get database path (backend-aware)
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		// For Dolt, cfg.DatabasePath() is a directory and sqlite checks are not applicable.
-		if cfg.GetBackend() == configfile.BackendDolt {
-			return issues
-		}
-		if cfg.Database != "" {
-			dbPath = cfg.DatabasePath(beadsDir)
-		}
+	// Check backend
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		return issues
 	}
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	backend := configfile.BackendDolt
+	if cfg != nil {
+		backend = cfg.GetBackend()
+	}
+
+	if backend != configfile.BackendDolt {
+		return issues // Non-Dolt backend, skip database config validation
+	}
+
+	// Check if Dolt directory exists
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
 		return issues // No database, nothing to check
 	}
 
-	// Open database in read-only mode
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	// Open Dolt store in read-only mode
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
-		return issues // Can't open database, skip
+		issues = append(issues, fmt.Sprintf("database: failed to open Dolt store: %v", err))
+		return issues
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
+
+	return checkDatabaseConfigValuesWithStore(store)
+}
+
+func checkDatabaseConfigValuesWithStore(store *dolt.DoltStore) []string {
+	var issues []string
+	ctx := context.Background()
 
 	// Check status.custom - custom status names should be lowercase alphanumeric with underscores
-	var statusCustom string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'status.custom'").Scan(&statusCustom)
+	statusCustom, err := store.GetConfig(ctx, "status.custom")
 	if err == nil && statusCustom != "" {
 		statuses := strings.Split(statusCustom, ",")
 		for _, status := range statuses {
@@ -445,51 +440,5 @@ func checkDatabaseConfigValues(repoPath string) []string {
 		}
 	}
 
-	// Check sync.branch if stored in database (legacy location)
-	var syncBranch string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'sync.branch'").Scan(&syncBranch)
-	if err == nil && syncBranch != "" {
-		if !isValidBranchName(syncBranch) {
-			issues = append(issues, fmt.Sprintf("sync.branch (database): %q is not a valid git branch name", syncBranch))
-		}
-	}
-
 	return issues
-}
-
-// isValidBranchName checks if a string is a valid git branch name
-func isValidBranchName(name string) bool {
-	if name == "" {
-		return false
-	}
-
-	// Can't start with -
-	if strings.HasPrefix(name, "-") {
-		return false
-	}
-
-	// Can't end with . or /
-	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, "/") {
-		return false
-	}
-
-	// Can't contain ..
-	if strings.Contains(name, "..") {
-		return false
-	}
-
-	// Can't contain these characters: space, ~, ^, :, \, ?, *, [
-	invalidChars := []string{" ", "~", "^", ":", "\\", "?", "*", "[", "@{"}
-	for _, char := range invalidChars {
-		if strings.Contains(name, char) {
-			return false
-		}
-	}
-
-	// Can't end with .lock
-	if strings.HasSuffix(name, ".lock") {
-		return false
-	}
-
-	return true
 }

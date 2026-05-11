@@ -235,6 +235,60 @@ func TestLintIssue(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "bug with acceptance in dedicated field",
+			issue: &types.Issue{
+				IssueType:          types.TypeBug,
+				Description:        "## Steps to Reproduce\nClick button",
+				AcceptanceCriteria: "## Acceptance Criteria\nButton works",
+			},
+			wantErr: false,
+		},
+		{
+			name: "task with acceptance in dedicated field",
+			issue: &types.Issue{
+				IssueType:          types.TypeTask,
+				Description:        "Do the thing",
+				AcceptanceCriteria: "Acceptance Criteria: thing is done",
+			},
+			wantErr: false,
+		},
+		{
+			name: "task with plain-text acceptance field (no heading) GH#2468",
+			issue: &types.Issue{
+				IssueType:          types.TypeTask,
+				Description:        "Do the thing",
+				AcceptanceCriteria: "- Criterion one\n- Criterion two",
+			},
+			wantErr: false,
+		},
+		{
+			name: "feature with plain-text acceptance field (no heading) GH#2468",
+			issue: &types.Issue{
+				IssueType:          types.TypeFeature,
+				Description:        "Add new widget",
+				AcceptanceCriteria: "Widget displays correctly",
+			},
+			wantErr: false,
+		},
+		{
+			name: "epic with plain-text acceptance field satisfies success criteria GH#2468",
+			issue: &types.Issue{
+				IssueType:          types.TypeEpic,
+				Description:        "Big project",
+				AcceptanceCriteria: "Project ships and users happy",
+			},
+			wantErr: false,
+		},
+		{
+			name: "bug with plain-text acceptance field still needs steps GH#2468",
+			issue: &types.Issue{
+				IssueType:          types.TypeBug,
+				Description:        "Something is broken",
+				AcceptanceCriteria: "It should work",
+			},
+			wantErr: true,
+		},
+		{
 			name: "chore always valid",
 			issue: &types.Issue{
 				IssueType:   types.TypeChore,
@@ -249,6 +303,32 @@ func TestLintIssue(t *testing.T) {
 			err := LintIssue(tt.issue)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("LintIssue() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateCloseReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		reason  string
+		wantErr bool
+	}{
+		{"empty reason", "", true},
+		{"default reason", "Closed", true},
+		{"default reason case insensitive", "closed", true},
+		{"terse reason", "fixed the bug", true},
+		{"adequate reason", "Fixed the login timeout by increasing session TTL to 24h", false},
+		{"exactly 20 chars", "12345678901234567890", false},
+		{"whitespace padded but terse", "   done   ", true},
+		{"whitespace padded but adequate", "   Fixed the auth flow for SSO users   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCloseReason(tt.reason)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateCloseReason(%q) error = %v, wantErr %v", tt.reason, err, tt.wantErr)
 			}
 		})
 	}

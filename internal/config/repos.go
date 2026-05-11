@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -24,20 +23,11 @@ type configFile struct {
 // FindConfigYAMLPath finds the config.yaml file in .beads directory
 // Walks up from CWD to find .beads/config.yaml
 func FindConfigYAMLPath() (string, error) {
-	cwd, err := os.Getwd()
+	configPath, err := findProjectConfigYaml()
 	if err != nil {
-		return "", fmt.Errorf("failed to get working directory: %w", err)
+		return "", fmt.Errorf("no .beads/config.yaml found in current directory or parents")
 	}
-
-	for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
-		beadsDir := filepath.Join(dir, ".beads")
-		configPath := filepath.Join(beadsDir, "config.yaml")
-		if _, err := os.Stat(configPath); err == nil {
-			return configPath, nil
-		}
-	}
-
-	return "", fmt.Errorf("no .beads/config.yaml found in current directory or parents")
+	return configPath, nil
 }
 
 // GetReposFromYAML reads the repos configuration from config.yaml
@@ -166,7 +156,7 @@ func SetReposInYAML(configPath string, repos *ReposConfig) error {
 	if v != nil {
 		if err := v.ReadInConfig(); err != nil {
 			// Not fatal - config is on disk, will be picked up on next command
-			_ = err
+			_ = err // Best effort: viper reload failure is non-fatal since config was already written to disk
 		}
 	}
 

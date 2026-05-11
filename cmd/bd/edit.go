@@ -1,17 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
-	"github.com/steveyegge/beads/internal/utils"
 )
 
 var editCmd = &cobra.Command{
@@ -34,14 +31,14 @@ Examples:
 		id := args[0]
 		ctx := rootCtx
 
-		// Resolve partial ID if in direct mode
-		if daemonClient == nil {
-			fullID, err := utils.ResolvePartialID(ctx, store, id)
-			if err != nil {
-				FatalErrorRespectJSON("resolving %s: %v", id, err)
-			}
-			id = fullID
+		// Resolve ID with prefix routing (supports cross-rig edits like `bd edit xe-5ls`)
+		result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+		if err != nil {
+			FatalErrorRespectJSON("resolving %s: %v", id, err)
 		}
+		defer result.Close()
+		id = result.ResolvedID
+		issueStore := result.Store
 
 		// Determine which field to edit
 		fieldToEdit := "description"
@@ -73,32 +70,7 @@ Examples:
 			FatalErrorRespectJSON("no editor found. Set $EDITOR or $VISUAL environment variable")
 		}
 
-		// Get the current issue
-		var issue *types.Issue
-		var err error
-
-		if daemonClient != nil {
-			// Daemon mode
-			showArgs := &rpc.ShowArgs{ID: id}
-			resp, err := daemonClient.Show(showArgs)
-			if err != nil {
-				FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-			}
-
-			issue = &types.Issue{}
-			if err := json.Unmarshal(resp.Data, issue); err != nil {
-				FatalErrorRespectJSON("parsing issue data: %v", err)
-			}
-		} else {
-			// Direct mode
-			issue, err = store.GetIssue(ctx, id)
-			if err != nil {
-				FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-			}
-			if issue == nil {
-				FatalErrorRespectJSON("issue %s not found", id)
-			}
-		}
+		issue := result.Issue
 
 		// Get the current field value
 		var currentValue string
@@ -121,7 +93,12 @@ Examples:
 			FatalErrorRespectJSON("creating temp file: %v", err)
 		}
 		tmpPath := tmpFile.Name()
-		defer func() { _ = os.Remove(tmpPath) }()
+		editSaved := false
+		defer func() {
+			if editSaved {
+				_ = os.Remove(tmpPath)
+			}
+		}()
 
 		// Write current value to temp file
 		if _, err := tmpFile.WriteString(currentValue); err != nil {
@@ -149,55 +126,55 @@ Examples:
 			FatalErrorRespectJSON("reading edited file: %v", err)
 		}
 
-		newValue := string(editedContent)
+		newValue := strings.TrimSpace(string(editedContent))
 
 		// Check if the value changed
 		if newValue == currentValue {
+			editSaved = true // no changes — safe to remove temp file
 			fmt.Println("No changes made")
 			return
 		}
 
 		// Validate title if editing title
-		if fieldToEdit == "title" && strings.TrimSpace(newValue) == "" {
+		if fieldToEdit == "title" && newValue == "" {
 			FatalErrorRespectJSON("title cannot be empty")
 		}
 
-		// Update the issue
+		// Update the issue — retry once if the DB connection went stale
+		// during a long editor session (GH-2267).
+		// Use the routed store for cross-rig mutations.
 		updates := map[string]interface{}{
 			fieldToEdit: newValue,
 		}
 
-		if daemonClient != nil {
-			// Daemon mode
-			updateArgs := &rpc.UpdateArgs{ID: id}
+		err = issueStore.UpdateIssue(ctx, id, updates, actor)
+		if err != nil {
+			// Connection may have gone stale while the editor was open.
+			// Ping to force the pool to discard dead connections, then retry.
+			if accessor, ok := storage.UnwrapStore(issueStore).(storage.RawDBAccessor); ok {
+				if pingErr := accessor.DB().PingContext(ctx); pingErr != nil {
+					// Ping failed — try to force a fresh connection via sql.DB pool reset.
+					accessor.DB().SetConnMaxIdleTime(0)
+					_ = accessor.DB().PingContext(ctx)
+				}
+			}
+			err = issueStore.UpdateIssue(ctx, id, updates, actor)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Your edits are preserved in: %s\n", tmpPath)
+			FatalErrorRespectJSON("updating issue: %v", err)
+		}
+		editSaved = true
 
-			switch fieldToEdit {
-			case "title":
-				updateArgs.Title = &newValue
-			case "description":
-				updateArgs.Description = &newValue
-			case "design":
-				updateArgs.Design = &newValue
-			case "notes":
-				updateArgs.Notes = &newValue
-			case "acceptance_criteria":
-				updateArgs.AcceptanceCriteria = &newValue
-			}
+		commandDidWrite.Store(true)
 
-			_, err := daemonClient.Update(updateArgs)
-			if err != nil {
-				FatalErrorRespectJSON("updating issue: %v", err)
-			}
-		} else {
-			// Direct mode
-			if err := store.UpdateIssue(ctx, id, updates, actor); err != nil {
-				FatalErrorRespectJSON("updating issue: %v", err)
-			}
-			markDirtyAndScheduleFlush()
+		displayTitle := issue.Title
+		if fieldToEdit == "title" {
+			displayTitle = newValue
 		}
 
 		fieldName := strings.ReplaceAll(fieldToEdit, "_", " ")
-		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, id)
+		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, formatFeedbackID(id, displayTitle))
 	},
 }
 

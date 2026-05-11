@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -13,6 +12,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // ServerHealthResult holds the results of all server health checks
@@ -73,19 +74,28 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 	if !cfg.IsDoltServerMode() {
 		result.Checks = append(result.Checks, DoctorCheck{
 			Name:     "Server Config",
-			Status:   StatusWarning,
-			Message:  fmt.Sprintf("Dolt mode is '%s' (not server)", cfg.GetDoltMode()),
-			Detail:   "Server health checks require dolt_mode: server in metadata.json",
-			Fix:      "Set dolt_mode: server in metadata.json and start dolt sql-server",
+			Status:   StatusOK,
+			Message:  fmt.Sprintf("Dolt mode is '%s' (embedded is the default)", cfg.GetDoltMode()),
+			Detail:   "Server health checks only apply when dolt_mode is explicitly set to 'server'",
 			Category: CategoryFederation,
 		})
-		result.OverallOK = false
 		return result
 	}
 
 	// Server mode is configured - run health checks
 	host := cfg.GetDoltServerHost()
-	port := cfg.GetDoltServerPort()
+	// Use doltserver.DefaultConfig for port resolution (env > port file > config.yaml).
+	// Port 0 means server not yet started — report that clearly.
+	port := doltserver.DefaultConfig(beadsDir).Port
+	if port == 0 {
+		result.Checks = append(result.Checks, DoctorCheck{
+			Name:     "Server port",
+			Status:   StatusWarning,
+			Message:  "No Dolt server port configured and no server running. Run any bd command to auto-start.",
+			Category: CategoryFederation,
+		})
+		return result
+	}
 
 	// Check 1: Server reachability (TCP connect)
 	reachCheck := checkServerReachable(host, port)
@@ -97,23 +107,23 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 	}
 
 	// Check 2: Connect and verify it's Dolt (get version)
-	versionCheck, db := checkDoltVersion(cfg)
+	versionCheck, db := checkDoltVersion(cfg, beadsDir)
 	result.Checks = append(result.Checks, versionCheck)
 	if versionCheck.Status == StatusError {
 		result.OverallOK = false
 		if db != nil {
-			_ = db.Close()
+			_ = db.Close() // Best effort cleanup
 		}
 		return result
 	}
 	defer func() {
 		if db != nil {
-			_ = db.Close()
+			_ = db.Close() // Best effort cleanup
 		}
 	}()
 
-	// Get database name from config (default: "beads")
-	database := "beads" // Default database name for Dolt server mode
+	// Get database name from config (uses dolt_database field, default: "beads")
+	database := cfg.GetDoltDatabase()
 
 	// Check 3: Database exists and is queryable
 	dbExistsCheck := checkDatabaseExists(db, database)
@@ -136,12 +146,123 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 		result.OverallOK = false
 	}
 
+	// Check 6: Stale databases (test/polecat leftovers)
+	staleCheck := checkStaleDatabases(db)
+	result.Checks = append(result.Checks, staleCheck)
+	if staleCheck.Status == StatusError {
+		result.OverallOK = false
+	}
+
 	return result
+}
+
+// staleDatabasePrefixes are prefixes that indicate test/polecat databases that
+// should not exist on the production Dolt server. These accumulate from interrupted
+// test runs and terminated polecats, wasting server memory and potentially
+// contributing to performance degradation under concurrent load.
+// - testdb_*: BEADS_TEST_MODE=1 FNV hash of temp paths
+// - doctest_*: doctor test helpers
+// - doctortest_*: doctor test helpers
+// - beads_pt*: orchestrator patrol_helpers_test.go random prefixes
+// - beads_vr*: orchestrator mail/router_test.go random prefixes
+// - beads_t[0-9a-f]*: protocol test random prefixes (t + 8 hex chars)
+var staleDatabasePrefixes = []string{
+	"testdb_",
+	"doctest_",
+	"doctortest_",
+	"beads_pt",
+	"beads_vr",
+	"beads_t",
+}
+
+// knownProductionDatabases are the databases that should exist on a production server.
+// Everything else matching a stale prefix is a candidate for cleanup.
+var knownProductionDatabases = map[string]bool{
+	"information_schema": true,
+	"mysql":              true,
+}
+
+// checkStaleDatabases identifies leftover test/polecat databases on the shared server.
+// These waste memory and can degrade performance under concurrent load.
+func checkStaleDatabases(db *sql.DB) DoctorCheck {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Stale Databases",
+			Status:   StatusError,
+			Message:  "Failed to list databases",
+			Detail:   err.Error(),
+			Category: CategoryMaintenance,
+		}
+	}
+	defer rows.Close()
+
+	var stale []string
+	var total int
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			continue
+		}
+		total++
+		if knownProductionDatabases[dbName] {
+			continue
+		}
+		for _, prefix := range staleDatabasePrefixes {
+			if strings.HasPrefix(dbName, prefix) {
+				stale = append(stale, dbName)
+				break
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DoctorCheck{
+			Name:     "Stale Databases",
+			Status:   StatusWarning,
+			Message:  "Row iteration error",
+			Detail:   err.Error(),
+			Category: CategoryMaintenance,
+		}
+	}
+
+	if len(stale) == 0 {
+		return DoctorCheck{
+			Name:     "Stale Databases",
+			Status:   StatusOK,
+			Message:  fmt.Sprintf("%d databases, no stale test/polecat databases found", total),
+			Category: CategoryMaintenance,
+		}
+	}
+
+	// Build detail string showing first few stale databases
+	detail := fmt.Sprintf("Found %d stale databases (of %d total):\n", len(stale), total)
+	shown := len(stale)
+	if shown > 10 {
+		shown = 10
+	}
+	for _, name := range stale[:shown] {
+		detail += fmt.Sprintf("  %s\n", name)
+	}
+	if len(stale) > 10 {
+		detail += fmt.Sprintf("  ... and %d more\n", len(stale)-10)
+	}
+
+	return DoctorCheck{
+		Name:     "Stale Databases",
+		Status:   StatusWarning,
+		Message:  fmt.Sprintf("%d stale test/polecat databases found", len(stale)),
+		Detail:   strings.TrimSpace(detail),
+		Fix:      "Run 'bd dolt clean-databases' to drop stale databases",
+		Category: CategoryMaintenance,
+	}
 }
 
 // checkServerReachable checks if the server is reachable via TCP
 func checkServerReachable(host string, port int) DoctorCheck {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		return DoctorCheck{
@@ -153,7 +274,7 @@ func checkServerReachable(host string, port int) DoctorCheck {
 			Category: CategoryFederation,
 		}
 	}
-	_ = conn.Close()
+	_ = conn.Close() // Best effort cleanup
 
 	return DoctorCheck{
 		Name:     "Server Reachable",
@@ -165,23 +286,26 @@ func checkServerReachable(host string, port int) DoctorCheck {
 
 // checkDoltVersion connects to the server and checks if it's a Dolt server
 // Returns the DoctorCheck and an open database connection (caller must close)
-func checkDoltVersion(cfg *configfile.Config) (DoctorCheck, *sql.DB) {
+func checkDoltVersion(cfg *configfile.Config, beadsDir string) (DoctorCheck, *sql.DB) {
 	host := cfg.GetDoltServerHost()
-	port := cfg.GetDoltServerPort()
+	port := doltserver.DefaultConfig(beadsDir).Port
 	user := cfg.GetDoltServerUser()
 
-	// Get password from environment (more secure than config file)
-	password := os.Getenv("BEADS_DOLT_PASSWORD")
+	// Resolve password the same way the CRUD path does: BEADS_DOLT_PASSWORD env
+	// takes precedence (checked inside GetDoltServerPasswordForPort), with a
+	// fallback to ~/.config/beads/credentials keyed by [host:port]. Using the
+	// resolved runtime port is required because the port file may differ from
+	// the metadata port (bd-h5k7).
+	password := cfg.GetDoltServerPasswordForPort(port)
 
 	// Build DSN without database (just to test server connectivity)
-	var connStr string
-	if password != "" {
-		connStr = fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
-			user, password, host, port)
-	} else {
-		connStr = fmt.Sprintf("%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
-			user, host, port)
-	}
+	connStr := doltutil.ServerDSN{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		TLS:      cfg.GetDoltServerTLS(),
+	}.String()
 
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
@@ -205,7 +329,7 @@ func checkDoltVersion(cfg *configfile.Config) (DoctorCheck, *sql.DB) {
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
+		_ = db.Close() // Best effort cleanup
 		return DoctorCheck{
 			Name:     "Dolt Version",
 			Status:   StatusError,
@@ -222,7 +346,7 @@ func checkDoltVersion(cfg *configfile.Config) (DoctorCheck, *sql.DB) {
 	if err != nil {
 		// If dolt_version() doesn't exist, it's not a Dolt server
 		if strings.Contains(err.Error(), "Unknown") || strings.Contains(err.Error(), "doesn't exist") {
-			_ = db.Close()
+			_ = db.Close() // Best effort cleanup
 			return DoctorCheck{
 				Name:     "Dolt Version",
 				Status:   StatusError,
@@ -232,7 +356,7 @@ func checkDoltVersion(cfg *configfile.Config) (DoctorCheck, *sql.DB) {
 				Category: CategoryFederation,
 			}, nil
 		}
-		_ = db.Close()
+		_ = db.Close() // Best effort cleanup
 		return DoctorCheck{
 			Name:     "Dolt Version",
 			Status:   StatusError,
@@ -255,22 +379,26 @@ func checkDatabaseExists(db *sql.DB, database string) DoctorCheck {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Validate database name (alphanumeric and underscore only)
+	// Validate database name
 	if !isValidIdentifier(database) {
-		return DoctorCheck{
-			Name:     "Database Exists",
-			Status:   StatusError,
-			Message:  fmt.Sprintf("Invalid database name '%s'", database),
-			Detail:   "Database name must be alphanumeric with underscores only",
-			Category: CategoryFederation,
+		// Check if it's just hyphens (legacy names from before GH#2142 fix)
+		if strings.ContainsRune(database, '-') && isValidIdentifier(strings.ReplaceAll(database, "-", "_")) {
+			// Hyphenated name — functional but not recommended.
+			// Continue with the check but we'll add a warning after.
+		} else {
+			return DoctorCheck{
+				Name:     "Database Exists",
+				Status:   StatusError,
+				Message:  fmt.Sprintf("Invalid database name '%s'", database),
+				Detail:   "Database name must be alphanumeric with underscores only",
+				Category: CategoryFederation,
+			}
 		}
 	}
 
-	// Check if database exists using parameterized query
-	var exists int
-	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?",
-		database).Scan(&exists)
+	// Use SHOW DATABASES instead of INFORMATION_SCHEMA.SCHEMATA to avoid
+	// crashing on phantom catalog entries (R-006, GH#2051, GH#2091).
+	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Database Exists",
@@ -280,26 +408,60 @@ func checkDatabaseExists(db *sql.DB, database string) DoctorCheck {
 			Category: CategoryFederation,
 		}
 	}
+	defer rows.Close()
 
-	if exists == 0 {
+	found := false
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			continue
+		}
+		if dbName == database {
+			found = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DoctorCheck{
+			Name:     "Database Exists",
+			Status:   StatusWarning,
+			Message:  "Row iteration error",
+			Detail:   err.Error(),
+			Category: CategoryFederation,
+		}
+	}
+
+	if !found {
 		return DoctorCheck{
 			Name:     "Database Exists",
 			Status:   StatusError,
 			Message:  fmt.Sprintf("Database '%s' not found", database),
-			Fix:      fmt.Sprintf("Run 'bd init --backend dolt' to create the '%s' database", database),
+			Fix:      fmt.Sprintf("Run 'bd bootstrap' to recover the existing '%s' database safely. Use 'bd init' only for brand-new projects.", database),
 			Category: CategoryFederation,
 		}
 	}
 
 	// Switch to the database
-	// Note: USE cannot use parameterized queries, but we validated the identifier above
-	_, err = db.ExecContext(ctx, "USE "+database) // #nosec G201 - database validated by isValidIdentifier
+	// Note: USE cannot use parameterized queries, but we validated the identifier above.
+	// Backtick-quote to support hyphenated legacy names (GH#2142).
+	_, err = db.ExecContext(ctx, "USE `"+database+"`") // #nosec G201 - database validated by isValidIdentifier
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Database Exists",
 			Status:   StatusError,
 			Message:  fmt.Sprintf("Cannot access database '%s'", database),
 			Detail:   err.Error(),
+			Category: CategoryFederation,
+		}
+	}
+
+	// Warn about hyphenated names — functional but new projects use underscores
+	if strings.ContainsRune(database, '-') {
+		return DoctorCheck{
+			Name:     "Database Exists",
+			Status:   StatusWarning,
+			Message:  fmt.Sprintf("Database '%s' uses hyphens (legacy naming)", database),
+			Detail:   "New projects use underscores. To migrate: export data, run 'bd init --force', re-import.",
 			Category: CategoryFederation,
 		}
 	}
@@ -345,7 +507,7 @@ func checkSchemaCompatible(db *sql.DB, database string) DoctorCheck {
 				Name:     "Schema Compatible",
 				Status:   StatusError,
 				Message:  "Issues table not found",
-				Fix:      "Run 'bd init --backend dolt' to create schema",
+				Fix:      "Run 'bd init' to create schema",
 				Category: CategoryFederation,
 			}
 		}
@@ -360,7 +522,7 @@ func checkSchemaCompatible(db *sql.DB, database string) DoctorCheck {
 
 	// Query metadata table for bd_version
 	var bdVersion string
-	err = db.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = 'bd_version'").Scan(&bdVersion)
+	err = db.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = 'bd_version'").Scan(&bdVersion)
 	if err != nil && err != sql.ErrNoRows {
 		if strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "Unknown table") {
 			return DoctorCheck{

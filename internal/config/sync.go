@@ -8,7 +8,7 @@ import (
 )
 
 // Sync mode configuration values (from hq-ew1mbr.3)
-// These control how Dolt syncs with JSONL/remotes.
+// These control how Dolt syncs with remotes.
 
 // ConfigWarnings controls whether warnings are logged for invalid config values.
 // Set to false to suppress warnings (useful for tests or scripts).
@@ -21,119 +21,8 @@ var ConfigWarningWriter io.Writer = os.Stderr
 // logConfigWarning logs a warning message if ConfigWarnings is enabled.
 func logConfigWarning(format string, args ...interface{}) {
 	if ConfigWarnings && ConfigWarningWriter != nil {
-		_, _ = fmt.Fprintf(ConfigWarningWriter, format, args...)
+		_, _ = fmt.Fprintf(ConfigWarningWriter, format, args...) // Best effort: warning output should not cause failures
 	}
-}
-
-// SyncMode represents the sync mode configuration
-type SyncMode string
-
-const (
-	// SyncModeGitPortable exports JSONL on push, imports on pull (default)
-	SyncModeGitPortable SyncMode = "git-portable"
-	// SyncModeRealtime exports JSONL on every change (legacy behavior)
-	SyncModeRealtime SyncMode = "realtime"
-	// SyncModeDoltNative uses Dolt remote directly (dolthub://, gs://, s3://)
-	SyncModeDoltNative SyncMode = "dolt-native"
-	// SyncModeBeltAndSuspenders uses Dolt remote + JSONL backup
-	SyncModeBeltAndSuspenders SyncMode = "belt-and-suspenders"
-)
-
-// validSyncModes is the set of allowed sync mode values
-var validSyncModes = map[SyncMode]bool{
-	SyncModeGitPortable:       true,
-	SyncModeRealtime:          true,
-	SyncModeDoltNative:        true,
-	SyncModeBeltAndSuspenders: true,
-}
-
-// ValidSyncModes returns the list of valid sync mode values.
-func ValidSyncModes() []string {
-	return []string{
-		string(SyncModeGitPortable),
-		string(SyncModeRealtime),
-		string(SyncModeDoltNative),
-		string(SyncModeBeltAndSuspenders),
-	}
-}
-
-// IsValidSyncMode returns true if the given string is a valid sync mode.
-func IsValidSyncMode(mode string) bool {
-	return validSyncModes[SyncMode(strings.ToLower(strings.TrimSpace(mode)))]
-}
-
-// ConflictStrategy represents the conflict resolution strategy
-type ConflictStrategy string
-
-const (
-	// ConflictStrategyNewest uses last-write-wins (default)
-	ConflictStrategyNewest ConflictStrategy = "newest"
-	// ConflictStrategyOurs prefers local changes
-	ConflictStrategyOurs ConflictStrategy = "ours"
-	// ConflictStrategyTheirs prefers remote changes
-	ConflictStrategyTheirs ConflictStrategy = "theirs"
-	// ConflictStrategyManual requires manual resolution
-	ConflictStrategyManual ConflictStrategy = "manual"
-)
-
-// FieldStrategy represents the merge strategy for a specific field
-type FieldStrategy string
-
-const (
-	// FieldStrategyNewest uses last-write-wins (default for scalar fields)
-	FieldStrategyNewest FieldStrategy = "newest"
-	// FieldStrategyMax takes the maximum value (for counters like compaction_level)
-	FieldStrategyMax FieldStrategy = "max"
-	// FieldStrategyUnion performs set union (for arrays like labels, waiters)
-	FieldStrategyUnion FieldStrategy = "union"
-	// FieldStrategyManual flags conflict for user resolution (for fields like estimated_minutes)
-	FieldStrategyManual FieldStrategy = "manual"
-)
-
-// validConflictStrategies is the set of allowed conflict strategy values
-var validConflictStrategies = map[ConflictStrategy]bool{
-	ConflictStrategyNewest: true,
-	ConflictStrategyOurs:   true,
-	ConflictStrategyTheirs: true,
-	ConflictStrategyManual: true,
-}
-
-// validFieldStrategies is the set of allowed per-field strategy values
-var validFieldStrategies = map[FieldStrategy]bool{
-	FieldStrategyNewest: true,
-	FieldStrategyMax:    true,
-	FieldStrategyUnion:  true,
-	FieldStrategyManual: true,
-}
-
-// ValidConflictStrategies returns the list of valid conflict strategy values.
-func ValidConflictStrategies() []string {
-	return []string{
-		string(ConflictStrategyNewest),
-		string(ConflictStrategyOurs),
-		string(ConflictStrategyTheirs),
-		string(ConflictStrategyManual),
-	}
-}
-
-// IsValidConflictStrategy returns true if the given string is a valid conflict strategy.
-func IsValidConflictStrategy(strategy string) bool {
-	return validConflictStrategies[ConflictStrategy(strings.ToLower(strings.TrimSpace(strategy)))]
-}
-
-// ValidFieldStrategies returns the list of valid per-field strategy values.
-func ValidFieldStrategies() []string {
-	return []string{
-		string(FieldStrategyNewest),
-		string(FieldStrategyMax),
-		string(FieldStrategyUnion),
-		string(FieldStrategyManual),
-	}
-}
-
-// IsValidFieldStrategy returns true if the given string is a valid per-field strategy.
-func IsValidFieldStrategy(strategy string) bool {
-	return validFieldStrategies[FieldStrategy(strings.ToLower(strings.TrimSpace(strategy)))]
 }
 
 // Sovereignty represents the federation sovereignty tier
@@ -179,50 +68,6 @@ func IsValidSovereignty(sovereignty string) bool {
 	return validSovereigntyTiers[Sovereignty(strings.ToUpper(strings.TrimSpace(sovereignty)))]
 }
 
-// GetSyncMode retrieves the sync mode configuration.
-// Returns the configured mode, or SyncModeGitPortable (default) if not set or invalid.
-// Logs a warning if an invalid value is configured (unless ConfigWarnings is false).
-//
-// Config key: sync.mode
-// Valid values: git-portable, realtime, dolt-native, belt-and-suspenders
-func GetSyncMode() SyncMode {
-	value := GetString("sync.mode")
-	if value == "" {
-		return SyncModeGitPortable // Default
-	}
-
-	mode := SyncMode(strings.ToLower(strings.TrimSpace(value)))
-	if !validSyncModes[mode] {
-		logConfigWarning("Warning: invalid sync.mode %q in config (valid: %s), using default 'git-portable'\n",
-			value, strings.Join(ValidSyncModes(), ", "))
-		return SyncModeGitPortable
-	}
-
-	return mode
-}
-
-// GetConflictStrategy retrieves the conflict resolution strategy configuration.
-// Returns the configured strategy, or ConflictStrategyNewest (default) if not set or invalid.
-// Logs a warning if an invalid value is configured (unless ConfigWarnings is false).
-//
-// Config key: conflict.strategy
-// Valid values: newest, ours, theirs, manual
-func GetConflictStrategy() ConflictStrategy {
-	value := GetString("conflict.strategy")
-	if value == "" {
-		return ConflictStrategyNewest // Default
-	}
-
-	strategy := ConflictStrategy(strings.ToLower(strings.TrimSpace(value)))
-	if !validConflictStrategies[strategy] {
-		logConfigWarning("Warning: invalid conflict.strategy %q in config (valid: %s), using default 'newest'\n",
-			value, strings.Join(ValidConflictStrategies(), ", "))
-		return ConflictStrategyNewest
-	}
-
-	return strategy
-}
-
 // GetSovereignty retrieves the federation sovereignty tier configuration.
 // Returns the configured tier, or SovereigntyNone (empty, no restriction) if not set.
 // Returns SovereigntyT1 and logs a warning if an invalid non-empty value is configured.
@@ -246,22 +91,7 @@ func GetSovereignty() Sovereignty {
 	return tier
 }
 
-// String returns the string representation of the SyncMode.
-func (m SyncMode) String() string {
-	return string(m)
-}
-
-// String returns the string representation of the ConflictStrategy.
-func (s ConflictStrategy) String() string {
-	return string(s)
-}
-
 // String returns the string representation of the Sovereignty.
 func (s Sovereignty) String() string {
 	return string(s)
-}
-
-// String returns the string representation of the FieldStrategy.
-func (f FieldStrategy) String() string {
-	return string(f)
 }

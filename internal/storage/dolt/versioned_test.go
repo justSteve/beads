@@ -1,28 +1,9 @@
 package dolt
 
 import (
+	"strings"
 	"testing"
-
-	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/types"
 )
-
-// TestDoltStoreImplementsVersionedStorage verifies DoltStore implements VersionedStorage.
-// This is a compile-time check.
-func TestDoltStoreImplementsVersionedStorage(t *testing.T) {
-	// The var _ declaration in versioned.go already ensures this at compile time.
-	// This test just documents the expectation.
-
-	var _ storage.VersionedStorage = (*DoltStore)(nil)
-}
-
-// TestVersionedStorageMethodsExist ensures all required methods are defined.
-// This is mostly a documentation test since Go's type system enforces this.
-func TestVersionedStorageMethodsExist(t *testing.T) {
-	// If DoltStore doesn't implement all VersionedStorage methods,
-	// this file won't compile. This test exists for documentation.
-	t.Log("DoltStore implements all VersionedStorage methods")
-}
 
 // TestCommitExists tests the CommitExists method.
 func TestCommitExists(t *testing.T) {
@@ -102,245 +83,87 @@ func TestCommitExists(t *testing.T) {
 	})
 }
 
-// TestGetChangesSinceExport tests the GetChangesSinceExport method.
-func TestGetChangesSinceExport(t *testing.T) {
+// TestCommitPending tests the batch commit mechanism.
+func TestCommitPending(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	t.Run("empty commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "")
+	// Initial commit so the store has a clean HEAD
+	if err := store.Commit(ctx, "initial state"); err != nil {
+		t.Fatalf("initial commit failed: %v", err)
+	}
+
+	t.Run("returns false when nothing to commit", func(t *testing.T) {
+		committed, err := store.CommitPending(ctx, "test-actor")
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
+			t.Fatalf("CommitPending failed: %v", err)
 		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for empty commit")
+		if committed {
+			t.Error("expected false when no changes pending")
 		}
 	})
 
-	t.Run("invalid commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "nonexistent123456789012345678901234567890")
+	t.Run("commits accumulated changes with summary", func(t *testing.T) {
+		headBefore, err := store.GetCurrentCommit(ctx)
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
+			t.Fatalf("failed to get HEAD: %v", err)
 		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for invalid commit")
+
+		// Insert directly via SQL to leave changes uncommitted in Dolt working set.
+		// (CreateIssue auto-commits via DOLT_COMMIT, so it can't be used here.)
+		_, err = store.db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES ('batch-test-1', 'Batch test issue', '', '', '', '', 'open', 2, 'task', NOW(), NOW())`)
+		if err != nil {
+			t.Fatalf("raw INSERT failed: %v", err)
+		}
+
+		// Now commit pending changes
+		committed, err := store.CommitPending(ctx, "test-actor")
+		if err != nil {
+			t.Fatalf("CommitPending failed: %v", err)
+		}
+		if !committed {
+			t.Error("expected true when changes were pending")
+		}
+
+		headAfter, err := store.GetCurrentCommit(ctx)
+		if err != nil {
+			t.Fatalf("failed to get HEAD after commit: %v", err)
+		}
+		if headAfter == headBefore {
+			t.Error("expected HEAD to advance after CommitPending")
 		}
 	})
 
-	t.Run("malformed commit returns needsFullExport", func(t *testing.T) {
-		result, err := store.GetChangesSinceExport(ctx, "invalid'hash")
+	t.Run("generates descriptive message", func(t *testing.T) {
+		// Insert directly via SQL to leave changes uncommitted in Dolt working set.
+		// (CreateIssue auto-commits via DOLT_COMMIT, so it can't be used here.)
+		_, err := store.db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES ('msg-test-1', 'Message test issue', '', '', '', '', 'open', 2, 'task', NOW(), NOW())`)
 		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-		if !result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=true for malformed commit")
-		}
-	})
-
-	t.Run("no changes returns empty entries", func(t *testing.T) {
-		// First create and commit an issue so the issues table has committed data
-		issue := &types.Issue{
-			ID:          "test-export-baseline",
-			Title:       "Baseline Issue",
-			Description: "Ensures table exists in committed state",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create baseline issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add baseline issue"); err != nil {
-			t.Fatalf("failed to commit baseline: %v", err)
+			t.Fatalf("raw INSERT failed: %v", err)
 		}
 
-		// Get current commit
-		currentCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
+		// Build the message (without committing)
+		msg := store.buildBatchCommitMessage(ctx, "test-actor")
+		if !strings.Contains(msg, "batch commit") {
+			t.Errorf("expected 'batch commit' in message, got: %q", msg)
+		}
+		if !strings.Contains(msg, "test-actor") {
+			t.Errorf("expected actor in message, got: %q", msg)
+		}
+		if !strings.Contains(msg, "created") {
+			t.Errorf("expected 'created' in message for new issues, got: %q", msg)
 		}
 
-		// Query changes since current commit (should be none)
-		result, err := store.GetChangesSinceExport(ctx, currentCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false for valid commit")
-		}
-		if len(result.Entries) != 0 {
-			t.Errorf("expected 0 entries, got %d", len(result.Entries))
-		}
-	})
-
-	t.Run("create issue shows added in diff", func(t *testing.T) {
-		// Get commit before creating issue
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Create an issue
-		issue := &types.Issue{
-			ID:          "test-export-add",
-			Title:       "Test Export Add",
-			Description: "Testing added detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-
-		// Commit the changes
-		if err := store.Commit(ctx, "Add test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the added entry
-		var foundAdded bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "added" {
-				foundAdded = true
-				if entry.NewValue == nil {
-					t.Error("expected NewValue to be set for added entry")
-				}
-				break
-			}
-		}
-		if !foundAdded {
-			t.Errorf("expected to find 'added' entry for issue %s", issue.ID)
-		}
-	})
-
-	t.Run("update issue shows modified in diff", func(t *testing.T) {
-		// Create an issue first
-		issue := &types.Issue{
-			ID:          "test-export-modify",
-			Title:       "Test Export Modify",
-			Description: "Testing modified detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add issue for modify test"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get commit before updating
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Update the issue
-		updates := map[string]interface{}{
-			"title": "Updated Title",
-		}
-		if err := store.UpdateIssue(ctx, issue.ID, updates, "tester"); err != nil {
-			t.Fatalf("failed to update issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Update test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the modified entry
-		var foundModified bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "modified" {
-				foundModified = true
-				if entry.OldValue == nil || entry.NewValue == nil {
-					t.Error("expected both OldValue and NewValue to be set for modified entry")
-				}
-				break
-			}
-		}
-		if !foundModified {
-			t.Errorf("expected to find 'modified' entry for issue %s", issue.ID)
-		}
-	})
-
-	t.Run("delete issue shows removed in diff", func(t *testing.T) {
-		// Create an issue first
-		issue := &types.Issue{
-			ID:          "test-export-delete",
-			Title:       "Test Export Delete",
-			Description: "Testing removed detection",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-			t.Fatalf("failed to create issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Add issue for delete test"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get commit before deleting
-		beforeCommit, err := store.GetCurrentCommit(ctx)
-		if err != nil {
-			t.Fatalf("failed to get current commit: %v", err)
-		}
-
-		// Delete the issue
-		if err := store.DeleteIssue(ctx, issue.ID); err != nil {
-			t.Fatalf("failed to delete issue: %v", err)
-		}
-		if err := store.Commit(ctx, "Delete test issue"); err != nil {
-			t.Fatalf("failed to commit: %v", err)
-		}
-
-		// Get changes since before
-		result, err := store.GetChangesSinceExport(ctx, beforeCommit)
-		if err != nil {
-			t.Fatalf("GetChangesSinceExport failed: %v", err)
-		}
-
-		if result.NeedsFullExport {
-			t.Error("expected NeedsFullExport=false")
-		}
-
-		// Find the removed entry
-		var foundRemoved bool
-		for _, entry := range result.Entries {
-			if entry.IssueID == issue.ID && entry.DiffType == "removed" {
-				foundRemoved = true
-				if entry.OldValue == nil {
-					t.Error("expected OldValue to be set for removed entry")
-				}
-				break
-			}
-		}
-		if !foundRemoved {
-			t.Errorf("expected to find 'removed' entry for issue %s", issue.ID)
+		// Clean up — commit to clear working set
+		if err := store.Commit(ctx, "cleanup"); err != nil {
+			t.Fatalf("cleanup commit failed: %v", err)
 		}
 	})
 }

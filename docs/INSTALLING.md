@@ -45,31 +45,67 @@ brew install beads
 - ✅ No need to install Go
 - ✅ Handles PATH setup automatically
 
+### [Mise-en-place](https://mise.jdx.dev)  (macOS/Linux/Windows)
+
+You can install beads using mise from the latest GitHub release:
+
+```bash
+mise install github:gastownhall/beads
+mise use -g github:gastownhall/beads
+```
+
+**NOTE**: The `-g` enables beads globally.  To enable project-specific versions, omit that.
+
+**Why Mise?**
+- ✅ Same as Homebrew: simple, updates via `mise up`, works without Go, handles PATH
+- ✅ Supports all platforms
+- ✅ Always the latest release
+- ✅ May optionally use a different release version for specific projects
+
+Mise's Go backend follows the same caveats as `go install`; prefer the release backend above.
+
 ### Quick Install Script (All Platforms)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 The installer will:
 - Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
-- Install via `go install` if Go is available
+- Verify downloaded release archives against release `checksums.txt`
+- Fall back to the supported `go install` modes if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
+
+On macOS, the script preserves the downloaded binary signature by default. If you explicitly want ad-hoc local re-signing, opt in:
+
+```bash
+BEADS_INSTALL_RESIGN_MACOS=1 curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+```
 
 ### Comparison of Installation Methods
 
 | Method | Best For | Updates | Prerequisites | Notes |
 |--------|----------|---------|---------------|-------|
-| **Homebrew** | macOS/Linux users | `brew upgrade bd` | Homebrew | Recommended. Handles everything automatically |
+| **Homebrew** | macOS/Linux users | `brew upgrade beads` | Homebrew | Recommended. Handles everything automatically |
 | **npm** | JS/Node.js projects | `npm update -g @beads/bd` | Node.js | Convenient if npm is your ecosystem |
 | **bun** | JS/Bun.js projects | `bun install -g --trust @beads/bd` | Bun.js | Convenient if bun is your ecosystem |
 | **Install script** | Quick setup, CI/CD | Re-run script | curl, bash | Good for automation and one-liners |
-| **go install** | Go developers | Re-run command | Go 1.24+ | Builds from source, always latest |
-| **From source** | Contributors, custom builds | `git pull && go build` | Go, git | Full control, can modify code |
+| **go install (nocgo)** | Go developers, simplest install | Re-run command | Go 1.24+ | **Server-mode only** (no embedded Dolt) |
+| **go install (cgo)** | Go developers wanting embedded mode | Re-run command | Go 1.24+, C compiler | Full embedded-Dolt support |
+| **From source** | Contributors only | `git pull && go build` | Go, git | Full control, can modify code |
 | **AUR (Arch)** | Arch Linux users | `yay -Syu` | yay/paru | Community-maintained |
 
 **TL;DR:** Use Homebrew if available. Use npm if you're in a Node.js environment. Use the script for quick one-off installs or CI.
+
+### A note on `go install` capability
+
+`go install` supports **two build modes** that give different capabilities:
+
+- **Nocgo (simplest, default in this doc):** `CGO_ENABLED=0 go install ...`. Works on any machine with a Go toolchain, no C compiler needed. Produces a **server-mode-only** binary — you must run an external `dolt sql-server` and use `bd init --server`. See [DOLT.md](DOLT.md) for server-mode setup.
+- **Cgo (embedded-capable):** `CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install ...`. Requires a C compiler (gcc/clang on Unix, MinGW on Windows). Produces a binary with the default embedded-Dolt backend — `bd init` Just Works.
+
+If you don't have a preference, `brew install beads` / `install.sh` give you the embedded-capable build with no fuss.
 
 ## Platform-Specific Installation
 
@@ -80,16 +116,22 @@ The installer will:
 brew install beads
 ```
 
-**Via go install**:
+**Via go install** (server-mode only, simplest):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+# Then: bd init --server   (requires a running dolt sql-server)
+```
+
+**Via go install** (embedded-capable, needs Xcode CLI tools):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 **From source**:
 ```bash
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd ./cmd/bd
+make build   # uses gms_pure_go tag and CGO
 sudo mv bd /usr/local/bin/
 ```
 
@@ -110,16 +152,22 @@ paru -S beads-git
 
 Thanks to [@v4rgas](https://github.com/v4rgas) for maintaining the AUR package!
 
-**Via go install**:
+**Via go install** (server-mode only, simplest):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+# Then: bd init --server   (requires a running dolt sql-server)
+```
+
+**Via go install** (embedded-capable, needs gcc):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 **From source**:
 ```bash
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd ./cmd/bd
+make build   # uses gms_pure_go tag and CGO
 sudo mv bd /usr/local/bin/
 ```
 
@@ -127,12 +175,12 @@ sudo mv bd /usr/local/bin/
 
 **Via Quick Install Script**:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
-**Via go install**:
+**Via go install** (server-mode only, simplest):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### Windows 11
@@ -145,21 +193,35 @@ Beads now ships with native Windows support—no MSYS or MinGW required.
 
 **Via PowerShell script**:
 ```pwsh
-irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 ```
 
-**Via go install**:
+The script installs a prebuilt Windows release if available and verifies the downloaded ZIP checksum against release `checksums.txt`. Go is only required for `go install` or building from source.
+
+**Via go install** (server-mode only, simplest):
 ```pwsh
-go install github.com/steveyegge/beads/cmd/bd@latest
+$env:CGO_ENABLED="0"; go install github.com/steveyegge/beads/cmd/bd@latest
+# Then: bd init --server   (requires a running dolt sql-server)
 ```
+
+This produces a server-mode-only binary with no C compiler requirement — the fastest path to a working `bd` on Windows.
+
+**Via go install** (embedded-capable, needs MinGW):
+```pwsh
+$env:CGO_ENABLED="1"; $env:GOFLAGS="-tags=gms_pure_go"; go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+Requires MinGW-w64 gcc on your PATH. ICU is **not** required — `gms_pure_go` selects Go's stdlib `regexp`.
 
 **From source**:
 ```pwsh
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd.exe ./cmd/bd
+make build   # uses gms_pure_go tag and CGO
 Move-Item bd.exe $env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\
 ```
+
+The `-tags gms_pure_go` flag tells go-mysql-server to use Go's stdlib regexp instead of ICU.
 
 **Verify installation**:
 ```pwsh
@@ -167,9 +229,38 @@ bd version
 ```
 
 **Windows notes:**
-- The background daemon listens on a loopback TCP endpoint recorded in `.beads\bd.sock`
-- Keep that metadata file intact
+- The Dolt server listens on a loopback TCP endpoint
 - Allow `bd.exe` loopback traffic through any host firewall
+
+## Build Dependencies (Contributors Only)
+
+> **Note:** These dependencies are only needed if you build from source. If you installed via Homebrew, npm, or the install script, skip this section entirely.
+
+Building from source requires a C compiler (for CGO / embedded Dolt). **ICU is
+not required** -- all builds use the `gms_pure_go` tag which selects Go's
+stdlib `regexp` instead of ICU regex. See [ICU-POLICY.md](ICU-POLICY.md) for
+details.
+
+macOS (Homebrew):
+```bash
+brew install zstd
+```
+
+Linux (Debian/Ubuntu):
+```bash
+sudo apt-get install -y libzstd-dev
+```
+
+Linux (Fedora/RHEL):
+```bash
+sudo dnf install -y libzstd-devel
+```
+
+> **For maintainers only:** If you intentionally need to run
+> `scripts/test-icu-path.sh` (which exercises the leftover ICU code path),
+> install ICU headers:
+> `brew install icu4c` (macOS) or `sudo apt-get install -y libicu-dev` (Linux).
+> This is not needed for normal development.
 
 ## IDE and Editor Integrations
 
@@ -186,17 +277,22 @@ cd your-project
 bd init --quiet
 
 # 3. Setup editor integration (choose one)
-bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
+bd setup claude   # Claude Code - installs SessionStart hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
-bd setup codex    # Codex CLI - creates/updates AGENTS.md
+bd setup codex    # Codex CLI - installs Beads skill, AGENTS.md guidance, and native hooks
+bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md
+bd setup mux      # Mux - creates/updates AGENTS.md
 ```
 
 **How it works:**
+- `bd init` creates or updates `AGENTS.md` by default unless you use `--skip-agents` or `--stealth`
 - Editor hooks/rules inject `bd prime` automatically on session start
+- Codex 0.129.0+ uses native `/hooks`: SessionStart injects `bd prime`, compact hooks mark context stale, and the next prompt after compaction refreshes Beads context once
 - `bd prime` provides ~1-2k tokens of workflow context
 - You use `bd` CLI commands directly
 - Git hooks (installed by `bd init`) auto-sync the database
+- `bd onboard` prints the small manual snippet for unsupported agents or custom instruction files
 
 **Why this is recommended:**
 - **Context efficient** - ~1-2k tokens vs 10-50k for MCP tool schemas
@@ -210,6 +306,8 @@ bd setup claude --check   # Check Claude Code integration
 bd setup cursor --check   # Check Cursor integration
 bd setup aider --check    # Check Aider integration
 bd setup codex --check    # Check Codex integration
+bd setup factory --check  # Check Factory.ai integration
+bd setup mux --check      # Check Mux integration
 ```
 
 ### Claude Code Plugin (Optional)
@@ -218,7 +316,7 @@ For enhanced UX with slash commands:
 
 ```bash
 # In Claude Code
-/plugin marketplace add steveyegge/beads
+/plugin marketplace add gastownhall/beads
 /plugin install beads
 # Restart Claude Code
 ```
@@ -334,6 +432,8 @@ bd help
 
 ## Troubleshooting Installation
 
+For additional troubleshooting, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 ### `bd: command not found`
 
 bd is not in your PATH. Either:
@@ -345,8 +445,8 @@ go list -f {{.Target}} github.com/steveyegge/beads/cmd/bd
 # Add Go bin to PATH (add to ~/.bashrc or ~/.zshrc)
 export PATH="$PATH:$(go env GOPATH)/bin"
 
-# Or reinstall
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Or reinstall (server-mode only, no C compiler needed)
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### `zsh: killed bd` or crashes on macOS
@@ -355,17 +455,17 @@ Some users report crashes when running `bd init` or other commands on macOS. Thi
 
 **Workaround:**
 ```bash
-# Build with CGO enabled
-CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
+# Install an embedded-capable build
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 
 # Or if building from source
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
-CGO_ENABLED=1 go build -o bd ./cmd/bd
+CGO_ENABLED=1 go build -tags gms_pure_go -o bd ./cmd/bd
 sudo mv bd /usr/local/bin/
 ```
 
-If you installed via Homebrew, this shouldn't be necessary as the formula already enables CGO. If you're still seeing crashes with the Homebrew version, please [file an issue](https://github.com/steveyegge/beads/issues).
+If you installed via Homebrew, this shouldn't be necessary as the formula already enables CGO. If you're still seeing crashes with the Homebrew version, please [file an issue](https://github.com/gastownhall/beads/issues).
 
 ### Claude Code Plugin: MCP server fails to start
 
@@ -397,22 +497,54 @@ See the "Claude Code Plugin" section above for alternative installation methods 
 After installation:
 
 1. **Initialize a project**: `cd your-project && bd init`
-2. **Configure your agent**: Add bd instructions to `AGENTS.md` (see [README.md](../README.md#quick-start))
+2. **Configure your agent**: `bd init` creates/updates `AGENTS.md` by default; run `bd setup --list` for richer integrations or `bd onboard` for a manual fallback snippet
 3. **Learn the basics**: See [QUICKSTART.md](QUICKSTART.md) for a tutorial
 4. **Explore examples**: Check out the [examples/](../examples/) directory
 
 ## Updating bd
 
+Use the update command that matches how you installed `bd`.
+
+### Quick Install Script (macOS/Linux/FreeBSD)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+```
+
+### PowerShell Installer (Windows)
+
+```pwsh
+irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
+```
+
 ### Homebrew
 
 ```bash
-brew upgrade bd
+brew upgrade beads
+```
+
+### npm
+
+```bash
+npm update -g @beads/bd
+```
+
+### bun
+
+```bash
+bun install -g --trust @beads/bd
 ```
 
 ### go install
 
+Use whichever mode you installed with originally:
+
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Server-mode only
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Embedded-capable
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### From source
@@ -420,8 +552,16 @@ go install github.com/steveyegge/beads/cmd/bd@latest
 ```bash
 cd beads
 git pull
-go build -o bd ./cmd/bd
+make build
 sudo mv bd /usr/local/bin/
+```
+
+## After Upgrading (Recommended)
+
+```bash
+bd info --whats-new
+bd hooks install
+bd version
 ```
 
 ## Uninstalling

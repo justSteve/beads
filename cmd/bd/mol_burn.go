@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -23,8 +23,8 @@ completely removes the molecule with no trace. Use this for:
   - Test/debug molecules you don't want to preserve
 
 The burn operation differs based on molecule phase:
-  - Wisp (ephemeral): Direct delete, no tombstones
-  - Mol (persistent): Cascade delete with tombstones (syncs to remotes)
+  - Wisp (ephemeral): Direct delete
+  - Mol (persistent): Cascade delete (syncs to remotes)
 
 CAUTION: This is a destructive operation. The molecule's data will be
 permanently lost. If you want to preserve a summary, use 'bd mol squash'.
@@ -57,15 +57,16 @@ func runMolBurn(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 
-	// mol burn requires direct store access (daemon auto-bypassed for wisp ops)
+	// mol burn requires direct store access
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		fmt.Fprintf(os.Stderr, "Hint: run 'bd init' or 'bd import' to initialize the database\n")
-		os.Exit(1)
+		FatalErrorWithHint("no database connection", diagHint())
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	force, _ := cmd.Flags().GetBool("force")
+	if yes, _ := cmd.Flags().GetBool("yes"); yes {
+		force = true
+	}
 
 	// Single ID: use original logic for backward compatibility
 	if len(args) == 1 {
@@ -82,23 +83,21 @@ func burnSingleMolecule(ctx context.Context, moleculeID string, dryRun, force bo
 	// Resolve molecule ID in main store
 	resolvedID, err := utils.ResolvePartialID(ctx, store, moleculeID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving molecule ID %s: %v\n", moleculeID, err)
-		os.Exit(1)
+		FatalError("resolving molecule ID %s: %v", moleculeID, err)
 	}
 
 	// Load the molecule
 	rootIssue, err := store.GetIssue(ctx, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Branch based on molecule phase
 	if rootIssue.Ephemeral {
-		// Wisp: direct delete without tombstones
+		// Wisp: direct delete
 		burnWispMolecule(ctx, resolvedID, dryRun, force)
 	} else {
-		// Mol: cascade delete with tombstones
+		// Mol: cascade delete
 		burnPersistentMolecule(ctx, resolvedID, dryRun, force)
 	}
 }
@@ -155,7 +154,7 @@ func burnMultipleMolecules(ctx context.Context, moleculeIDs []string, dryRun, fo
 				}
 			}
 			if len(persistentIDs) > 0 {
-				fmt.Printf("\nPersistent molecules to delete (will create tombstones):\n")
+				fmt.Printf("\nPersistent molecules to delete:\n")
 				for _, id := range persistentIDs {
 					fmt.Printf("  - %s\n", id)
 				}
@@ -228,9 +227,6 @@ func burnMultipleMolecules(ctx context.Context, moleculeIDs []string, dryRun, fo
 		})
 	}
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
-
 	if jsonOutput {
 		outputJSON(batchResult)
 		return
@@ -242,13 +238,12 @@ func burnMultipleMolecules(ctx context.Context, moleculeIDs []string, dryRun, fo
 	}
 }
 
-// burnWispMolecule handles wisp deletion (no tombstones, ephemeral-only)
+// burnWispMolecule handles wisp deletion (ephemeral-only)
 func burnWispMolecule(ctx context.Context, resolvedID string, dryRun, force bool) {
 	// Load the molecule subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, store, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading wisp molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading wisp molecule: %v", err)
 	}
 
 	// Collect wisp issue IDs to delete (only delete wisps, not regular children)
@@ -308,13 +303,9 @@ func burnWispMolecule(ctx context.Context, resolvedID string, dryRun, force bool
 	// Perform the burn
 	result, err := burnWisps(ctx, store, wispIDs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error burning wisp: %v\n", err)
-		os.Exit(1)
+		FatalError("burning wisp: %v", err)
 	}
 	result.MoleculeID = resolvedID
-
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(result)
@@ -326,13 +317,12 @@ func burnWispMolecule(ctx context.Context, resolvedID string, dryRun, force bool
 	fmt.Printf("  No digest created.\n")
 }
 
-// burnPersistentMolecule handles mol deletion (with tombstones, cascade delete)
+// burnPersistentMolecule handles mol deletion (cascade delete)
 func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, force bool) {
 	// Load the molecule subgraph to show what will be deleted
 	subgraph, err := loadTemplateSubgraph(ctx, store, resolvedID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Collect all issue IDs in the molecule
@@ -365,7 +355,7 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 				fmt.Printf("  - [%s] %s (%s)\n", status, issue.Title, issue.ID)
 			}
 		}
-		fmt.Printf("\nNote: Persistent mol - will create tombstones (syncs to remotes).\n")
+		fmt.Printf("\nNote: Persistent mol - deletions sync to remotes.\n")
 		fmt.Printf("No digest will be created (use 'bd mol squash' to create one).\n")
 		return
 	}
@@ -374,7 +364,7 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 	if !force && !jsonOutput {
 		fmt.Printf("About to burn mol %s (%d issues)\n", resolvedID, len(issueIDs))
 		fmt.Printf("This will permanently delete all molecule data with no digest.\n")
-		fmt.Printf("Note: Persistent mol - tombstones will sync to remotes.\n")
+		fmt.Printf("Note: Persistent mol - deletions sync to remotes.\n")
 		fmt.Printf("Use 'bd mol squash' instead if you want to preserve a summary.\n")
 		fmt.Printf("\nContinue? [y/N] ")
 
@@ -387,30 +377,29 @@ func burnPersistentMolecule(ctx context.Context, resolvedID string, dryRun, forc
 	}
 
 	// Use deleteBatch with cascade=false (we already have all IDs from subgraph)
-	// force=true, hardDelete=false (keep tombstones for sync)
+	// force=true, hardDelete=false (Dolt handles sync)
 	deleteBatch(nil, issueIDs, true, false, false, jsonOutput, false, "mol burn")
 }
 
-// burnWisps deletes all wisp issues without creating a digest
-func burnWisps(ctx context.Context, s interface{}, ids []string) (*BurnResult, error) {
-	// Type assert to SQLite storage for delete access
-	sqliteStore, ok := s.(*sqlite.SQLiteStorage)
-	if !ok {
-		return nil, fmt.Errorf("burn requires SQLite storage backend")
-	}
-
+// burnWisps deletes all wisp issues atomically within a single transaction.
+// If any delete fails, the entire operation is rolled back to prevent partial deletion.
+func burnWisps(ctx context.Context, s storage.DoltStorage, ids []string) (*BurnResult, error) {
 	result := &BurnResult{
 		DeletedIDs: make([]string, 0, len(ids)),
 	}
 
-	for _, id := range ids {
-		if err := sqliteStore.DeleteIssue(ctx, id); err != nil {
-			// Log but continue - try to delete as many as possible
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete %s: %v\n", id, err)
-			continue
+	err := transact(ctx, s, "bd: burn wisps", func(tx storage.Transaction) error {
+		for _, id := range ids {
+			if err := tx.DeleteIssue(ctx, id); err != nil {
+				return fmt.Errorf("failed to delete wisp %s: %w", id, err)
+			}
+			result.DeletedIDs = append(result.DeletedIDs, id)
+			result.DeletedCount++
 		}
-		result.DeletedIDs = append(result.DeletedIDs, id)
-		result.DeletedCount++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return result, nil
@@ -419,6 +408,8 @@ func burnWisps(ctx context.Context, s interface{}, ids []string) (*BurnResult, e
 func init() {
 	molBurnCmd.Flags().Bool("dry-run", false, "Preview what would be deleted")
 	molBurnCmd.Flags().Bool("force", false, "Skip confirmation prompt")
+	molBurnCmd.Flags().BoolP("yes", "y", false, "Alias for --force (skip confirmation)")
+	_ = molBurnCmd.Flags().MarkHidden("yes")
 
 	molCmd.AddCommand(molBurnCmd)
 }

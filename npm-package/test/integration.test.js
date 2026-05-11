@@ -146,7 +146,7 @@ async function testBinaryFunctionality(npmPrefix) {
     // Test help command
     logInfo('Testing help command...');
     const help = exec(`"${bdCmd}" --help`, { env });
-    if (!help.includes('Available Commands')) {
+    if (!help.includes('Usage:') || !help.includes('Working With Issues')) {
       throw new Error('Help command did not return expected output');
     }
     logSuccess('Help command works');
@@ -174,7 +174,7 @@ async function testBasicWorkflow(npmPrefix) {
   const env = {
     ...process.env,
     PATH: `${path.join(npmPrefix, 'bin')}:${process.env.PATH}`,
-    BD_ACTOR: 'integration-test'
+    BEADS_ACTOR: 'integration-test'
   };
 
   try {
@@ -223,7 +223,7 @@ async function testBasicWorkflow(npmPrefix) {
 
     // Test bd update
     logInfo('Testing bd update...');
-    exec(`"${bdCmd}" update ${issue.id} --status in_progress`, { cwd: projectDir, env });
+    exec(`"${bdCmd}" update ${issue.id} --claim`, { cwd: projectDir, env });
     const updatedOutput = exec(`"${bdCmd}" show ${issue.id} --json`, { cwd: projectDir, env });
     const updatedResult = JSON.parse(updatedOutput);
     const updatedIssue = Array.isArray(updatedResult) ? updatedResult[0] : updatedResult;
@@ -276,7 +276,7 @@ async function testClaudeCodeWebSimulation(npmPrefix) {
     const env = {
       ...process.env,
       PATH: `${path.join(npmPrefix, 'bin')}:${process.env.PATH}`,
-      BD_ACTOR: 'claude-agent'
+      BEADS_ACTOR: 'claude-agent'
     };
 
     // First session: initialize and create an issue
@@ -302,13 +302,18 @@ async function testClaudeCodeWebSimulation(npmPrefix) {
       throw new Error('JSONL file not created');
     }
 
-    // Remove the database to simulate a fresh clone
-    const dbFiles = fs.readdirSync(beadsDir).filter(f => f.endsWith('.db'));
-    dbFiles.forEach(f => fs.unlinkSync(path.join(beadsDir, f)));
+    // Remove local-only database state to simulate a fresh clone that kept the
+    // committed JSONL export but not the gitignored embedded Dolt database.
+    for (const entry of fs.readdirSync(beadsDir)) {
+      if (entry === 'issues.jsonl') {
+        continue;
+      }
+      fs.rmSync(path.join(beadsDir, entry), { recursive: true, force: true });
+    }
 
     // Session 2: Re-initialize (simulating SessionStart hook in new session)
     logInfo('Session 2: Re-initialize from JSONL...');
-    exec(`"${bdCmd}" init --quiet`, { cwd: sessionDir, env });
+    exec(`"${bdCmd}" init --quiet --from-jsonl`, { cwd: sessionDir, env });
     logSuccess('bd init re-imported from JSONL');
 
     // Verify issue was imported
@@ -329,6 +334,10 @@ async function testClaudeCodeWebSimulation(npmPrefix) {
     }
     logSuccess(`Found ${readyIssues.length} ready issue(s)`);
 
+    // The default auto-export interval is throttled for normal use. Disable
+    // the interval so this test can assert the next write updates JSONL.
+    exec(`"${bdCmd}" config set export.interval 0s`, { cwd: sessionDir, env });
+
     // Simulate agent creating a new issue
     const newCreateOutput = exec(
       `"${bdCmd}" create "Bug discovered during session" -t bug -p 0 --json`,
@@ -337,7 +346,8 @@ async function testClaudeCodeWebSimulation(npmPrefix) {
     const newIssue = JSON.parse(newCreateOutput);
     logSuccess(`Agent created new issue: ${newIssue.id}`);
 
-    // Verify JSONL was updated
+    // Verify JSONL export works after the imported session creates more work.
+    exec(`"${bdCmd}" export -o "${jsonlPath}"`, { cwd: sessionDir, env });
     const jsonlContent = fs.readFileSync(
       path.join(beadsDir, 'issues.jsonl'),
       'utf8'
@@ -347,7 +357,7 @@ async function testClaudeCodeWebSimulation(npmPrefix) {
     if (jsonlLines.length < 2) {
       throw new Error('JSONL not updated with new issue');
     }
-    logSuccess('JSONL auto-export working');
+    logSuccess('JSONL export working');
 
     return true;
   } catch (err) {
@@ -391,7 +401,7 @@ async function testPlatformDetection() {
     // Check if GitHub release has this binary
     const version = require(path.join(PACKAGE_DIR, 'package.json')).version;
     const ext = platform === 'win32' ? 'zip' : 'tar.gz';
-    const binaryUrl = `https://github.com/steveyegge/beads/releases/download/v${version}/beads_${version}_${platform}_${mappedArch}.${ext}`;
+    const binaryUrl = `https://github.com/gastownhall/beads/releases/download/v${version}/beads_${version}_${platform}_${mappedArch}.${ext}`;
 
     logInfo(`Expected binary URL: ${binaryUrl}`);
     logSuccess('Platform detection logic validated');

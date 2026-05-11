@@ -2,19 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/formula"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
-	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -26,12 +21,13 @@ var variablePattern = regexp.MustCompile(`\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}`)
 
 // TemplateSubgraph holds a template epic and all its descendants
 type TemplateSubgraph struct {
-	Root         *types.Issue                // The template epic
-	Issues       []*types.Issue              // All issues in the subgraph (including root)
-	Dependencies []*types.Dependency         // All dependencies within the subgraph
-	IssueMap     map[string]*types.Issue     // ID -> Issue for quick lookup
-	VarDefs      map[string]formula.VarDef   // Variable definitions from formula (for defaults)
-	Phase        string                      // Recommended phase: "liquid" (pour) or "vapor" (wisp)
+	Root         *types.Issue              // The template epic
+	Issues       []*types.Issue            // All issues in the subgraph (including root)
+	Dependencies []*types.Dependency       // All dependencies within the subgraph
+	IssueMap     map[string]*types.Issue   // ID -> Issue for quick lookup
+	VarDefs      map[string]formula.VarDef // Variable definitions from formula (for defaults)
+	Phase        string                    // Recommended phase: "liquid" (pour) or "vapor" (wisp)
+	Pour         bool                      // If true, steps should be materialized as sub-issues (from formula pour=true)
 }
 
 // InstantiateResult holds the result of template instantiation
@@ -47,330 +43,31 @@ type CloneOptions struct {
 	Assignee  string            // Assign the root epic to this agent/user
 	Actor     string            // Actor performing the operation
 	Ephemeral bool              // If true, spawned issues are marked for bulk deletion
-	Prefix   string            // Override prefix for ID generation (bd-hobo: distinct prefixes)
+	Prefix    string            // Override prefix for ID generation (bd-hobo: distinct prefixes)
 
 	// Dynamic bonding fields (for Christmas Ornament pattern)
 	ParentID string // Parent molecule ID to bond under (e.g., "patrol-x7k")
 	ChildRef string // Child reference with variables (e.g., "arm-{{polecat_name}}")
+
+	// Atomic attachment: if set, adds a dependency from the spawned root to
+	// AttachToID within the same transaction as the clone, preventing orphans.
+	AttachToID    string               // Molecule ID to attach spawned root to
+	AttachDepType types.DependencyType // Dependency type for the attachment
+
+	// RootOnly: if true, only create the root issue (no child step issues).
+	// Used by patrol wisps where steps are inlined at prime time, not tracked as beads.
+	RootOnly bool
 }
 
 // bondedIDPattern validates bonded IDs (alphanumeric, dash, underscore, dot)
 var bondedIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
-
-var templateCmd = &cobra.Command{
-	Use:        "template",
-	GroupID:    "setup",
-	Short:      "Manage issue templates",
-	Deprecated: "use 'bd mol' instead (will be removed in v1.0.0)",
-	Long: `Manage Beads templates for creating issue hierarchies.
-
-Templates are epics with the "template" label. They can have child issues
-with {{variable}} placeholders that get substituted during instantiation.
-
-To create a template:
-  1. Create an epic with child issues
-  2. Add the 'template' label: bd label add <epic-id> template
-  3. Use {{variable}} placeholders in titles/descriptions
-
-To use a template:
-  bd template instantiate <id> --var key=value`,
-}
-
-var templateListCmd = &cobra.Command{
-	Use:        "list",
-	Short:      "List available templates",
-	Deprecated: "use 'bd formula list' instead (will be removed in v1.0.0)",
-	Run: func(cmd *cobra.Command, args []string) {
-		ctx := rootCtx
-		var beadsTemplates []*types.Issue
-
-		if daemonClient != nil {
-			resp, err := daemonClient.List(&rpc.ListArgs{})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading templates: %v\n", err)
-				os.Exit(1)
-			}
-			var allIssues []*types.Issue
-			if err := json.Unmarshal(resp.Data, &allIssues); err == nil {
-				for _, issue := range allIssues {
-					for _, label := range issue.Labels {
-						if label == BeadsTemplateLabel {
-							beadsTemplates = append(beadsTemplates, issue)
-							break
-						}
-					}
-				}
-			}
-		} else if store != nil {
-			var err error
-			beadsTemplates, err = store.GetIssuesByLabel(ctx, BeadsTemplateLabel)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading templates: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
-		}
-
-		if jsonOutput {
-			outputJSON(beadsTemplates)
-			return
-		}
-
-		// Human-readable output
-		if len(beadsTemplates) == 0 {
-			fmt.Println("No templates available.")
-			fmt.Println("\nTo create a template:")
-			fmt.Println("  1. Create an epic with child issues")
-			fmt.Println("  2. Add the 'template' label: bd label add <epic-id> template")
-			fmt.Println("  3. Use {{variable}} placeholders in titles/descriptions")
-			return
-		}
-
-		fmt.Printf("%s\n", ui.RenderPass("Templates (for bd template instantiate):"))
-		for _, tmpl := range beadsTemplates {
-			vars := extractVariables(tmpl.Title + " " + tmpl.Description)
-			varStr := ""
-			if len(vars) > 0 {
-				varStr = fmt.Sprintf(" (vars: %s)", strings.Join(vars, ", "))
-			}
-			fmt.Printf("  %s: %s%s\n", ui.RenderAccent(tmpl.ID), tmpl.Title, varStr)
-		}
-		fmt.Println()
-	},
-}
-
-var templateShowCmd = &cobra.Command{
-	Use:        "show <template-id>",
-	Short:      "Show template details",
-	Deprecated: "use 'bd mol show' instead (will be removed in v1.0.0)",
-	Args:       cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		ctx := rootCtx
-		var templateID string
-
-		if daemonClient != nil {
-			resolveArgs := &rpc.ResolveIDArgs{ID: args[0]}
-			resp, err := daemonClient.ResolveID(resolveArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: template '%s' not found\n", args[0])
-				os.Exit(1)
-			}
-			if err := json.Unmarshal(resp.Data, &templateID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store != nil {
-			var err error
-			templateID, err = utils.ResolvePartialID(ctx, store, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: template '%s' not found\n", args[0])
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
-		}
-
-		// Load and show Beads template
-		var subgraph *TemplateSubgraph
-		var err error
-		if daemonClient != nil {
-			subgraph, err = loadTemplateSubgraphViaDaemon(daemonClient, templateID)
-		} else {
-			subgraph, err = loadTemplateSubgraph(ctx, store, templateID)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading template: %v\n", err)
-			os.Exit(1)
-		}
-
-		showBeadsTemplate(subgraph)
-	},
-}
-
-func showBeadsTemplate(subgraph *TemplateSubgraph) {
-	if jsonOutput {
-		outputJSON(map[string]interface{}{
-			"root":         subgraph.Root,
-			"issues":       subgraph.Issues,
-			"dependencies": subgraph.Dependencies,
-			"variables":    extractAllVariables(subgraph),
-		})
-		return
-	}
-
-	fmt.Printf("\n%s Template: %s\n", ui.RenderAccent("📋"), subgraph.Root.Title)
-	fmt.Printf("   ID: %s\n", subgraph.Root.ID)
-	fmt.Printf("   Issues: %d\n", len(subgraph.Issues))
-
-	// Show variables
-	vars := extractAllVariables(subgraph)
-	if len(vars) > 0 {
-		fmt.Printf("\n%s Variables:\n", ui.RenderWarn("📝"))
-		for _, v := range vars {
-			fmt.Printf("   {{%s}}\n", v)
-		}
-	}
-
-	// Show structure
-	fmt.Printf("\n%s Structure:\n", ui.RenderPass("🌲"))
-	printTemplateTree(subgraph, subgraph.Root.ID, 0, true)
-	fmt.Println()
-}
-
-var templateInstantiateCmd = &cobra.Command{
-	Use:        "instantiate <template-id>",
-	Short:      "Create issues from a Beads template",
-	Deprecated: "use 'bd mol bond' instead (will be removed in v1.0.0)",
-	Long: `Instantiate a Beads template by cloning its subgraph and substituting variables.
-
-Variables are specified with --var key=value flags. The template's {{key}}
-placeholders will be replaced with the corresponding values.
-
-Example:
-  bd template instantiate bd-abc123 --var version=1.2.0 --var date=2024-01-15`,
-	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		CheckReadonly("template instantiate")
-
-		ctx := rootCtx
-		dryRun, _ := cmd.Flags().GetBool("dry-run")
-		varFlags, _ := cmd.Flags().GetStringArray("var")
-		assignee, _ := cmd.Flags().GetString("assignee")
-
-		// Parse variables
-		vars := make(map[string]string)
-		for _, v := range varFlags {
-			parts := strings.SplitN(v, "=", 2)
-			if len(parts) != 2 {
-				fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-				os.Exit(1)
-			}
-			vars[parts[0]] = parts[1]
-		}
-
-		// Resolve template ID
-		var templateID string
-		if daemonClient != nil {
-			resolveArgs := &rpc.ResolveIDArgs{ID: args[0]}
-			resp, err := daemonClient.ResolveID(resolveArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving template ID %s: %v\n", args[0], err)
-				os.Exit(1)
-			}
-			if err := json.Unmarshal(resp.Data, &templateID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else if store != nil {
-			var err error
-			templateID, err = utils.ResolvePartialID(ctx, store, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving template ID %s: %v\n", args[0], err)
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
-		}
-
-		// Load the template subgraph
-		var subgraph *TemplateSubgraph
-		var err error
-		if daemonClient != nil {
-			subgraph, err = loadTemplateSubgraphViaDaemon(daemonClient, templateID)
-		} else {
-			subgraph, err = loadTemplateSubgraph(ctx, store, templateID)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading template: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Check for missing variables
-		requiredVars := extractAllVariables(subgraph)
-		var missingVars []string
-		for _, v := range requiredVars {
-			if _, ok := vars[v]; !ok {
-				missingVars = append(missingVars, v)
-			}
-		}
-		if len(missingVars) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: missing required variables: %s\n", strings.Join(missingVars, ", "))
-			fmt.Fprintf(os.Stderr, "Provide them with: --var %s=<value>\n", missingVars[0])
-			os.Exit(1)
-		}
-
-		if dryRun {
-			// Preview what would be created
-			fmt.Printf("\nDry run: would create %d issues from template %s\n\n", len(subgraph.Issues), templateID)
-			for _, issue := range subgraph.Issues {
-				newTitle := substituteVariables(issue.Title, vars)
-				suffix := ""
-				if issue.ID == subgraph.Root.ID && assignee != "" {
-					suffix = fmt.Sprintf(" (assignee: %s)", assignee)
-				}
-				fmt.Printf("  - %s (from %s)%s\n", newTitle, issue.ID, suffix)
-			}
-			if len(vars) > 0 {
-				fmt.Printf("\nVariables:\n")
-				for k, v := range vars {
-					fmt.Printf("  {{%s}} = %s\n", k, v)
-				}
-			}
-			return
-		}
-
-		// Clone the subgraph (deprecated command, non-wisp for backwards compatibility)
-		opts := CloneOptions{
-			Vars:     vars,
-			Assignee: assignee,
-			Actor:    actor,
-			Ephemeral:     false,
-		}
-		var result *InstantiateResult
-		if daemonClient != nil {
-			result, err = cloneSubgraphViaDaemon(daemonClient, subgraph, opts)
-		} else {
-			result, err = cloneSubgraph(ctx, store, subgraph, opts)
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error instantiating template: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Schedule auto-flush
-		markDirtyAndScheduleFlush()
-
-		if jsonOutput {
-			outputJSON(result)
-			return
-		}
-
-		fmt.Printf("%s Created %d issues from template\n", ui.RenderPass("✓"), result.Created)
-		fmt.Printf("  New epic: %s\n", result.NewEpicID)
-	},
-}
-
-func init() {
-	templateInstantiateCmd.Flags().StringArray("var", []string{}, "Variable substitution (key=value)")
-	templateInstantiateCmd.Flags().Bool("dry-run", false, "Preview what would be created")
-	templateInstantiateCmd.Flags().String("assignee", "", "Assign the root epic to this agent/user")
-
-	templateCmd.AddCommand(templateListCmd)
-	templateCmd.AddCommand(templateShowCmd)
-	templateCmd.AddCommand(templateInstantiateCmd)
-	rootCmd.AddCommand(templateCmd)
-}
 
 // =============================================================================
 // Beads Template Functions
 // =============================================================================
 
 // loadTemplateSubgraph loads a template epic and all its descendants
-func loadTemplateSubgraph(ctx context.Context, s storage.Storage, templateID string) (*TemplateSubgraph, error) {
+func loadTemplateSubgraph(ctx context.Context, s storage.DoltStorage, templateID string) (*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -390,8 +87,9 @@ func loadTemplateSubgraph(ctx context.Context, s storage.Storage, templateID str
 		IssueMap: map[string]*types.Issue{root.ID: root},
 	}
 
-	// Recursively load all children
-	if err := loadDescendants(ctx, s, subgraph, root.ID); err != nil {
+	// Recursively load all children (with cycle detection, GH#2719)
+	visited := map[string]bool{root.ID: true}
+	if err := loadDescendants(ctx, s, subgraph, root.ID, visited); err != nil {
 		return nil, err
 	}
 
@@ -412,51 +110,48 @@ func loadTemplateSubgraph(ctx context.Context, s storage.Storage, templateID str
 	return subgraph, nil
 }
 
-// loadDescendants recursively loads all child issues
+// loadDescendants recursively loads all child issues.
 // It uses two strategies to find children:
 // 1. Check dependency records for parent-child relationships
 // 2. Check for hierarchical IDs (parent.N) to catch children with missing/wrong deps
-func loadDescendants(ctx context.Context, s storage.Storage, subgraph *TemplateSubgraph, parentID string) error {
+//
+// The visited set tracks IDs already expanded to detect cycles (GH#2719).
+// Without this, cyclic parent-child dependencies cause unbounded recursion leading to OOM.
+func loadDescendants(ctx context.Context, s storage.DoltStorage, subgraph *TemplateSubgraph, parentID string, visited map[string]bool) error {
 	// Track children we've already added to avoid duplicates
 	addedChildren := make(map[string]bool)
 
-	// Strategy 1: GetDependents returns issues that depend on parentID
-	dependents, err := s.GetDependents(ctx, parentID)
+	// Strategy 1: Get direct parent-child dependents with relationship metadata.
+	dependents, err := s.GetDependentsWithMetadata(ctx, parentID)
 	if err != nil {
 		return fmt.Errorf("failed to get dependents of %s: %w", parentID, err)
 	}
 
-	// Check each dependent to see if it's a child (has parent-child relationship)
+	// Only keep explicit parent-child relationships.
 	for _, dependent := range dependents {
+		if dependent.DependencyType != types.DepParentChild {
+			continue
+		}
+
 		if _, exists := subgraph.IssueMap[dependent.ID]; exists {
 			continue // Already in subgraph
 		}
 
-		// Check if this dependent has a parent-child relationship with parentID
-		depRecs, err := s.GetDependencyRecords(ctx, dependent.ID)
-		if err != nil {
+		// Cycle detection (GH#2719)
+		if visited[dependent.ID] {
 			continue
 		}
 
-		isChild := false
-		for _, depRec := range depRecs {
-			if depRec.DependsOnID == parentID && depRec.Type == types.DepParentChild {
-				isChild = true
-				break
-			}
-		}
-
-		if !isChild {
-			continue
-		}
+		child := dependent.Issue
 
 		// Add to subgraph
-		subgraph.Issues = append(subgraph.Issues, dependent)
-		subgraph.IssueMap[dependent.ID] = dependent
-		addedChildren[dependent.ID] = true
+		subgraph.Issues = append(subgraph.Issues, &child)
+		subgraph.IssueMap[child.ID] = &child
+		addedChildren[child.ID] = true
 
-		// Recurse to get children of this child
-		if err := loadDescendants(ctx, s, subgraph, dependent.ID); err != nil {
+		// Mark visited before recursing
+		visited[child.ID] = true
+		if err := loadDescendants(ctx, s, subgraph, child.ID, visited); err != nil {
 			return err
 		}
 	}
@@ -478,13 +173,36 @@ func loadDescendants(ctx context.Context, s storage.Storage, subgraph *TemplateS
 			continue // Already in subgraph
 		}
 
+		// Cycle detection (GH#2719)
+		if visited[child.ID] {
+			continue
+		}
+
+		// Check if this hierarchical child has been reparented to a different parent (GH#2476).
+		// If it has an explicit parent-child dependency pointing elsewhere, skip it —
+		// the ID pattern match is stale and the child belongs to another molecule.
+		depRecs, err := s.GetDependencyRecords(ctx, child.ID)
+		if err == nil {
+			reparented := false
+			for _, dep := range depRecs {
+				if dep.Type == types.DepParentChild && dep.DependsOnID != parentID {
+					reparented = true
+					break
+				}
+			}
+			if reparented {
+				continue
+			}
+		}
+
 		// Add to subgraph
 		subgraph.Issues = append(subgraph.Issues, child)
 		subgraph.IssueMap[child.ID] = child
 		addedChildren[child.ID] = true
 
-		// Recurse to get children of this child
-		if err := loadDescendants(ctx, s, subgraph, child.ID); err != nil {
+		// Mark visited before recursing
+		visited[child.ID] = true
+		if err := loadDescendants(ctx, s, subgraph, child.ID, visited); err != nil {
 			return err
 		}
 	}
@@ -494,27 +212,18 @@ func loadDescendants(ctx context.Context, s storage.Storage, subgraph *TemplateS
 
 // findHierarchicalChildren finds issues with IDs that match the pattern parentID.N
 // This catches hierarchical children that may be missing parent-child dependencies.
-func findHierarchicalChildren(ctx context.Context, s storage.Storage, parentID string) ([]*types.Issue, error) {
-	// Look for issues with IDs starting with "parentID."
-	// We need to query by ID pattern, which requires listing issues
+func findHierarchicalChildren(ctx context.Context, s storage.DoltStorage, parentID string) ([]*types.Issue, error) {
 	pattern := parentID + "."
-
-	// Use the storage's search capability with a filter
-	allIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{})
+	candidates, err := s.SearchIssues(ctx, "", types.IssueFilter{IDPrefix: pattern})
 	if err != nil {
 		return nil, err
 	}
 
 	var children []*types.Issue
-	for _, issue := range allIssues {
-		// Check if ID starts with pattern and is a direct child (no further dots after the pattern)
-		if len(issue.ID) > len(pattern) && issue.ID[:len(pattern)] == pattern {
-			// Check it's a direct child, not a grandchild
-			// e.g., "parent.1" is a child, "parent.1.2" is a grandchild
-			remaining := issue.ID[len(pattern):]
-			if !strings.Contains(remaining, ".") {
-				children = append(children, issue)
-			}
+	for _, issue := range candidates {
+		_, directParentID, depth := types.ParseHierarchicalID(issue.ID)
+		if depth > 0 && directParentID == parentID {
+			children = append(children, issue)
 		}
 	}
 
@@ -529,7 +238,7 @@ func findHierarchicalChildren(ctx context.Context, s storage.Storage, parentID s
 // It first tries to resolve as an ID (via ResolvePartialID).
 // If that fails, it searches for protos with matching titles.
 // Returns the proto ID if found, or an error if not found or ambiguous.
-func resolveProtoIDOrTitle(ctx context.Context, s storage.Storage, input string) (string, error) {
+func resolveProtoIDOrTitle(ctx context.Context, s storage.DoltStorage, input string) (string, error) {
 	// Strategy 1: Try to resolve as an ID
 	protoID, err := utils.ResolvePartialID(ctx, s, input)
 	if err == nil {
@@ -587,197 +296,35 @@ func resolveProtoIDOrTitle(ctx context.Context, s storage.Storage, input string)
 	return "", fmt.Errorf("ambiguous: %q matches %d protos:\n  %s\nUse the ID or a more specific title", input, len(matches), strings.Join(matchNames, "\n  "))
 }
 
-// =============================================================================
-// Daemon-compatible Template Functions
-// =============================================================================
-
-// IssueDetailsFromShow represents the response structure from daemon Show RPC
-type IssueDetailsFromShow struct {
-	types.Issue
-	Labels       []string                              `json:"labels,omitempty"`
-	Dependencies []*types.IssueWithDependencyMetadata `json:"dependencies,omitempty"`
-	Dependents   []*types.IssueWithDependencyMetadata `json:"dependents,omitempty"`
-}
-
-// loadTemplateSubgraphViaDaemon loads a template subgraph using daemon RPC calls
-func loadTemplateSubgraphViaDaemon(client *rpc.Client, templateID string) (*TemplateSubgraph, error) {
-	// Get root issue with dependencies/dependents
-	resp, err := client.Show(&rpc.ShowArgs{ID: templateID})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get template: %w", err)
-	}
-
-	var rootDetails IssueDetailsFromShow
-	if err := json.Unmarshal(resp.Data, &rootDetails); err != nil {
-		return nil, fmt.Errorf("failed to parse template: %w", err)
-	}
-
-	root := &rootDetails.Issue
-	subgraph := &TemplateSubgraph{
-		Root:     root,
-		Issues:   []*types.Issue{root},
-		IssueMap: map[string]*types.Issue{root.ID: root},
-	}
-
-	// Find children from dependents (those with parent-child relationship)
-	// and recursively load them
-	if err := loadDescendantsViaDaemon(client, subgraph, rootDetails.Dependents); err != nil {
-		return nil, err
-	}
-
-	// Now build dependencies list by examining each issue's dependencies
-	// We need to get the dependency records, which Show provides
-	for _, issue := range subgraph.Issues {
-		resp, err := client.Show(&rpc.ShowArgs{ID: issue.ID})
-		if err != nil {
-			continue
-		}
-
-		var details IssueDetailsFromShow
-		if err := json.Unmarshal(resp.Data, &details); err != nil {
-			continue
-		}
-
-		// Dependencies are issues that THIS issue depends on
-		for _, dep := range details.Dependencies {
-			// Only include if the dependency target is also in the subgraph
-			if _, ok := subgraph.IssueMap[dep.Issue.ID]; ok {
-				subgraph.Dependencies = append(subgraph.Dependencies, &types.Dependency{
-					IssueID:     issue.ID,
-					DependsOnID: dep.Issue.ID,
-					Type:        dep.DependencyType,
-				})
-			}
-		}
-	}
-
-	return subgraph, nil
-}
-
-// loadDescendantsViaDaemon recursively loads child issues via daemon RPC
-func loadDescendantsViaDaemon(client *rpc.Client, subgraph *TemplateSubgraph, dependents []*types.IssueWithDependencyMetadata) error {
-	for _, dep := range dependents {
-		// Check if this is a child (parent-child relationship)
-		if dep.DependencyType != types.DepParentChild {
-			continue
-		}
-
-		if _, exists := subgraph.IssueMap[dep.Issue.ID]; exists {
-			continue // Already in subgraph
-		}
-
-		// Add to subgraph
-		issue := &dep.Issue
-		subgraph.Issues = append(subgraph.Issues, issue)
-		subgraph.IssueMap[issue.ID] = issue
-
-		// Get this issue's dependents for recursion
-		resp, err := client.Show(&rpc.ShowArgs{ID: issue.ID})
-		if err != nil {
-			continue
-		}
-
-		var details IssueDetailsFromShow
-		if err := json.Unmarshal(resp.Data, &details); err != nil {
-			continue
-		}
-
-		// Recurse on children
-		if err := loadDescendantsViaDaemon(client, subgraph, details.Dependents); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// cloneSubgraphViaDaemon creates new issues from the template using daemon RPC calls
-func cloneSubgraphViaDaemon(client *rpc.Client, subgraph *TemplateSubgraph, opts CloneOptions) (*InstantiateResult, error) {
-	// Generate new IDs and create mapping
-	idMapping := make(map[string]string)
-
-	// First pass: create all issues with new IDs
-	for _, oldIssue := range subgraph.Issues {
-		// Determine assignee: use override for root epic, otherwise keep template's
-		issueAssignee := oldIssue.Assignee
-		if oldIssue.ID == subgraph.Root.ID && opts.Assignee != "" {
-			issueAssignee = opts.Assignee
-		}
-
-		// Build create args
-		createArgs := &rpc.CreateArgs{
-			Title:              substituteVariables(oldIssue.Title, opts.Vars),
-			Description:        substituteVariables(oldIssue.Description, opts.Vars),
-			IssueType:          string(oldIssue.IssueType),
-			Priority:           oldIssue.Priority,
-			Design:             substituteVariables(oldIssue.Design, opts.Vars),
-			AcceptanceCriteria: substituteVariables(oldIssue.AcceptanceCriteria, opts.Vars),
-			Assignee:           issueAssignee,
-			EstimatedMinutes:   oldIssue.EstimatedMinutes,
-			Ephemeral:               opts.Ephemeral,
-			IDPrefix:           opts.Prefix, // distinct prefixes for mols/wisps
-		}
-
-		// Generate custom ID for dynamic bonding if ParentID is set
-		if opts.ParentID != "" {
-			bondedID, err := generateBondedID(oldIssue.ID, subgraph.Root.ID, opts)
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate bonded ID for %s: %w", oldIssue.ID, err)
-			}
-			createArgs.ID = bondedID
-		}
-
-		resp, err := client.Create(createArgs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create issue from %s: %w", oldIssue.ID, err)
-		}
-
-		// Parse response to get the new issue ID
-		var newIssue types.Issue
-		if err := json.Unmarshal(resp.Data, &newIssue); err != nil {
-			return nil, fmt.Errorf("failed to parse created issue: %w", err)
-		}
-
-		idMapping[oldIssue.ID] = newIssue.ID
-	}
-
-	// Second pass: recreate dependencies with new IDs
-	for _, dep := range subgraph.Dependencies {
-		newFromID, ok1 := idMapping[dep.IssueID]
-		newToID, ok2 := idMapping[dep.DependsOnID]
-		if !ok1 || !ok2 {
-			continue // Skip if either end is outside the subgraph
-		}
-
-		_, err := client.AddDependency(&rpc.DepAddArgs{
-			FromID:  newFromID,
-			ToID:    newToID,
-			DepType: string(dep.Type),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create dependency: %w", err)
-		}
-	}
-
-	return &InstantiateResult{
-		NewEpicID: idMapping[subgraph.Root.ID],
-		IDMapping: idMapping,
-		Created:   len(subgraph.Issues),
-	}, nil
-}
-
-// extractVariables finds all {{variable}} patterns in text
+// extractVariables finds all {{variable}} patterns in text.
+// Handlebars control keywords like "else", "this" are excluded.
 func extractVariables(text string) []string {
 	matches := variablePattern.FindAllStringSubmatch(text, -1)
 	seen := make(map[string]bool)
 	var vars []string
 	for _, match := range matches {
 		if len(match) >= 2 && !seen[match[1]] {
-			vars = append(vars, match[1])
-			seen[match[1]] = true
+			name := match[1]
+			// Skip Handlebars control keywords
+			if isHandlebarsKeyword(name) {
+				continue
+			}
+			vars = append(vars, name)
+			seen[name] = true
 		}
 	}
 	return vars
+}
+
+// isHandlebarsKeyword returns true for Handlebars control keywords
+// that look like variables but aren't (e.g., "else", "this").
+func isHandlebarsKeyword(name string) bool {
+	switch name {
+	case "else", "this", "root", "index", "key", "first", "last":
+		return true
+	default:
+		return false
+	}
 }
 
 // extractAllVariables finds all variables across the entire subgraph
@@ -796,25 +343,27 @@ func extractAllVariables(subgraph *TemplateSubgraph) []string {
 func extractRequiredVariables(subgraph *TemplateSubgraph) []string {
 	allVars := extractAllVariables(subgraph)
 
-	// If no VarDefs, assume all variables are required
-	if subgraph.VarDefs == nil || len(subgraph.VarDefs) == 0 {
+	// If no VarDefs, assume all variables are required (legacy template behavior)
+	if subgraph.VarDefs == nil {
 		return allVars
 	}
 
-	// Filter to only required variables (no default and marked as required, or not defined in VarDefs)
+	// VarDefs exists (from a cooked formula) - only declared variables matter.
+	// Variables in text but NOT in VarDefs are ignored - they're documentation
+	// handlebars meant for LLM agents, not formula input variables (gt-ky9loa).
 	var required []string
 	for _, v := range allVars {
 		def, exists := subgraph.VarDefs[v]
-		// A variable is required if:
-		// 1. It's not defined in VarDefs at all, OR
-		// 2. It's defined with Required=true and no Default, OR
-		// 3. It's defined with no Default (even if Required is false)
 		if !exists {
-			required = append(required, v)
-		} else if def.Default == "" {
+			// Not a declared formula variable - skip (documentation handlebars)
+			continue
+		}
+		// A declared variable is required if it has no default.
+		// nil Default = no default specified (must provide).
+		// Non-nil Default (including &"") = has explicit default (optional).
+		if def.Default == nil {
 			required = append(required, v)
 		}
-		// If exists and has default, it's not required
 	}
 	return required
 }
@@ -831,10 +380,10 @@ func applyVariableDefaults(vars map[string]string, subgraph *TemplateSubgraph) m
 		result[k] = v
 	}
 
-	// Apply defaults for missing variables
+	// Apply defaults for missing variables (including empty-string defaults)
 	for name, def := range subgraph.VarDefs {
-		if _, exists := result[name]; !exists && def.Default != "" {
-			result[name] = def.Default
+		if _, exists := result[name]; !exists && def.Default != nil {
+			result[name] = *def.Default
 		}
 	}
 
@@ -929,20 +478,103 @@ func getRelativeID(oldID, rootID string) string {
 	return ""
 }
 
+// ensureSubgraphCustomTypes scans the template subgraph for issue types
+// that are not built-in and ensures they are registered as custom types
+// in the database. This is needed because formula cooking can produce
+// issues with types like "gate" (for async coordination beads) that are
+// not in the default type whitelist. Without this, cloneSubgraph fails
+// with "invalid issue type" on the first non-built-in bead. (GH#3213)
+func ensureSubgraphCustomTypes(ctx context.Context, s storage.DoltStorage, subgraph *TemplateSubgraph) error {
+	// Collect non-built-in types used by the subgraph.
+	needed := make(map[string]bool)
+	for _, issue := range subgraph.Issues {
+		t := issue.IssueType
+		if t == "" || t.IsValid() {
+			continue
+		}
+		needed[string(t)] = true
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+
+	// Read the current custom types and check which are missing.
+	existing, err := s.GetConfig(ctx, "types.custom")
+	if err != nil {
+		existing = ""
+	}
+	var current []string
+	if existing != "" {
+		// parseTypesValue handles both JSON arrays and comma-separated.
+		// It's in issueops — but we don't import that package here, so
+		// do a simple comma split (good enough for the merge check).
+		for _, t := range strings.Split(strings.Trim(existing, "[] \""), ",") {
+			t = strings.Trim(t, " \"")
+			if t != "" {
+				current = append(current, t)
+			}
+		}
+	}
+	currentSet := make(map[string]bool, len(current))
+	for _, t := range current {
+		currentSet[t] = true
+	}
+
+	var toAdd []string
+	for t := range needed {
+		if !currentSet[t] {
+			toAdd = append(toAdd, t)
+		}
+	}
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	// Merge and write back. SetConfig triggers SyncCustomTypesTable
+	// which populates the normalized custom_types table used by
+	// PrepareIssueForInsert → ValidateWithCustom.
+	merged := append(current, toAdd...)
+	// Serialize as JSON array for consistency with bd config set.
+	var buf strings.Builder
+	buf.WriteString("[")
+	for i, t := range merged {
+		if i > 0 {
+			buf.WriteString(",")
+		}
+		buf.WriteString("\"")
+		buf.WriteString(t)
+		buf.WriteString("\"")
+	}
+	buf.WriteString("]")
+	return s.SetConfig(ctx, "types.custom", buf.String())
+}
+
 // cloneSubgraph creates new issues from the template with variable substitution.
 // Uses CloneOptions to control all spawn/bond behavior including dynamic bonding.
-func cloneSubgraph(ctx context.Context, s storage.Storage, subgraph *TemplateSubgraph, opts CloneOptions) (*InstantiateResult, error) {
+func cloneSubgraph(ctx context.Context, s storage.DoltStorage, subgraph *TemplateSubgraph, opts CloneOptions) (*InstantiateResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
+	}
+
+	// Auto-register any non-built-in issue types used by the subgraph
+	// so that formula-generated beads (e.g., type "gate" for async
+	// coordination) pass type validation without requiring the operator
+	// to run `bd config set types.custom` manually first. See GH#3213.
+	if err := ensureSubgraphCustomTypes(ctx, s, subgraph); err != nil {
+		return nil, fmt.Errorf("registering custom types for subgraph: %w", err)
 	}
 
 	// Generate new IDs and create mapping
 	idMapping := make(map[string]string)
 
 	// Use transaction for atomicity
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	err := transact(ctx, s, "bd: clone template subgraph", func(tx storage.Transaction) error {
 		// First pass: create all issues with new IDs
 		for _, oldIssue := range subgraph.Issues {
+			// RootOnly: skip child issues, only create the root
+			if opts.RootOnly && oldIssue.ID != subgraph.Root.ID {
+				continue
+			}
 			// Determine assignee: use override for root epic, otherwise keep template's
 			issueAssignee := oldIssue.Assignee
 			if oldIssue.ID == subgraph.Root.ID && opts.Assignee != "" {
@@ -962,11 +594,13 @@ func cloneSubgraph(ctx context.Context, s storage.Storage, subgraph *TemplateSub
 				Assignee:           issueAssignee,
 				EstimatedMinutes:   oldIssue.EstimatedMinutes,
 				Ephemeral:          opts.Ephemeral, // mark for cleanup when closed
-				IDPrefix:           opts.Prefix,   // distinct prefixes for mols/wisps
+				IDPrefix:           opts.Prefix,    // distinct prefixes for mols/wisps
 				// Gate fields (for async coordination)
 				AwaitType: oldIssue.AwaitType,
 				AwaitID:   substituteVariables(oldIssue.AwaitID, opts.Vars),
 				Timeout:   oldIssue.Timeout,
+				Labels:    oldIssue.Labels,
+				Metadata:  oldIssue.Metadata,
 				CreatedAt: time.Now(),
 				UpdatedAt: time.Now(),
 			}
@@ -1005,6 +639,19 @@ func cloneSubgraph(ctx context.Context, s storage.Storage, subgraph *TemplateSub
 			}
 		}
 
+		// Atomic attachment: link spawned root to target molecule within
+		// the same transaction (bd-wvplu: prevents orphaned spawns)
+		if opts.AttachToID != "" {
+			attachDep := &types.Dependency{
+				IssueID:     idMapping[subgraph.Root.ID],
+				DependsOnID: opts.AttachToID,
+				Type:        opts.AttachDepType,
+			}
+			if err := tx.AddDependency(ctx, attachDep, opts.Actor); err != nil {
+				return fmt.Errorf("attaching to molecule: %w", err)
+			}
+		}
+
 		return nil
 	})
 
@@ -1015,17 +662,25 @@ func cloneSubgraph(ctx context.Context, s storage.Storage, subgraph *TemplateSub
 	return &InstantiateResult{
 		NewEpicID: idMapping[subgraph.Root.ID],
 		IDMapping: idMapping,
-		Created:   len(subgraph.Issues),
+		Created:   len(idMapping),
 	}, nil
 }
 
-// printTemplateTree prints the template structure as a tree
+// printTemplateTree prints the template structure as a tree.
+// Uses a visited set to detect cycles (GH#2719) and avoid infinite recursion.
 func printTemplateTree(subgraph *TemplateSubgraph, parentID string, depth int, isRoot bool) {
+	visited := make(map[string]bool)
+	printTemplateTreeVisited(subgraph, parentID, depth, isRoot, visited)
+}
+
+// printTemplateTreeVisited is the internal recursive implementation with cycle tracking.
+func printTemplateTreeVisited(subgraph *TemplateSubgraph, parentID string, depth int, isRoot bool, visited map[string]bool) {
 	indent := strings.Repeat("  ", depth)
 
 	// Print root
 	if isRoot {
 		fmt.Printf("%s   %s (root)\n", indent, subgraph.Root.Title)
+		visited[parentID] = true
 	}
 
 	// Find children of this parent
@@ -1049,7 +704,14 @@ func printTemplateTree(subgraph *TemplateSubgraph, parentID string, depth int, i
 		if len(vars) > 0 {
 			varStr = fmt.Sprintf(" [%s]", strings.Join(vars, ", "))
 		}
+
+		// Cycle detection (GH#2719)
+		if visited[child.ID] {
+			fmt.Printf("%s   %s %s%s (cycle detected, skipping)\n", indent, connector, child.Title, varStr)
+			continue
+		}
 		fmt.Printf("%s   %s %s%s\n", indent, connector, child.Title, varStr)
-		printTemplateTree(subgraph, child.ID, depth+1, false)
+		visited[child.ID] = true
+		printTemplateTreeVisited(subgraph, child.ID, depth+1, false, visited)
 	}
 }

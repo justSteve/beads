@@ -1,262 +1,204 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/importer"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
-// fieldComparator handles comparison logic for a specific field type
-type fieldComparator struct {
-	// Helper to safely extract string from interface (handles string and *string)
-	strFrom func(v interface{}) (string, bool)
-	// Helper to safely extract int from interface
-	intFrom func(v interface{}) (int64, bool)
-}
-
-func newFieldComparator() *fieldComparator {
-	fc := &fieldComparator{}
-	
-	fc.strFrom = func(v interface{}) (string, bool) {
-		switch t := v.(type) {
-		case string:
-			return t, true
-		case *string:
-			if t == nil {
-				return "", true
-			}
-			return *t, true
-		case nil:
-			return "", true
-		default:
-			return "", false
-		}
-	}
-	
-	fc.intFrom = func(v interface{}) (int64, bool) {
-		switch t := v.(type) {
-		case int:
-			return int64(t), true
-		case int32:
-			return int64(t), true
-		case int64:
-			return t, true
-		case float64:
-			// Only accept whole numbers
-			if t == float64(int64(t)) {
-				return int64(t), true
-			}
-			return 0, false
-		default:
-			return 0, false
-		}
-	}
-	
-	return fc
-}
-
-// equalStr compares string field (treats empty and nil as equal)
-func (fc *fieldComparator) equalStr(existingVal string, newVal interface{}) bool {
-	s, ok := fc.strFrom(newVal)
-	if !ok {
-		return false // Type mismatch means changed
-	}
-	return existingVal == s
-}
-
-// equalPtrStr compares *string field (treats empty and nil as equal)
-func (fc *fieldComparator) equalPtrStr(existing *string, newVal interface{}) bool {
-	s, ok := fc.strFrom(newVal)
-	if !ok {
-		return false // Type mismatch means changed
-	}
-	if existing == nil {
-		return s == ""
-	}
-	return *existing == s
-}
-
-// equalStatus compares Status field
-func (fc *fieldComparator) equalStatus(existing types.Status, newVal interface{}) bool {
-	switch t := newVal.(type) {
-	case types.Status:
-		return existing == t
-	case string:
-		return string(existing) == t
-	default:
-		return false // Unknown type means changed
-	}
-}
-
-// equalIssueType compares IssueType field
-func (fc *fieldComparator) equalIssueType(existing types.IssueType, newVal interface{}) bool {
-	switch t := newVal.(type) {
-	case types.IssueType:
-		return existing == t
-	case string:
-		return string(existing) == t
-	default:
-		return false // Unknown type means changed
-	}
-}
-
-// equalPriority compares priority field
-func (fc *fieldComparator) equalPriority(existing int, newVal interface{}) bool {
-	p, ok := fc.intFrom(newVal)
-	if !ok {
-		return false
-	}
-	return existing == int(p)
-}
-
-// checkFieldChanged checks if a specific field has changed
-func (fc *fieldComparator) checkFieldChanged(key string, existing *types.Issue, newVal interface{}) bool {
-	switch key {
-	case "title":
-		return !fc.equalStr(existing.Title, newVal)
-	case "description":
-		return !fc.equalStr(existing.Description, newVal)
-	case "status":
-		return !fc.equalStatus(existing.Status, newVal)
-	case "priority":
-		return !fc.equalPriority(existing.Priority, newVal)
-	case "issue_type":
-		return !fc.equalIssueType(existing.IssueType, newVal)
-	case "design":
-		return !fc.equalStr(existing.Design, newVal)
-	case "acceptance_criteria":
-		return !fc.equalStr(existing.AcceptanceCriteria, newVal)
-	case "notes":
-		return !fc.equalStr(existing.Notes, newVal)
-	case "assignee":
-		return !fc.equalStr(existing.Assignee, newVal)
-	case "external_ref":
-		return !fc.equalPtrStr(existing.ExternalRef, newVal)
-	default:
-		// Unknown field - treat as changed to be conservative
-		// This prevents skipping updates when new fields are added
-		return true
-	}
-}
-
-// issueDataChanged checks if any fields in the updates map differ from the existing issue
-// Returns true if any field changed, false if all fields match
-func issueDataChanged(existing *types.Issue, updates map[string]interface{}) bool {
-	fc := newFieldComparator()
-	
-	// Check each field in updates map
-	for key, newVal := range updates {
-		if fc.checkFieldChanged(key, existing, newVal) {
-			return true
-		}
-	}
-	
-	return false // No changes detected
-}
-
-// ImportOptions configures how the import behaves
+// ImportOptions configures import behavior.
 type ImportOptions struct {
-	DryRun                     bool              // Preview changes without applying them
-	SkipUpdate                 bool              // Skip updating existing issues (create-only mode)
-	Strict                     bool              // Fail on any error (dependencies, labels, etc.)
-	RenameOnImport             bool              // Rename imported issues to match database prefix
-	SkipPrefixValidation       bool              // Skip prefix validation (for auto-import)
-	ClearDuplicateExternalRefs bool              // Clear duplicate external_ref values instead of erroring
-	OrphanHandling             string            // Orphan handling mode: strict/resurrect/skip/allow (empty = use config)
-	ProtectLocalExportIDs      map[string]time.Time // IDs from left snapshot with timestamps for timestamp-aware protection (GH#865)
-	DeletionIDs                []string          // IDs to delete (from JSONL deletion markers)
+	DryRun                     bool
+	SkipUpdate                 bool
+	Strict                     bool
+	RenameOnImport             bool
+	ClearDuplicateExternalRefs bool
+	OrphanHandling             string
+	DeletionIDs                []string
+	SkipPrefixValidation       bool
+	ProtectLocalExportIDs      map[string]time.Time
 }
 
-// ImportResult contains statistics about the import operation
+// ImportResult describes what an import operation did.
 type ImportResult struct {
-	Created             int               // New issues created
-	Updated             int               // Existing issues updated
-	Unchanged           int               // Existing issues that matched exactly (idempotent)
-	Skipped             int               // Issues skipped (duplicates, errors)
-	Deleted             int               // Issues deleted (from deletion markers)
-	Collisions          int               // Collisions detected
-	IDMapping           map[string]string // Mapping of remapped IDs (old -> new)
-	CollisionIDs        []string          // IDs that collided
-	PrefixMismatch      bool              // Prefix mismatch detected
-	ExpectedPrefix      string            // Database configured prefix
-	MismatchPrefixes    map[string]int    // Map of mismatched prefixes to count
-	SkippedDependencies []string          // Dependencies skipped due to FK constraint violations
+	Created             int
+	Updated             int
+	Unchanged           int
+	Skipped             int
+	Deleted             int
+	Collisions          int
+	IDMapping           map[string]string
+	CollisionIDs        []string
+	PrefixMismatch      bool
+	ExpectedPrefix      string
+	MismatchPrefixes    map[string]int
+	SkippedDependencies []string
 }
 
-// importIssuesCore handles the core import logic used by both manual and auto-import.
-// This function:
-// - Opens a direct SQLite connection if needed (daemon mode)
-// - Detects and handles collisions
-// - Imports issues, dependencies, and labels
-// - Returns detailed results
-//
-// The caller is responsible for:
-// - Reading and parsing JSONL into issues slice
-// - Displaying results to the user
-// - Setting metadata (e.g., last_import_hash)
-func importIssuesCore(ctx context.Context, dbPath string, store storage.Storage, issues []*types.Issue, opts ImportOptions) (*ImportResult, error) {
-	// Determine orphan handling: flag > config > default (allow)
-	orphanHandling := opts.OrphanHandling
-	if orphanHandling == "" && store != nil {
-		// Read from config if flag not specified
-		configValue, err := store.GetConfig(ctx, "import.missing_parents")
-		if err == nil && configValue != "" {
-			orphanHandling = configValue
-		} else {
-			// Default to allow (most permissive)
-			orphanHandling = "allow"
-		}
-	} else if orphanHandling == "" {
-		// No store available, default to allow
-		orphanHandling = "allow"
-	}
-	
-	// Convert ImportOptions to importer.Options
-	importerOpts := importer.Options{
-		DryRun:                     opts.DryRun,
-		SkipUpdate:                 opts.SkipUpdate,
-		Strict:                     opts.Strict,
-		RenameOnImport:             opts.RenameOnImport,
-		SkipPrefixValidation:       opts.SkipPrefixValidation,
-		ClearDuplicateExternalRefs: opts.ClearDuplicateExternalRefs,
-		OrphanHandling:             importer.OrphanHandling(orphanHandling),
-		ProtectLocalExportIDs:      opts.ProtectLocalExportIDs,
-		DeletionIDs:                opts.DeletionIDs,
+// importIssuesCore imports issues into the Dolt store.
+// This is a bridge function that delegates to the Dolt store's batch creation.
+func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, issues []*types.Issue, opts ImportOptions) (*ImportResult, error) {
+	if opts.DryRun || len(issues) == 0 {
+		return &ImportResult{Skipped: len(issues)}, nil
 	}
 
-	// Delegate to the importer package
-	result, err := importer.ImportIssues(ctx, dbPath, store, issues, importerOpts)
+	err := store.CreateIssuesWithFullOptions(ctx, issues, getActorWithGit(), storage.BatchCreateOptions{
+		OrphanHandling:       storage.OrphanAllow,
+		SkipPrefixValidation: opts.SkipPrefixValidation,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert importer.Result to ImportResult
-	return &ImportResult{
-		Created:             result.Created,
-		Updated:             result.Updated,
-		Unchanged:           result.Unchanged,
-		Skipped:             result.Skipped,
-		Deleted:             result.Deleted,
-		Collisions:          result.Collisions,
-		IDMapping:           result.IDMapping,
-		CollisionIDs:        result.CollisionIDs,
-		PrefixMismatch:      result.PrefixMismatch,
-		ExpectedPrefix:      result.ExpectedPrefix,
-		MismatchPrefixes:    result.MismatchPrefixes,
-		SkippedDependencies: result.SkippedDependencies,
-	}, nil
+	return &ImportResult{Created: len(issues)}, nil
 }
 
+// importLocalResult holds counts from a local JSONL import.
+type importLocalResult struct {
+	Issues   int
+	Memories int
+}
 
-// isNumeric returns true if the string contains only digits
-func isNumeric(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
+// memoryRecord represents a memory entry in the JSONL export.
+type memoryRecord struct {
+	Type  string `json:"_type"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// importFromLocalJSONL imports issues (and memories) from a local JSONL file on disk
+// into the Dolt store. Returns the number of issues imported and any error.
+// This is a convenience wrapper around importFromLocalJSONLFull.
+func importFromLocalJSONL(ctx context.Context, store storage.DoltStorage, localPath string) (int, error) {
+	result, err := importFromLocalJSONLFull(ctx, store, localPath)
+	if err != nil {
+		return 0, err
 	}
-	return true
+	return result.Issues, nil
+}
+
+// parseJSONLFile reads a JSONL file and returns parsed issues and config
+// entries (memories). Pure function — no store I/O.
+func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
+	//nolint:gosec // G304: path from user-provided CLI argument
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read JSONL file %s: %w", path, err)
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	// Allow up to 64MB per line for large descriptions
+	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+	var issues []*types.Issue
+	configEntries := make(map[string]string)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		// Peek at the record to check for _type field
+		var peek map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &peek); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse JSONL line: %w", err)
+		}
+
+		// Check if this is a memory record
+		if rawType, ok := peek["_type"]; ok {
+			var typeStr string
+			if err := json.Unmarshal(rawType, &typeStr); err == nil && typeStr == "memory" {
+				var mem memoryRecord
+				if err := json.Unmarshal([]byte(line), &mem); err != nil {
+					return nil, nil, fmt.Errorf("failed to parse memory record: %w", err)
+				}
+				if mem.Key != "" && mem.Value != "" {
+					configEntries[kvPrefix+memoryPrefix+mem.Key] = mem.Value
+				}
+				continue
+			}
+		}
+
+		// Regular issue record
+		var issue types.Issue
+		if err := json.Unmarshal([]byte(line), &issue); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse issue from JSONL: %w", err)
+		}
+		// Skip tombstone entries: these are deleted issues exported by older
+		// versions (pre-v0.50) with status "tombstone" and deleted_at set.
+		// They are not valid for re-import since "tombstone" is not a real status.
+		if issue.Status == "tombstone" {
+			continue
+		}
+
+		// v0.35–v0.37 exported "wisp" (bool), renamed to "ephemeral" in v0.38+.
+		// map old field name so the flag is preserved on import.
+		if _, hasWisp := peek["wisp"]; hasWisp && !issue.Ephemeral {
+			var wisp bool
+			if err := json.Unmarshal(peek["wisp"], &wisp); err == nil && wisp {
+				issue.Ephemeral = true
+			}
+		}
+
+		issue.SetDefaults()
+		issues = append(issues, &issue)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("failed to scan JSONL: %w", err)
+	}
+
+	return issues, configEntries, nil
+}
+
+// importFromLocalJSONLFull imports issues and memories from a local JSONL file.
+// It detects memory records (lines with "_type":"memory") and imports them
+// via SetConfig, while routing regular issue records through the normal path.
+func importFromLocalJSONLFull(ctx context.Context, store storage.DoltStorage, localPath string) (*importLocalResult, error) {
+	issues, configEntries, err := parseJSONLFile(localPath)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &importLocalResult{}
+
+	// Import memories
+	for key, value := range configEntries {
+		if err := store.SetConfig(ctx, key, value); err != nil {
+			return nil, fmt.Errorf("failed to import config %q: %w", key, err)
+		}
+		result.Memories++
+	}
+
+	// Import issues
+	if len(issues) > 0 {
+		// Auto-detect prefix from first issue if not already configured
+		configuredPrefix, err := store.GetConfig(ctx, "issue_prefix")
+		if err == nil && strings.TrimSpace(configuredPrefix) == "" {
+			firstPrefix := utils.ExtractIssuePrefix(issues[0].ID)
+			if firstPrefix != "" {
+				if err := store.SetConfig(ctx, "issue_prefix", firstPrefix); err != nil {
+					return nil, fmt.Errorf("failed to set issue_prefix from imported issues: %w", err)
+				}
+			}
+		}
+
+		opts := ImportOptions{
+			SkipPrefixValidation: true,
+		}
+		_, err = importIssuesCore(ctx, "", store, issues, opts)
+		if err != nil {
+			return nil, err
+		}
+		result.Issues = len(issues)
+	}
+
+	return result, nil
 }

@@ -4,13 +4,15 @@
 // This package exports only the essential types and functions needed for
 // Go-based extensions that want to use bd's storage layer programmatically.
 //
-// For detailed guidance on extending bd, see docs/EXTENDING.md.
+// For a working extension example, see examples/bd-example-extension-go.
 package beads
 
 import (
 	"context"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -21,21 +23,53 @@ type Storage = beads.Storage
 // Use Storage.RunInTransaction() to obtain a Transaction instance.
 type Transaction = beads.Transaction
 
-// NewSQLiteStorage creates a new SQLite storage instance at the given path.
-// This function explicitly uses SQLite regardless of configuration.
+// RemoteStore provides dolt remote management and replication operations.
+// Use type assertion on a Storage value to access these methods:
 //
-// Note: This bypasses backend configuration. If your .beads directory is
-// configured to use Dolt, this will still open SQLite (and likely fail or
-// access wrong data). For most use cases, callers should use storage/factory
-// package to respect backend configuration.
-func NewSQLiteStorage(ctx context.Context, dbPath string) (Storage, error) {
-	return beads.NewSQLiteStorage(ctx, dbPath)
+//	if rs, ok := store.(beads.RemoteStore); ok {
+//	    rs.Push(ctx)
+//	}
+type RemoteStore = storage.RemoteStore
+
+// SyncStore provides high-level sync operations with peers.
+type SyncStore = storage.SyncStore
+
+// VersionControlReader provides read-only version control operations.
+// Write operations (Branch, Checkout, Merge, DeleteBranch) are not yet
+// part of the public API. If you need them, please open an issue.
+type VersionControlReader interface {
+	CurrentBranch(ctx context.Context) (string, error)
+	ListBranches(ctx context.Context) ([]string, error)
+	CommitExists(ctx context.Context, commitHash string) (bool, error)
+	GetCurrentCommit(ctx context.Context) (string, error)
+	Status(ctx context.Context) (*VCStatus, error)
+	Log(ctx context.Context, limit int) ([]CommitInfo, error)
 }
 
-// GetConfiguredBackend returns the backend type from the beads directory config.
-// Returns "sqlite" if no config exists or backend is not specified.
-func GetConfiguredBackend(beadsDir string) string {
-	return beads.GetConfiguredBackend(beadsDir)
+// Replication and version control types from internal/storage
+type (
+	RemoteInfo  = storage.RemoteInfo
+	SyncResult  = storage.SyncResult
+	SyncStatus  = storage.SyncStatus
+	Conflict    = storage.Conflict
+	CommitInfo  = storage.CommitInfo
+	VCStatus    = storage.Status
+	StatusEntry = storage.StatusEntry
+)
+
+// Open opens a Dolt-backed beads database at the given path.
+// This always opens in embedded mode. Use OpenFromConfig to respect
+// server mode settings from metadata.json.
+func Open(ctx context.Context, dbPath string) (Storage, error) {
+	return dolt.New(ctx, &dolt.Config{Path: dbPath, CreateIfMissing: true})
+}
+
+// OpenFromConfig opens a beads database using configuration from metadata.json.
+// Unlike Open, this respects Dolt server mode settings and database name
+// configuration, connecting to the Dolt SQL server when dolt_mode is "server".
+// beadsDir is the path to the .beads directory.
+func OpenFromConfig(ctx context.Context, beadsDir string) (Storage, error) {
+	return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{CreateIfMissing: true})
 }
 
 // FindDatabasePath finds the beads database in the current directory tree
@@ -43,15 +77,10 @@ func FindDatabasePath() string {
 	return beads.FindDatabasePath()
 }
 
-// FindBeadsDir finds the .beads/ directory in the current directory tree
-// Returns empty string if not found. Supports both database and JSONL-only mode.
+// FindBeadsDir finds the .beads/ directory in the current directory tree.
+// Returns empty string if not found.
 func FindBeadsDir() string {
 	return beads.FindBeadsDir()
-}
-
-// FindJSONLPath finds the JSONL file corresponding to a database path
-func FindJSONLPath(dbPath string) string {
-	return beads.FindJSONLPath(dbPath)
 }
 
 // DatabaseInfo contains information about a beads database
@@ -73,24 +102,26 @@ func GetRedirectInfo() RedirectInfo {
 
 // Core types from internal/types
 type (
-	Issue              = types.Issue
-	Status             = types.Status
-	IssueType          = types.IssueType
-	Dependency         = types.Dependency
-	DependencyType     = types.DependencyType
-	Label              = types.Label
-	Comment            = types.Comment
-	Event              = types.Event
-	EventType          = types.EventType
-	BlockedIssue       = types.BlockedIssue
-	TreeNode           = types.TreeNode
-	IssueFilter        = types.IssueFilter
-	WorkFilter         = types.WorkFilter
-	StaleFilter        = types.StaleFilter
-	DependencyCounts   = types.DependencyCounts
-	IssueWithCounts    = types.IssueWithCounts
-	SortPolicy         = types.SortPolicy
-	EpicStatus         = types.EpicStatus
+	Issue                       = types.Issue
+	Status                      = types.Status
+	IssueType                   = types.IssueType
+	Dependency                  = types.Dependency
+	DependencyType              = types.DependencyType
+	Label                       = types.Label
+	Comment                     = types.Comment
+	Event                       = types.Event
+	EventType                   = types.EventType
+	BlockedIssue                = types.BlockedIssue
+	TreeNode                    = types.TreeNode
+	IssueFilter                 = types.IssueFilter
+	WorkFilter                  = types.WorkFilter
+	StaleFilter                 = types.StaleFilter
+	DependencyCounts            = types.DependencyCounts
+	IssueWithCounts             = types.IssueWithCounts
+	IssueWithDependencyMetadata = types.IssueWithDependencyMetadata
+	SortPolicy                  = types.SortPolicy
+	EpicStatus                  = types.EpicStatus
+	WispFilter                  = types.WispFilter
 )
 
 // Status constants

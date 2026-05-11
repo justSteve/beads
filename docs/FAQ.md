@@ -6,7 +6,7 @@ Common questions about bd (beads) and how to use it effectively.
 
 ### What is bd?
 
-bd is a lightweight, git-based issue tracker designed for AI coding agents. It provides dependency-aware task management with automatic sync across machines via git.
+bd is a lightweight, Dolt-powered issue tracker designed for AI coding agents. It provides dependency-aware task management with built-in sync across machines, so agents and humans can collaborate from the same task graph.
 
 ### Why not just use GitHub Issues?
 
@@ -22,7 +22,7 @@ GitHub Issues + gh CLI can approximate some features, but fundamentally cannot r
    - bd: `bd ready` computes transitive blocking offline in ~10ms, no network required
    - GH: No built-in "ready" concept; would require custom GraphQL + sync service + ongoing maintenance
 
-3. **Git-First, Offline, Branch-Scoped Task Memory**
+3. **Offline-First, Branch-Scoped Task Memory**
    - bd: Works offline, issues live on branches, hash IDs prevent collisions on merge
    - GH: Cloud-first, requires network/auth, global per-repo, no branch-scoped task state
 
@@ -30,17 +30,17 @@ GitHub Issues + gh CLI can approximate some features, but fundamentally cannot r
    - bd: Automatic collision resolution, duplicate merge with dependency consolidation and reference rewriting
    - GH: Manual close-as-duplicate, no safe bulk merge, no cross-reference updates
 
-5. **Extensible Local Database**
-   - bd: Add SQL tables and join with issue data locally (see [EXTENDING.md](EXTENDING.md))
+5. **Version-Controlled SQL Database**
+   - bd: Full SQL queries against local Dolt database with native version control
    - GH: No local database; would need to mirror data externally
 
 6. **Agent-Native APIs**
    - bd: Consistent `--json` on all commands, dedicated MCP server with auto workspace detection
    - GH: Mixed JSON/text output, GraphQL requires custom queries, no agent-focused MCP layer
 
-**When to use each:** GitHub Issues excels for human teams in web UI with cross-repo dashboards and integrations. bd excels for AI agents needing offline, git-synchronized task memory with graph semantics and deterministic queries.
+**When to use each:** GitHub Issues excels for human teams in web UI with cross-repo dashboards and integrations. bd excels for AI agents needing offline, version-controlled task memory with graph semantics and deterministic queries.
 
-See [GitHub issue #125](https://github.com/steveyegge/beads/issues/125) for detailed comparison.
+See [GitHub issue #125](https://github.com/gastownhall/beads/issues/125) for detailed comparison.
 
 ### How is this different from Taskwarrior?
 
@@ -48,9 +48,9 @@ Taskwarrior is excellent for personal task management, but bd is built for AI ag
 
 - **Explicit agent semantics**: `discovered-from` dependency type, `bd ready` for queue management
 - **JSON-first design**: Every command has `--json` output
-- **Git-native sync**: No sync server setup required
-- **Merge-friendly JSONL**: One issue per line, AI-resolvable conflicts
-- **Extensible SQLite**: Add your own tables without forking
+- **Built-in sync**: Version-controlled storage with native push/pull, no separate sync server to run
+- **Dolt merge**: Cell-level merge with AI-resolvable conflicts
+- **SQL database**: Full SQL queries against Dolt database
 
 ### Can I use bd without AI agents?
 
@@ -58,15 +58,14 @@ Absolutely! bd is a great CLI issue tracker for humans too. The `bd ready` comma
 
 ### Is this production-ready?
 
-**Current status: Alpha (v0.9.11)**
+**Current status: Active development with 1.x releases**
 
-bd is in active development and being dogfooded on real projects. The core functionality (create, update, dependencies, ready work, collision resolution) is stable and well-tested. However:
+bd is in active development and being dogfooded on real projects. The core functionality (create, update, dependencies, ready work, Dolt-backed sync) is stable and well-tested. However:
 
-- ⚠️ **Alpha software** - No 1.0 release yet
-- ⚠️ **API may change** - Command flags and JSONL format may evolve before 1.0
-- ✅ **Safe for development** - Use for development/internal projects
-- ✅ **Data is portable** - JSONL format is human-readable and easy to migrate
-- 📈 **Rapid iteration** - Expect frequent updates and improvements
+- **CLI/API changes still happen** - command flags and data formats can evolve
+- **Safe for development/internal projects** - use normal backup and sync hygiene
+- **Data is portable** - `bd export` produces human-readable JSONL for migration
+- **Rapid iteration** - expect frequent updates and improvements
 
 **When to use bd:**
 - ✅ AI-assisted development workflows
@@ -75,11 +74,11 @@ bd is in active development and being dogfooded on real projects. The core funct
 - ✅ Experimenting with agent-first tools
 
 **When to wait:**
-- ❌ Mission-critical production systems (wait for 1.0)
-- ❌ Large enterprise deployments (wait for stability guarantees)
-- ❌ Long-term archival (though JSONL makes migration easy)
+- Mission-critical production systems without a tested backup/restore plan
+- Large enterprise deployments that need formal compatibility guarantees
+- Long-term archival as the only system of record
 
-Follow the repo for updates and the path to 1.0!
+Follow the repo for updates and compatibility notes.
 
 ## Usage Questions
 
@@ -170,11 +169,11 @@ bd init --quiet  # Non-interactive - auto-installs hooks, no prompts
 # Clone existing project with bd:
 git clone <repo>
 cd <repo>
-bd init  # Auto-imports from .beads/issues.jsonl
+bd init  # Creates Dolt database, pulls from remote if configured
 
 # Or initialize new project:
 cd ~/my-project
-bd init  # Creates .beads/, sets up daemon
+bd init  # Creates .beads/, sets up Dolt database
 git add .beads/
 git commit -m "Initialize beads"
 ```
@@ -189,37 +188,31 @@ bd ready --json  # Start using bd normally
 
 ### Do I need to run export/import manually?
 
-**No! Sync is automatic by default.**
+**No! Dolt handles storage and versioning natively.**
 
-bd automatically:
-- **Exports** to JSONL after CRUD operations (5-second debounce)
-- **Imports** from JSONL when it's newer than DB (e.g., after `git pull`)
-
-**How auto-import works:** The first bd command after `git pull` detects that `.beads/issues.jsonl` is newer than the database and automatically imports it. There's no background daemon watching for changes - the check happens when you run a bd command.
-
-**Optional**: For immediate export (no 5-second wait) and guaranteed import after git operations, install the git hooks:
-```bash
-bd hooks install
-```
-
-**Disable auto-sync** if needed:
-```bash
-bd --no-auto-flush create "Issue"   # Disable auto-export
-bd --no-auto-import list            # Disable auto-import check
-```
-
-### What if my database feels stale after git pull?
-
-Just run any bd command - it will auto-import:
+All writes go directly to the Dolt database and are automatically committed to Dolt history. To sync with Dolt remotes:
 
 ```bash
-git pull
-bd ready     # Automatically imports fresh data from git
-bd list      # Also triggers auto-import if needed
-bd sync      # Explicit sync command for manual control
+bd init --remote http://myserver:7007/mydb  # Configure remote during first init
+bd dolt push    # Push changes to Dolt remote
+bd dolt pull    # Pull changes from Dolt remote
 ```
 
-The auto-import check is fast (<5ms) and only imports when the JSONL file is newer than the database. If you want guaranteed immediate sync without waiting for the next command, use the git hooks (see `examples/git-hooks/`).
+The `bd export` command exists for issue portability and interchange. For backup and restore, use `bd backup init <path>` / `bd backup sync` to push Dolt-native backups, and `bd backup restore <path>` to restore from them. None of these are needed for day-to-day Dolt sync.
+
+### What if my database feels stale after a colleague pushes changes?
+
+Pull from the Dolt remote:
+
+```bash
+bd dolt pull    # Fetch and merge updates from Dolt remote
+bd ready        # Shows fresh data
+```
+
+For federation setups, use:
+```bash
+bd federation sync    # Sync with all configured peers
+```
 
 ### Can I track issues for multiple projects?
 
@@ -230,48 +223,56 @@ cd ~/project1 && bd init --prefix proj1
 cd ~/project2 && bd init --prefix proj2
 ```
 
-Each project gets its own `.beads/` directory with its own database and JSONL file. bd auto-discovers the correct database based on your current directory (walks up like git).
+Each project gets its own `.beads/` directory with its own Dolt database. bd auto-discovers the correct database based on your current directory (walks up like git).
 
 **Multi-project scenarios work seamlessly:**
-- Multiple agents working on different projects simultaneously → No conflicts
-- Same machine, different repos → Each finds its own `.beads/*.db` automatically
-- Agents in subdirectories → bd walks up to find the project root (like git)
-- **Per-project daemons** → Each project gets its own daemon at `.beads/bd.sock` (LSP model)
+- Multiple agents working on different projects simultaneously - no conflicts
+- Same machine, different repos - each finds its own `.beads/` automatically
+- Agents in subdirectories - bd walks up to find the project root (like git)
+- **Per-project Dolt servers** (default) - each project gets its own Dolt server
+- **Shared Dolt server** (opt-in) - all projects share a single server for reduced resource usage
 
 **Limitation:** Issues cannot reference issues in other projects. Each database is isolated by design. If you need cross-project tracking, initialize bd in a parent directory that contains both projects.
 
 **Example:** Multiple agents, multiple projects, same machine:
 ```bash
 # Agent 1 working on web app
-cd ~/work/webapp && bd ready --json    # Uses ~/work/webapp/.beads/webapp.db
+cd ~/work/webapp && bd ready --json    # Uses ~/work/webapp/.beads/ database "webapp"
 
 # Agent 2 working on API
-cd ~/work/api && bd ready --json       # Uses ~/work/api/.beads/api.db
+cd ~/work/api && bd ready --json       # Uses ~/work/api/.beads/ database "api"
 
-# No conflicts! Completely isolated databases and daemons.
+# No conflicts! Completely isolated databases.
 ```
 
-**Architecture:** bd uses per-project daemons (like LSP/language servers) for complete database isolation. See [ADVANCED.md#architecture-daemon-vs-mcp-vs-beads](ADVANCED.md#architecture-daemon-vs-mcp-vs-beads).
+**Shared server mode** (recommended for machines with 2+ projects):
+```bash
+# Enable shared server - single Dolt process serves all projects
+export BEADS_DOLT_SHARED_SERVER=1   # add to shell profile for machine-wide
+# Or per-project: bd dolt set shared-server true
+```
+
+**Architecture:** By default, bd uses per-project Dolt servers (like LSP/language servers). With shared server mode enabled, a single server at `~/.beads/shared-server/` handles all projects, each using its own database. See [DOLT.md](DOLT.md) for details.
 
 ### What happens if two agents work on the same issue?
 
-The last agent to export/commit wins. This is the same as any git-based workflow. To prevent conflicts:
+With Dolt server mode, concurrent writes are handled natively. For distributed setups, Dolt's cell-level merge resolves most conflicts automatically. To prevent conflicts:
 
-- Have agents claim work with `bd update <id> --status in_progress`
+- Have agents claim work with `bd update <id> --claim`
 - Query by assignee: `bd ready --assignee agent-name`
 - Review git diffs before merging
 
-For true multi-agent coordination, you'd need additional tooling (like locks or a coordination server). bd handles the simpler case: multiple humans/agents working on different tasks, syncing via git.
+For true multi-agent coordination, use Dolt server mode (`bd dolt start`) which supports concurrent writes natively. For distributed setups, use Dolt federation for peer-to-peer sync.
 
-### Why JSONL instead of JSON?
+### Why Dolt instead of plain files?
 
-- ✅ **Git-friendly**: One line per issue = clean diffs
-- ✅ **Mergeable**: Concurrent appends rarely conflict
-- ✅ **Human-readable**: Easy to review changes
-- ✅ **Scriptable**: Use `jq`, `grep`, or any text tools
-- ✅ **Portable**: Export/import between databases
+- ✅ **Version-controlled SQL**: Full SQL queries with native version control
+- ✅ **Cell-level merge**: Concurrent changes merge automatically at the field level
+- ✅ **Multi-writer**: Server mode supports concurrent agents
+- ✅ **Native branching**: Dolt branches independent of git branches
+- ✅ **Portable**: `bd export` produces JSONL for migration and interoperability
 
-See [ADVANCED.md](ADVANCED.md) for detailed analysis.
+See [DOLT.md](DOLT.md) for detailed analysis.
 
 ### How do I handle merge conflicts?
 
@@ -290,7 +291,7 @@ Git may show a conflict, but resolution is simple: **keep both lines** (both cha
 
 If you import an issue with the same ID but different fields, bd treats it as an update to the existing issue. This is normal behavior - hash IDs remain stable, so same ID = same issue being updated.
 
-For git conflicts where the same issue was modified on both branches, manually resolve the JSONL conflict (usually keeping the newer `updated_at` timestamp), then `bd import` will apply the update.
+Dolt handles merge conflicts natively with cell-level merge. Use `bd vc conflicts` to view and resolve any conflicts after pulling.
 
 ## Migration Questions
 
@@ -300,7 +301,7 @@ We don't have automated migration tools yet, but you can:
 
 1. Export issues from your current tracker (usually CSV or JSON)
 2. Write a simple script to convert to bd's JSONL format
-3. Import with `bd import -i issues.jsonl`
+3. Place the JSONL file at `.beads/issues.jsonl` and run `bd init --from-jsonl`
 
 See [examples/](../examples/) for scripting patterns. Contributions welcome!
 
@@ -318,16 +319,16 @@ The [CONFIG.md](CONFIG.md) guide shows how to store integration settings. Contri
 
 ### How does bd handle scale?
 
-bd uses SQLite, which handles millions of rows efficiently. For a typical project with thousands of issues:
+bd uses Dolt (a version-controlled SQL database), which handles millions of rows efficiently. For a typical project with thousands of issues:
 
 - Commands complete in <100ms
 - Full-text search is instant
 - Dependency graphs traverse quickly
-- JSONL files stay small (one line per issue)
+- Dolt database stays compact with garbage collection
 
 For extremely large projects (100k+ issues), you might want to filter exports or use multiple databases per component.
 
-### What if my JSONL file gets too large?
+### What if my database gets too large?
 
 Use compaction to remove old closed issues:
 
@@ -337,6 +338,9 @@ bd admin compact --dry-run --all
 
 # Compact issues closed more than 90 days ago
 bd admin compact --days 90
+
+# Run Dolt garbage collection
+cd .beads/dolt && dolt gc
 ```
 
 Or split your project into multiple databases:
@@ -363,19 +367,24 @@ The agent-friendly design works for any AI-assisted workflow.
 Yes! Each agent can:
 
 1. Query ready work: `bd ready --assignee agent-name`
-2. Claim issues: `bd update <id> --status in_progress --assignee agent-name`
-3. Create discovered work: `bd create "Found issue" --deps discovered-from:<parent-id>`
-4. Sync via git commits
+2. Assign issues: `bd update <id> --assignee agent-name`
+3. Start work (as assigned agent): `bd update <id> --status in_progress`
+4. Create discovered work: `bd create "Found issue" --deps discovered-from:<parent-id>`
+5. Sync via `bd dolt push` / `bd dolt pull`
 
-bd's git-based sync means agents work independently and merge their changes like developers do.
+Note: In orchestrated workflows, assignment is usually done by an orchestrator.
+If the issue is already assigned, start with `bd update <id> --status in_progress`.
+If an agent picks work directly, use atomic `bd update <id> --claim --assignee agent-name`.
+
+bd's version-controlled storage means agents work independently and merge their changes like developers do, with cell-level merge resolving most conflicts automatically.
 
 ### Does bd work offline?
 
 Yes! bd is designed for offline-first operation:
 
-- All queries run against local SQLite database
+- All queries run against local Dolt database
 - No network required for any commands
-- Sync happens via git push/pull when you're online
+- Sync happens via `bd dolt push` / `bd dolt pull` when you're online
 - Full functionality available without internet
 
 This makes bd ideal for:
@@ -391,19 +400,14 @@ This makes bd ideal for:
 bd is a single static binary with no runtime dependencies:
 
 - **Language**: Go 1.24+
-- **Database**: SQLite (embedded, pure Go driver)
-- **Optional**: Git (for sync across machines)
+- **Database**: Dolt (server mode)
+- **Optional**: Git (for version control of project code)
 
 That's it! No PostgreSQL, no Redis, no Docker, no node_modules.
 
 ### Can I extend bd's database?
 
-Yes! See [EXTENDING.md](EXTENDING.md) for how to:
-
-- Add custom tables to the SQLite database
-- Join with issue data
-- Build custom queries
-- Create integrations
+With the Dolt backend, use `bd query` for direct SQL access or build integrations using `bd --json` CLI output.
 
 ### Does bd support Windows?
 
@@ -412,16 +416,16 @@ Yes! bd has native Windows support (v0.9.0+):
 - No MSYS or MinGW required
 - PowerShell install script
 - Works with Windows paths and filesystem
-- Daemon uses TCP instead of Unix sockets
+- Dolt server uses TCP instead of Unix sockets
 
 See [INSTALLING.md](INSTALLING.md#windows-11) for details.
 
 ### Can I use bd with git worktrees?
 
-Yes, but with limitations. The daemon doesn't work correctly with worktrees, so use `--no-daemon` mode:
+Yes! Dolt handles worktrees natively. Use embedded mode if the Dolt server is not needed:
 
 ```bash
-export BEADS_NO_DAEMON=1
+bd dolt set mode embedded
 bd ready
 bd create "Fix bug" -p 1
 ```
@@ -430,15 +434,9 @@ See [WORKTREES.md](WORKTREES.md) for details.
 
 ### Why did beads create worktrees in my .git directory?
 
-Beads automatically creates git worktrees when using the **sync-branch** feature. This happens when you:
-- Run `bd init --branch <name>`
-- Set `bd config set sync.branch <name>`
+Older versions of beads created git worktrees for a **sync-branch** feature that has since been removed. Dolt now stores data under `refs/dolt/data`, separate from standard Git refs, so a separate branch is no longer needed.
 
-The worktrees allow beads to commit issue updates to a separate branch without switching your working directory.
-
-**Location:** `.git/beads-worktrees/<sync-branch>/`
-
-**Common issue:** If you see "branch already checked out" errors when switching branches, remove the beads worktrees:
+If you have leftover worktrees from an older version, you can safely remove them:
 
 ```bash
 rm -rf .git/beads-worktrees
@@ -454,7 +452,7 @@ bd config set sync.branch ""
 
 See [WORKTREES.md#beads-created-worktrees-sync-branch](WORKTREES.md#beads-created-worktrees-sync-branch) for full details.
 
-### What's the difference between SQLite corruption and ID collisions?
+### What's the difference between database corruption and ID collisions?
 
 bd handles two distinct types of integrity issues:
 
@@ -463,27 +461,26 @@ bd handles two distinct types of integrity issues:
 The hash/fingerprint/collision architecture prevents:
 - **ID collisions**: Same ID assigned to different issues (e.g., from parallel workers or branch merges)
 - **Wrong prefix bugs**: Issues created with incorrect prefix due to config mismatch
-- **Merge conflicts**: Branch divergence creating conflicting JSONL content
+- **Merge conflicts**: Branch divergence creating conflicting data
 
 **Solution**: Hash-based IDs (v0.20+) eliminate collisions. Different issues automatically get different IDs.
 
-**2. Physical SQLite Corruption**
+**2. Physical Database Corruption**
 
-SQLite database file corruption can occur from:
+Database corruption can occur from:
 - **Disk/hardware failures**: Power loss, disk errors, filesystem corruption
-- **Concurrent writes**: Multiple processes writing to the same database file simultaneously
-- **Container scenarios**: Shared database volumes with multiple containers
+- **Concurrent writes**: Multiple processes writing to the database simultaneously
 
-**Solution**: Reimport from JSONL (which survives in git history):
+**Solution**: Rebuild from Dolt remote or a backup export:
 ```bash
-mv .beads/*.db .beads/*.db.backup
+rm -rf .beads/dolt
 bd init
-bd import -i .beads/issues.jsonl
+bd dolt pull    # Pull from Dolt remote if configured
 ```
 
-**Key Difference**: Collision resolution fixes logical issues in the data. Physical corruption requires restoring from the JSONL source of truth.
+**Key Difference**: Collision resolution fixes logical issues in the data. Physical corruption requires restoring from Dolt remotes or backup exports.
 
-**When to use in-memory mode (`--no-db`)**: For multi-process/container scenarios where SQLite's file locking isn't sufficient. The in-memory backend loads from JSONL at startup and writes back after each command, avoiding shared database state entirely.
+**For multi-writer scenarios**: Use Dolt server mode (`bd dolt set mode server`) to allow concurrent access from multiple processes.
 
 ## Getting Help
 
@@ -492,8 +489,8 @@ bd import -i .beads/issues.jsonl
 - **Documentation**: [README.md](../README.md), [QUICKSTART.md](QUICKSTART.md), [ADVANCED.md](ADVANCED.md)
 - **Troubleshooting**: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 - **Examples**: [examples/](../examples/)
-- **GitHub Issues**: [Report bugs or request features](https://github.com/steveyegge/beads/issues)
-- **GitHub Discussions**: [Ask questions](https://github.com/steveyegge/beads/discussions)
+- **GitHub Issues**: [Report bugs or request features](https://github.com/gastownhall/beads/issues)
+- **GitHub Discussions**: [Ask questions](https://github.com/gastownhall/beads/discussions)
 
 ### How can I contribute?
 

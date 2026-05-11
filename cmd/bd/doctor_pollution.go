@@ -14,10 +14,9 @@ import (
 //
 //nolint:unparam // path reserved for future use
 func runPollutionCheck(_ string, clean bool, yes bool) {
-	// Ensure we have a store initialized (uses direct mode, no daemon support yet)
+	// Ensure we have a store initialized
 	if err := ensureDirectMode("pollution check requires direct mode"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	ctx := rootCtx
@@ -25,8 +24,7 @@ func runPollutionCheck(_ string, clean bool, yes bool) {
 	// Get all issues
 	allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error fetching issues: %v\n", err)
-		os.Exit(1)
+		FatalError("fetching issues: %v", err)
 	}
 
 	// Detect pollution (reuse detectTestPollution from detect_pollution.go)
@@ -122,8 +120,7 @@ func runPollutionCheck(_ string, clean bool, yes bool) {
 	// Backup to JSONL before deleting
 	backupPath := ".beads/pollution-backup.jsonl"
 	if err := backupPollutedIssues(polluted, backupPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error backing up issues: %v\n", err)
-		os.Exit(1)
+		FatalError("backing up issues: %v", err)
 	}
 	fmt.Printf("Backed up %d issues to %s\n", len(polluted), backupPath)
 
@@ -138,11 +135,8 @@ func runPollutionCheck(_ string, clean bool, yes bool) {
 		deleted++
 	}
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
-
 	fmt.Printf("%s Deleted %d test issues\n", ui.RenderPass("✓"), deleted)
-	fmt.Printf("\nCleanup complete. To restore, run: bd import %s\n", backupPath)
+	fmt.Printf("\nCleanup complete. To restore, run: bd init --from-jsonl %s\n", backupPath)
 }
 
 func init() {

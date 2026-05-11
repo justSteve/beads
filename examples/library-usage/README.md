@@ -37,7 +37,7 @@ func main() {
     
     // Find and open database
     dbPath := beads.FindDatabasePath()
-    store, err := beads.NewSQLiteStorage(dbPath)
+    store, err := beads.Open(ctx, dbPath)
     if err != nil {
         log.Fatal(err)
     }
@@ -145,8 +145,8 @@ type VCStorage struct {
     beads beads.Storage
 }
 
-func NewVCStorage(dbPath string) (*VCStorage, error) {
-    store, err := beads.NewSQLiteStorage(dbPath)
+func NewVCStorage(ctx context.Context, dbPath string) (*VCStorage, error) {
+    store, err := beads.Open(ctx, dbPath)
     if err != nil {
         return nil, err
     }
@@ -194,6 +194,6 @@ func (s *VCStorage) ClaimWork(ctx context.Context, executorID string) (*beads.Is
 
 ## See Also
 
-- [EXTENDING.md](../../EXTENDING.md) - Detailed extension guide
+- [bd-example-extension-go](../bd-example-extension-go/README.md) - Legacy SQLite extension example
 - [beads.go](../../beads.go) - Public API source
 - [internal/storage/storage.go](../../internal/storage/storage.go) - Storage interface

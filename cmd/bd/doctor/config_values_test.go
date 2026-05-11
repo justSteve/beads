@@ -2,48 +2,53 @@ package doctor
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
 
-func TestIsValidBranchName(t *testing.T) {
-	tests := []struct {
-		name     string
-		branch   string
-		expected bool
-	}{
-		{"valid simple", "main", true},
-		{"valid with slash", "feature/test", true},
-		{"valid with dash", "my-branch", true},
-		{"valid with underscore", "my_branch", true},
-		{"valid with dot", "v1.0", true},
-		{"valid complex", "feature/bd-123-add-thing", true},
+func setupDoctorSharedWorktree(t *testing.T) (mainRepoDir, worktreeDir string) {
+	t.Helper()
 
-		{"empty", "", false},
-		{"starts with dash", "-branch", false},
-		{"ends with dot", "branch.", false},
-		{"ends with slash", "branch/", false},
-		{"contains space", "my branch", false},
-		{"contains tilde", "branch~1", false},
-		{"contains caret", "branch^2", false},
-		{"contains colon", "branch:name", false},
-		{"contains backslash", "branch\\name", false},
-		{"contains question", "branch?", false},
-		{"contains asterisk", "branch*", false},
-		{"contains bracket", "branch[0]", false},
-		{"contains double dot", "branch..name", false},
-		{"ends with .lock", "branch.lock", false},
-		{"contains @{", "branch@{1}", false},
+	tmpDir := t.TempDir()
+	mainRepoDir = filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatalf("failed to create main repo dir: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isValidBranchName(tt.branch)
-			if got != tt.expected {
-				t.Errorf("isValidBranchName(%q) = %v, want %v", tt.branch, got, tt.expected)
-			}
-		})
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
 	}
+
+	run(mainRepoDir, "init")
+	run(mainRepoDir, "config", "user.email", "test@example.com")
+	run(mainRepoDir, "config", "user.name", "Test User")
+
+	readmePath := filepath.Join(mainRepoDir, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("failed to write README.md: %v", err)
+	}
+	run(mainRepoDir, "add", "README.md")
+	run(mainRepoDir, "commit", "-m", "Initial commit")
+
+	worktreeDir = filepath.Join(tmpDir, "worktree")
+	addWorktree := exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	addWorktree.Dir = mainRepoDir
+	if out, err := addWorktree.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add failed: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		removeWorktree := exec.Command("git", "worktree", "remove", "--force", worktreeDir)
+		removeWorktree.Dir = mainRepoDir
+		_ = removeWorktree.Run()
+	})
+
+	return mainRepoDir, worktreeDir
 }
 
 func TestCheckConfigValues(t *testing.T) {
@@ -57,8 +62,6 @@ func TestCheckConfigValues(t *testing.T) {
 	// Test with valid config
 	t.Run("valid config", func(t *testing.T) {
 		configContent := `issue-prefix: "test"
-flush-debounce: "30s"
-sync-branch: "beads-sync"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 			t.Fatalf("failed to write config.yaml: %v", err)
@@ -67,24 +70,6 @@ sync-branch: "beads-sync"
 		check := CheckConfigValues(tmpDir)
 		if check.Status != "ok" {
 			t.Errorf("expected ok status, got %s: %s", check.Status, check.Detail)
-		}
-	})
-
-	// Test with invalid flush-debounce
-	t.Run("invalid flush-debounce", func(t *testing.T) {
-		configContent := `issue-prefix: "test"
-flush-debounce: "not-a-duration"
-`
-		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
-			t.Fatalf("failed to write config.yaml: %v", err)
-		}
-
-		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "flush-debounce") {
-			t.Errorf("expected detail to mention flush-debounce, got: %s", check.Detail)
 		}
 	})
 
@@ -123,23 +108,6 @@ flush-debounce: "not-a-duration"
 		}
 	})
 
-	// Test with invalid sync-branch
-	t.Run("invalid sync-branch", func(t *testing.T) {
-		configContent := `sync-branch: "branch with spaces"
-`
-		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
-			t.Fatalf("failed to write config.yaml: %v", err)
-		}
-
-		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "sync-branch") {
-			t.Errorf("expected detail to mention sync-branch, got: %s", check.Detail)
-		}
-	})
-
 	// Test with too long issue-prefix
 	t.Run("too long issue-prefix", func(t *testing.T) {
 		configContent := `issue-prefix: "thisprefiswaytooolongtobevalid"
@@ -158,6 +126,27 @@ flush-debounce: "not-a-duration"
 	})
 }
 
+func TestCheckConfigValues_WorktreeFallbackUsesSharedConfig(t *testing.T) {
+	mainRepoDir, worktreeDir := setupDoctorSharedWorktree(t)
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create main .beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mainBeadsDir, "config.yaml"), []byte("issue-prefix: \"123-invalid\"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config.yaml: %v", err)
+	}
+
+	clearResolveBeadsDirCache()
+
+	check := CheckConfigValues(worktreeDir)
+	if check.Status != "warning" {
+		t.Fatalf("expected warning status, got %s: %s", check.Status, check.Detail)
+	}
+	if check.Detail == "" || !contains(check.Detail, "issue-prefix") {
+		t.Fatalf("expected detail to mention issue-prefix, got: %s", check.Detail)
+	}
+}
+
 func TestCheckMetadataConfigValues(t *testing.T) {
 	// Create a temporary directory for testing
 	tmpDir := t.TempDir()
@@ -166,11 +155,10 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		t.Fatalf("failed to create .beads dir: %v", err)
 	}
 
-	// Test with valid metadata
+	// Test with valid metadata (Dolt backend)
 	t.Run("valid metadata", func(t *testing.T) {
 		metadataContent := `{
-  "database": "beads.db",
-  "jsonl_export": "issues.jsonl"
+  "database": "dolt"
 }`
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
 			t.Fatalf("failed to write metadata.json: %v", err)
@@ -182,10 +170,99 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 		}
 	})
 
+	// GH#3231: hyphenated dolt_database in embedded mode
+	t.Run("hyphenated dolt_database embedded mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-cool-project",
+  "dolt_mode": "embedded"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "invalid in embedded") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected invalid-chars warning for embedded mode, got: %v", issues)
+		}
+	})
+
+	// GH#3231: dotted dolt_database in embedded mode
+	t.Run("dotted dolt_database embedded mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my.project",
+  "dolt_mode": "embedded"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "invalid in embedded") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected invalid-chars warning for dotted name in embedded mode, got: %v", issues)
+		}
+	})
+
+	// GH#3231: hyphenated dolt_database is OK in server mode
+	t.Run("hyphenated dolt_database server mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-cool-project",
+  "dolt_mode": "server"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		for _, issue := range issues {
+			if contains(issue, "invalid in embedded") {
+				t.Errorf("should not warn about invalid chars in server mode, got: %s", issue)
+			}
+		}
+	})
+
+	// GH#3231: no dolt_mode defaults to embedded, hyphens should warn
+	t.Run("hyphenated dolt_database default mode", func(t *testing.T) {
+		metadataContent := `{
+  "database": "dolt",
+  "dolt_database": "my-project"
+}`
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
+			t.Fatalf("failed to write metadata.json: %v", err)
+		}
+
+		issues := checkMetadataConfigValues(tmpDir)
+		found := false
+		for _, issue := range issues {
+			if contains(issue, "invalid in embedded") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected invalid-chars warning when dolt_mode is unset (defaults to embedded), got: %v", issues)
+		}
+	})
+
 	t.Run("valid dolt metadata", func(t *testing.T) {
 		metadataContent := `{
   "database": "dolt",
-  "jsonl_export": "issues.jsonl",
   "backend": "dolt"
 }`
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
@@ -201,8 +278,7 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 	// Test with path in database field
 	t.Run("path in database field", func(t *testing.T) {
 		metadataContent := `{
-  "database": "/path/to/beads.db",
-  "jsonl_export": "issues.jsonl"
+  "database": "/path/to/beads.db"
 }`
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
 			t.Fatalf("failed to write metadata.json: %v", err)
@@ -213,37 +289,30 @@ func TestCheckMetadataConfigValues(t *testing.T) {
 			t.Error("expected issues for path in database field")
 		}
 	})
+}
 
-	// Test with wrong extension for jsonl
-	t.Run("wrong jsonl extension", func(t *testing.T) {
-		metadataContent := `{
-  "database": "beads.db",
-  "jsonl_export": "issues.json"
+func TestCheckMetadataConfigValues_WorktreeFallbackUsesSharedMetadata(t *testing.T) {
+	mainRepoDir, worktreeDir := setupDoctorSharedWorktree(t)
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create main .beads dir: %v", err)
+	}
+	metadataContent := `{
+  "database": "/path/to/beads.db"
 }`
-		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
-			t.Fatalf("failed to write metadata.json: %v", err)
-		}
+	if err := os.WriteFile(filepath.Join(mainBeadsDir, "metadata.json"), []byte(metadataContent), 0o644); err != nil {
+		t.Fatalf("failed to write metadata.json: %v", err)
+	}
 
-		issues := checkMetadataConfigValues(tmpDir)
-		if len(issues) == 0 {
-			t.Error("expected issues for wrong jsonl extension")
-		}
-	})
+	clearResolveBeadsDirCache()
 
-	t.Run("jsonl_export cannot be system file", func(t *testing.T) {
-		metadataContent := `{
-  "database": "beads.db",
-  "jsonl_export": "interactions.jsonl"
-}`
-		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadataContent), 0644); err != nil {
-			t.Fatalf("failed to write metadata.json: %v", err)
-		}
-
-		issues := checkMetadataConfigValues(tmpDir)
-		if len(issues) == 0 {
-			t.Error("expected issues for system jsonl_export")
-		}
-	})
+	issues := checkMetadataConfigValues(worktreeDir)
+	if len(issues) == 0 {
+		t.Fatal("expected metadata validation issues from shared worktree metadata")
+	}
+	if !contains(issues[0], "should be a filename") {
+		t.Fatalf("expected shared metadata issue, got: %v", issues)
+	}
 }
 
 func contains(s, substr string) bool {
@@ -436,11 +505,9 @@ func TestCheckConfigValuesDbPath(t *testing.T) {
 		}
 
 		check := CheckConfigValues(tmpDir)
-		if check.Status != "warning" {
-			t.Errorf("expected warning status, got %s", check.Status)
-		}
-		if check.Detail == "" || !contains(check.Detail, "db") {
-			t.Errorf("expected detail to mention db, got: %s", check.Detail)
+		// Dolt backend doesn't validate db file extension (it's directory-based)
+		if check.Status != "ok" {
+			t.Errorf("expected ok status (db extension not validated for Dolt), got %s: %s", check.Status, check.Detail)
 		}
 	})
 

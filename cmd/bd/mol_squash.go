@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -30,7 +28,7 @@ The squash operation:
   3. Generates a digest (summary of work done)
   4. Creates a permanent digest issue (Ephemeral=false)
   5. Clears Wisp flag on children (promotes to persistent)
-     OR deletes them with --delete-children
+     OR keeps them with --keep-children (default: delete)
 
 AGENT INTEGRATION:
 Use --summary to provide an AI-generated summary. This keeps bd as a pure
@@ -44,7 +42,7 @@ execution happens, squash compresses the trace into an outcome (digest).
 Example:
   bd mol squash bd-abc123                    # Squash and promote children
   bd mol squash bd-abc123 --dry-run          # Preview what would be squashed
-  bd mol squash bd-abc123 --delete-children  # Delete wisps after digest
+  bd mol squash bd-abc123 --keep-children    # Keep wisps after digest
   bd mol squash bd-abc123 --summary "Agent-generated summary of work done"`,
 	Args: cobra.ExactArgs(1),
 	Run:  runMolSquash,
@@ -66,11 +64,9 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 
 	ctx := rootCtx
 
-	// mol squash requires direct store access (daemon auto-bypassed for wisp ops)
+	// mol squash requires direct store access
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		fmt.Fprintf(os.Stderr, "Hint: run 'bd init' or 'bd import' to initialize the database\n")
-		os.Exit(1)
+		FatalErrorWithHint("no database connection", diagHint())
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -80,15 +76,13 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 	// Resolve molecule ID in main store
 	moleculeID, err := utils.ResolvePartialID(ctx, store, args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving molecule ID %s: %v\n", args[0], err)
-		os.Exit(1)
+		FatalError("resolving molecule ID %s: %v", args[0], err)
 	}
 
 	// Load the molecule subgraph from main store
 	subgraph, err := loadTemplateSubgraph(ctx, store, moleculeID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("loading molecule: %v", err)
 	}
 
 	// Filter to only ephemeral children (exclude root)
@@ -141,12 +135,8 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 	// Perform the squash
 	result, err := squashMolecule(ctx, store, subgraph.Root, wispChildren, keepChildren, summary, actor)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error squashing molecule: %v\n", err)
-		os.Exit(1)
+		FatalError("squashing molecule: %v", err)
 	}
-
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
 		outputJSON(result)
@@ -159,6 +149,9 @@ func runMolSquash(cmd *cobra.Command, args []string) {
 		fmt.Printf("  Deleted: %d wisps\n", result.DeletedCount)
 	} else if result.KeptChildren {
 		fmt.Printf("  Children preserved (--keep-children)\n")
+	}
+	if result.WispSquash {
+		fmt.Printf("  Root auto-closed: %s\n", result.MoleculeID)
 	}
 }
 
@@ -215,7 +208,7 @@ func generateDigest(root *types.Issue, children []*types.Issue) string {
 // If summary is provided (non-empty), it's used as the digest content.
 // Otherwise, generateDigest() creates a basic concatenation.
 // This enables agents to provide AI-generated summaries while keeping bd as a pure tool.
-func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
+func squashMolecule(ctx context.Context, s storage.DoltStorage, root *types.Issue, children []*types.Issue, keepChildren bool, summary string, actorName string) (*SquashResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -243,7 +236,7 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 		CloseReason: fmt.Sprintf("Squashed from %d wisps", len(children)),
 		Priority:    root.Priority,
 		IssueType:   types.TypeTask,
-		Ephemeral:        false, // Digest is permanent, not a wisp
+		Ephemeral:   false, // Digest is permanent, not a wisp
 		ClosedAt:    &now,
 	}
 
@@ -254,8 +247,9 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 		KeptChildren:  keepChildren,
 	}
 
-	// Use transaction for atomicity
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	// All squash operations in a single transaction for atomicity (bd-4kgbq):
+	// digest creation, child deletion, and root close
+	err := transact(ctx, s, fmt.Sprintf("bd: squash molecule %s", root.ID), func(tx storage.Transaction) error {
 		// Create digest issue
 		if err := tx.CreateIssue(ctx, digestIssue, actorName); err != nil {
 			return fmt.Errorf("failed to create digest issue: %w", err)
@@ -272,6 +266,29 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 			return fmt.Errorf("failed to link digest to root: %w", err)
 		}
 
+		// Delete ephemeral children within the same transaction
+		if !keepChildren {
+			for _, id := range childIDs {
+				if err := tx.DeleteIssue(ctx, id); err != nil {
+					return fmt.Errorf("failed to delete child %s: %w", id, err)
+				}
+				result.DeletedCount++
+			}
+		}
+
+		// Auto-close the root if it's a wisp — squash completes the molecule lifecycle
+		if root.Ephemeral {
+			reason := fmt.Sprintf("Squashed: %d steps → digest %s", len(children), result.DigestID)
+			if err := tx.CloseIssue(ctx, root.ID, reason, actorName, ""); err != nil {
+				return fmt.Errorf("failed to close wisp root %s: %w", root.ID, err)
+			}
+			// Clear ephemeral so the closed root stops being re-emitted by every wisp-table export cycle.
+			if err := tx.UpdateIssue(ctx, root.ID, map[string]interface{}{"wisp": false}, actorName); err != nil {
+				return fmt.Errorf("failed to clear ephemeral flag on root %s: %w", root.ID, err)
+			}
+			result.WispSquash = true
+		}
+
 		return nil
 	})
 
@@ -279,38 +296,7 @@ func squashMolecule(ctx context.Context, s storage.Storage, root *types.Issue, c
 		return nil, err
 	}
 
-	// Delete ephemeral children (outside transaction for better error handling)
-	if !keepChildren {
-		deleted, err := deleteWispChildren(ctx, s, childIDs)
-		if err != nil {
-			// Log but don't fail - digest was created successfully
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete some children: %v\n", err)
-		}
-		result.DeletedCount = deleted
-	}
-
 	return result, nil
-}
-
-// deleteWispChildren removes the wisp issues from the database
-func deleteWispChildren(ctx context.Context, s storage.Storage, ids []string) (int, error) {
-	// Type assert to SQLite storage for delete access
-	d, ok := s.(*sqlite.SQLiteStorage)
-	if !ok {
-		return 0, fmt.Errorf("delete not supported by this storage backend")
-	}
-
-	deleted := 0
-	var lastErr error
-	for _, id := range ids {
-		if err := d.DeleteIssue(ctx, id); err != nil {
-			lastErr = err
-			continue
-		}
-		deleted++
-	}
-
-	return deleted, lastErr
 }
 
 func init() {

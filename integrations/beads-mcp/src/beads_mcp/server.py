@@ -16,7 +16,6 @@ import importlib.metadata
 import logging
 import os
 import signal
-import subprocess
 import sys
 from functools import wraps
 from types import FrameType
@@ -41,6 +40,7 @@ from beads_mcp.models import (
 from beads_mcp.tools import (
     beads_add_dependency,
     beads_blocked,
+    beads_claim_issue,
     beads_close_issue,
     beads_create_issue,
     beads_detect_pollution,
@@ -58,6 +58,7 @@ from beads_mcp.tools import (
     beads_validate,
     current_workspace,  # ContextVar for per-request workspace routing
 )
+from beads_mcp.workspace import resolve_workspace_root as _shared_resolve_workspace_root
 
 # Setup logging for lifecycle events
 logger = logging.getLogger(__name__)
@@ -70,7 +71,6 @@ logging.basicConfig(
 T = TypeVar("T")
 
 # Global state for cleanup
-_daemon_clients: list[Any] = []
 _cleanup_done = False
 
 # Persistent workspace context (survives across MCP tool calls)
@@ -85,17 +85,18 @@ _workspace_context: dict[str, str] = {}
 #   BEADS_MCP_COMPACTION_THRESHOLD - Compact results with >N issues (default: 20)
 #   BEADS_MCP_PREVIEW_COUNT - Show first N issues in preview (default: 5)
 
+
 def _get_compaction_settings() -> tuple[int, int]:
     """Load compaction settings from environment or use defaults.
-    
+
     Returns:
         (threshold, preview_count) tuple
     """
     import os
-    
+
     threshold = int(os.environ.get("BEADS_MCP_COMPACTION_THRESHOLD", "20"))
     preview_count = int(os.environ.get("BEADS_MCP_PREVIEW_COUNT", "5"))
-    
+
     # Validate settings
     if threshold < 1:
         raise ValueError("BEADS_MCP_COMPACTION_THRESHOLD must be >= 1")
@@ -103,7 +104,7 @@ def _get_compaction_settings() -> tuple[int, int]:
         raise ValueError("BEADS_MCP_PREVIEW_COUNT must be >= 1")
     if preview_count > threshold:
         raise ValueError("BEADS_MCP_PREVIEW_COUNT must be <= BEADS_MCP_COMPACTION_THRESHOLD")
-    
+
     return threshold, preview_count
 
 
@@ -131,28 +132,16 @@ IMPORTANT: Call context(workspace_root='...') to set your workspace before any w
 
 def cleanup() -> None:
     """Clean up resources on exit.
-    
-    Closes daemon connections and removes temp files.
+
     Safe to call multiple times.
     """
     global _cleanup_done
-    
+
     if _cleanup_done:
         return
-    
+
     _cleanup_done = True
     logger.info("Cleaning up beads-mcp resources...")
-    
-    # Close all daemon client connections
-    for client in _daemon_clients:
-        try:
-            if hasattr(client, 'cleanup'):
-                client.cleanup()
-                logger.debug(f"Closed daemon client: {client}")
-        except Exception as e:
-            logger.warning(f"Error closing daemon client: {e}")
-    
-    _daemon_clients.clear()
     logger.info("Cleanup complete")
 
 
@@ -187,16 +176,15 @@ def with_workspace(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable
 
     This enables per-request workspace routing for multi-project support.
     """
+
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
         # Extract workspace_root parameter (if provided)
-        workspace_root = kwargs.get('workspace_root')
+        workspace_root = kwargs.get("workspace_root")
 
         # Determine workspace: parameter > persistent context > env > None
         workspace = (
-            workspace_root
-            or _workspace_context.get("BEADS_WORKING_DIR")
-            or os.environ.get("BEADS_WORKING_DIR")
+            workspace_root or _workspace_context.get("BEADS_WORKING_DIR") or os.environ.get("BEADS_WORKING_DIR")
         )
 
         # Set ContextVar for this request
@@ -214,14 +202,15 @@ def with_workspace(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable
 
 def require_context(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
     """Decorator to enforce context has been set before write operations.
-    
+
     Passes if either:
     - workspace_root was provided on tool call (via ContextVar), OR
     - BEADS_WORKING_DIR is set (from context tool)
-    
+
     Only enforces if BEADS_REQUIRE_CONTEXT=1 is set in environment.
     This allows backward compatibility while adding safety for multi-repo setups.
     """
+
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> T:
         # Only enforce if explicitly enabled
@@ -233,21 +222,25 @@ def require_context(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitabl
                     "Context not set. Either provide workspace_root parameter or call context(workspace_root='...') first."
                 )
         return await func(*args, **kwargs)
+
     return wrapper
 
 
 def _find_beads_db(workspace_root: str) -> str | None:
-    """Find .beads/*.db by walking up from workspace_root.
-    
+    """Find a SQLite .beads/*.db by walking up from workspace_root.
+
     Args:
         workspace_root: Starting directory to search from
-        
+
     Returns:
-        Absolute path to first .db file found in .beads/, None otherwise
+        Absolute path to first .db file found in .beads/, None otherwise.
+        Returns None for Dolt-backed projects (which have no single .db file);
+        callers should use _find_beads_project() to detect those.
     """
     import glob
+
     current = os.path.abspath(workspace_root)
-    
+
     while True:
         beads_dir = os.path.join(current, ".beads")
         if os.path.isdir(beads_dir):
@@ -255,41 +248,72 @@ def _find_beads_db(workspace_root: str) -> str | None:
             db_files = glob.glob(os.path.join(beads_dir, "*.db"))
             if db_files:
                 return db_files[0]  # Return first .db file found
-        
+
         parent = os.path.dirname(current)
         if parent == current:  # Reached root
             break
         current = parent
-    
+
     return None
 
 
-def _resolve_workspace_root(path: str) -> str:
-    """Resolve workspace root to git repo root if inside a git repo.
-    
-    Args:
-        path: Directory path to resolve
-        
+def _find_beads_project(workspace_root: str) -> tuple[str, str] | None:
+    """Find a .beads project by walking up from workspace_root.
+
+    Delegates to ``_find_beads_db_in_tree`` so that ``.beads/redirect`` files,
+    symlinks, and all backend types are handled identically to the rest of the
+    MCP server.
+
     Returns:
-        Git repo root if inside git repo, otherwise the original path
+        (project_root, backend) where backend is "sqlite", "dolt-embedded",
+        "dolt-server", or "unknown". None if no .beads project is found.
     """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=path,
-            capture_output=True,
-            text=True,
-            check=False,
-            shell=sys.platform == "win32",
-            stdin=subprocess.DEVNULL,  # Prevent inheriting MCP's stdin
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception as e:
-        logger.debug(f"Git detection failed for {path}: {e}")
-        pass
-    
-    return os.path.abspath(path)
+    from beads_mcp.tools import _find_beads_db_in_tree
+
+    project_root = _find_beads_db_in_tree(workspace_root)
+    if project_root is None:
+        return None
+    backend = _detect_backend(os.path.join(project_root, ".beads"))
+    return (project_root, backend)
+
+
+def _detect_backend(beads_dir: str) -> str:
+    """Identify the storage backend in a .beads directory."""
+    import glob
+    import json
+
+    metadata_path = os.path.join(beads_dir, "metadata.json")
+    if os.path.isfile(metadata_path):
+        try:
+            with open(metadata_path) as f:
+                meta = json.load(f)
+            if isinstance(meta, dict):
+                backend = (meta.get("backend") or meta.get("database") or "").lower()
+                if backend == "dolt":
+                    if (meta.get("dolt_mode") or "").lower() == "embedded":
+                        return "dolt-embedded"
+                    return "dolt-server"
+                if backend == "sqlite":
+                    return "sqlite"
+        except Exception:
+            pass
+
+    if os.path.isdir(os.path.join(beads_dir, "embeddeddolt")):
+        return "dolt-embedded"
+    if os.path.isdir(os.path.join(beads_dir, "dolt")):
+        return "dolt-server"
+
+    for match in glob.glob(os.path.join(beads_dir, "*.db")):
+        base = os.path.basename(match)
+        if ".backup" not in base and base != "vc.db":
+            return "sqlite"
+
+    return "unknown"
+
+
+def _resolve_workspace_root(path: str) -> str:
+    """Resolve workspace root to the repo that owns the active beads workspace."""
+    return _shared_resolve_workspace_root(path)
 
 
 # Register quickstart resource
@@ -314,6 +338,7 @@ _TOOL_CATALOG = {
     "list": "List issues with filters (status, priority, type)",
     "show": "Show full details for a specific issue",
     "create": "Create a new issue (bug, feature, task, epic)",
+    "claim": "Atomically claim an issue for work (assignee + in_progress)",
     "update": "Update issue status, priority, or assignee",
     "close": "Close/complete an issue",
     "reopen": "Reopen closed issues",
@@ -333,16 +358,16 @@ _TOOL_CATALOG = {
 )
 async def discover_tools() -> dict[str, Any]:
     """Discover available beads tools without loading full schemas.
-    
+
     Returns lightweight tool catalog to minimize context usage.
     Use get_tool_info(tool_name) for full parameter details.
-    
+
     Context savings: ~500 bytes vs ~10-50k for full schemas.
     """
     return {
         "tools": _TOOL_CATALOG,
         "count": len(_TOOL_CATALOG),
-        "hint": "Use get_tool_info('tool_name') for full parameters and usage"
+        "hint": "Use get_tool_info('tool_name') for full parameters and usage",
     }
 
 
@@ -352,10 +377,10 @@ async def discover_tools() -> dict[str, Any]:
 )
 async def get_tool_info(tool_name: str) -> dict[str, Any]:
     """Get detailed info for a specific tool.
-    
+
     Args:
         tool_name: Name of the tool to get info for
-        
+
     Returns:
         Full tool details including parameters and usage examples
     """
@@ -366,6 +391,7 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             "parameters": {
                 "limit": "int (1-100, default 10) - Max issues to return",
                 "priority": "int (0-4, optional) - Filter by priority",
+                "issue_type": "str (optional) - Filter by type (task, bug, feature, epic, chore, decision, merge-request, or custom)",
                 "assignee": "str (optional) - Filter by assignee",
                 "labels": "list[str] (optional) - AND filter: must have ALL labels",
                 "labels_any": "list[str] (optional) - OR filter: must have at least one",
@@ -374,10 +400,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "brief": "bool (default false) - Return only {id, title, status, priority}",
                 "fields": "list[str] (optional) - Custom field projection",
                 "max_description_length": "int (optional) - Truncate descriptions",
-                "workspace_root": "str (optional) - Workspace path"
+                "workspace_root": "str (optional) - Workspace path",
             },
             "returns": "List of ready issues (minimal format for context efficiency)",
-            "example": "ready(limit=5, priority=1, unassigned=True)"
+            "example": "ready(limit=5, priority=1, unassigned=True)",
         },
         "list": {
             "name": "list",
@@ -385,7 +411,7 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             "parameters": {
                 "status": "open|in_progress|blocked|deferred|closed or custom (optional)",
                 "priority": "int 0-4 (optional)",
-                "issue_type": "bug|feature|task|epic|chore or custom (optional)",
+                "issue_type": "bug|feature|task|epic|chore|decision or custom (optional)",
                 "assignee": "str (optional)",
                 "labels": "list[str] (optional) - AND filter: must have ALL labels",
                 "labels_any": "list[str] (optional) - OR filter: must have at least one",
@@ -395,10 +421,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "brief": "bool (default false) - Return only {id, title, status, priority}",
                 "fields": "list[str] (optional) - Custom field projection",
                 "max_description_length": "int (optional) - Truncate descriptions",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "List of issues (compacted if >20 results)",
-            "example": "list(status='open', labels=['bug'], query='auth')"
+            "example": "list(status='open', labels=['bug'], query='auth')",
         },
         "show": {
             "name": "show",
@@ -409,10 +435,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "brief_deps": "bool (default false) - Full issue with compact dependencies",
                 "fields": "list[str] (optional) - Custom field projection",
                 "max_description_length": "int (optional) - Truncate description",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "Full Issue object (or BriefIssue/dict based on params)",
-            "example": "show(issue_id='bd-a1b2', brief_deps=True)"
+            "example": "show(issue_id='bd-a1b2', brief_deps=True)",
         },
         "create": {
             "name": "create",
@@ -421,15 +447,26 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "title": "str (required)",
                 "description": "str (default '')",
                 "priority": "int 0-4 (default 2)",
-                "issue_type": "bug|feature|task|epic|chore or custom (default task)",
+                "issue_type": "bug|feature|task|epic|chore|decision or custom (default task)",
                 "assignee": "str (optional)",
                 "labels": "list[str] (optional)",
                 "deps": "list[str] (optional) - dependency IDs",
                 "brief": "bool (default true) - Return OperationResult instead of full Issue",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "OperationResult {id, action} or full Issue if brief=False",
-            "example": "create(title='Fix auth bug', priority=1, issue_type='bug')"
+            "example": "create(title='Fix auth bug', priority=1, issue_type='bug')",
+        },
+        "claim": {
+            "name": "claim",
+            "description": "Atomically claim an issue for work",
+            "parameters": {
+                "issue_id": "str (required)",
+                "brief": "bool (default true) - Return OperationResult instead of full Issue",
+                "workspace_root": "str (optional)",
+            },
+            "returns": "OperationResult {id, action='claimed'} or full Issue if brief=False",
+            "example": "claim(issue_id='bd-a1b2')",
         },
         "update": {
             "name": "update",
@@ -442,10 +479,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "title": "str (optional)",
                 "description": "str (optional)",
                 "brief": "bool (default true) - Return OperationResult instead of full Issue",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "OperationResult {id, action} or full Issue if brief=False",
-            "example": "update(issue_id='bd-a1b2', status='in_progress')"
+            "example": "update(issue_id='bd-a1b2', status='blocked')",
         },
         "close": {
             "name": "close",
@@ -454,10 +491,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "issue_id": "str (required)",
                 "reason": "str (default 'Completed')",
                 "brief": "bool (default true) - Return OperationResult instead of full Issue",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "List of OperationResult or full Issues if brief=False",
-            "example": "close(issue_id='bd-a1b2', reason='Fixed in PR #123')"
+            "example": "close(issue_id='bd-a1b2', reason='Fixed in PR #123')",
         },
         "reopen": {
             "name": "reopen",
@@ -466,10 +503,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "issue_ids": "list[str] (required)",
                 "reason": "str (optional)",
                 "brief": "bool (default true) - Return OperationResult instead of full Issue",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "List of OperationResult or full Issues if brief=False",
-            "example": "reopen(issue_ids=['bd-a1b2'], reason='Need more work')"
+            "example": "reopen(issue_ids=['bd-a1b2'], reason='Need more work')",
         },
         "dep": {
             "name": "dep",
@@ -478,17 +515,17 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "issue_id": "str (required) - Issue that has the dependency",
                 "depends_on_id": "str (required) - Issue it depends on",
                 "dep_type": "blocks|related|parent-child|discovered-from (default blocks)",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "Confirmation message",
-            "example": "dep(issue_id='bd-f1a2', depends_on_id='bd-a1b2', dep_type='blocks')"
+            "example": "dep(issue_id='bd-f1a2', depends_on_id='bd-a1b2', dep_type='blocks')",
         },
         "stats": {
             "name": "stats",
             "description": "Get issue statistics",
             "parameters": {"workspace_root": "str (optional)"},
             "returns": "Stats object with counts and metrics",
-            "example": "stats()"
+            "example": "stats()",
         },
         "blocked": {
             "name": "blocked",
@@ -496,10 +533,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             "parameters": {
                 "brief": "bool (default false) - Return only {id, title, status, priority}",
                 "brief_deps": "bool (default false) - Full issues with compact dependencies",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "List of BlockedIssue (or BriefIssue/dict based on params)",
-            "example": "blocked(brief=True)"
+            "example": "blocked(brief=True)",
         },
         "admin": {
             "name": "admin",
@@ -510,10 +547,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
                 "fix_all": "bool (default false) - For validate: auto-fix issues",
                 "fix": "bool (default false) - For repair: apply fixes",
                 "clean": "bool (default false) - For pollution: delete test issues",
-                "workspace_root": "str (optional)"
+                "workspace_root": "str (optional)",
             },
             "returns": "Dict with operation results (or string for debug)",
-            "example": "admin(action='validate', checks='orphans')"
+            "example": "admin(action='validate', checks='orphans')",
         },
         "context": {
             "name": "context",
@@ -521,10 +558,10 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
             "parameters": {
                 "action": "str (optional) - set|show|init (default: show if no args, set if workspace_root provided)",
                 "workspace_root": "str (optional) - Workspace path for set/init actions",
-                "prefix": "str (optional) - Issue ID prefix for init action"
+                "prefix": "str (optional) - Issue ID prefix for init action",
             },
             "returns": "String with context information or confirmation",
-            "example": "context(action='set', workspace_root='/path/to/project')"
+            "example": "context(action='set', workspace_root='/path/to/project')",
         },
     }
 
@@ -533,9 +570,9 @@ async def get_tool_info(tool_name: str) -> dict[str, Any]:
         return {
             "error": f"Unknown tool: {tool_name}",
             "available_tools": available,
-            "hint": "Use discover_tools() to see all available tools"
+            "hint": "Use discover_tools() to see all available tools",
         }
-    
+
     return tool_details[tool_name]
 
 
@@ -582,10 +619,7 @@ async def context(
 
     elif action == "init":
         # For init, we need context to be set first
-        context_set = (
-            _workspace_context.get("BEADS_CONTEXT_SET")
-            or os.environ.get("BEADS_CONTEXT_SET")
-        )
+        context_set = _workspace_context.get("BEADS_CONTEXT_SET") or os.environ.get("BEADS_CONTEXT_SET")
         if not context_set:
             return (
                 "Error: Context must be set before init.\n"
@@ -622,10 +656,10 @@ async def _context_set(workspace_root: str) -> str:
     os.environ["BEADS_WORKING_DIR"] = resolved_root
     os.environ["BEADS_CONTEXT_SET"] = "1"
 
-    # Find beads database
-    db_path = _find_beads_db(resolved_root)
+    # Locate the beads project (handles SQLite and Dolt backends)
+    project = _find_beads_project(resolved_root)
 
-    if db_path is None:
+    if project is None:
         # Clear any stale DB path
         _workspace_context.pop("BEADS_DB", None)
         os.environ.pop("BEADS_DB", None)
@@ -635,23 +669,38 @@ async def _context_set(workspace_root: str) -> str:
             f"  Database: Not found (run context(action='init') to create)"
         )
 
-    # Set database path in both persistent context and os.environ
-    _workspace_context["BEADS_DB"] = db_path
-    os.environ["BEADS_DB"] = db_path
+    project_root, backend = project
 
+    # BEADS_DB only applies to SQLite. Dolt backends use metadata.json,
+    # which the bd CLI reads directly.
+    if backend == "sqlite":
+        db_path = _find_beads_db(project_root)
+        if db_path:
+            _workspace_context["BEADS_DB"] = db_path
+            os.environ["BEADS_DB"] = db_path
+            return f"Context set successfully:\n  Workspace root: {resolved_root}\n  Database: {db_path}"
+        else:
+            _workspace_context.pop("BEADS_DB", None)
+            os.environ.pop("BEADS_DB", None)
+            return (
+                f"Context set successfully:\n"
+                f"  Workspace root: {resolved_root}\n"
+                f"  Database: Not found (run context(action='init') to create)"
+            )
+
+    # Dolt or unknown — clear any stale BEADS_DB and report the project root.
+    _workspace_context.pop("BEADS_DB", None)
+    os.environ.pop("BEADS_DB", None)
     return (
         f"Context set successfully:\n"
         f"  Workspace root: {resolved_root}\n"
-        f"  Database: {db_path}"
+        f"  Project: {os.path.join(project_root, '.beads')} (backend: {backend})"
     )
 
 
 def _context_show() -> str:
     """Show current workspace context for debugging."""
-    context_set = (
-        _workspace_context.get("BEADS_CONTEXT_SET")
-        or os.environ.get("BEADS_CONTEXT_SET")
-    )
+    context_set = _workspace_context.get("BEADS_CONTEXT_SET") or os.environ.get("BEADS_CONTEXT_SET")
 
     if not context_set:
         return (
@@ -662,27 +711,18 @@ def _context_show() -> str:
             f"BEADS_DB: {_workspace_context.get('BEADS_DB') or os.environ.get('BEADS_DB', 'NOT SET')}"
         )
 
-    working_dir = (
-        _workspace_context.get("BEADS_WORKING_DIR")
-        or os.environ.get("BEADS_WORKING_DIR", "NOT SET")
-    )
-    db_path = (
-        _workspace_context.get("BEADS_DB")
-        or os.environ.get("BEADS_DB", "NOT SET")
-    )
+    working_dir = _workspace_context.get("BEADS_WORKING_DIR") or os.environ.get("BEADS_WORKING_DIR", "NOT SET")
+    db_path = _workspace_context.get("BEADS_DB") or os.environ.get("BEADS_DB", "NOT SET")
     actor = os.environ.get("BEADS_ACTOR", "NOT SET")
 
-    return (
-        f"Workspace root: {working_dir}\n"
-        f"Database: {db_path}\n"
-        f"Actor: {actor}"
-    )
+    return f"Workspace root: {working_dir}\nDatabase: {db_path}\nActor: {actor}"
 
 
 # Register all tools
 # =============================================================================
 # CONTEXT ENGINEERING: Optimized List Tools with Compaction
 # =============================================================================
+
 
 def _to_minimal(issue: Issue) -> IssueMinimal:
     """Convert full Issue to minimal format for context efficiency."""
@@ -722,10 +762,25 @@ def _to_brief_dep(linked: LinkedIssue) -> BriefDep:
 
 # Valid fields for Issue model (used for field validation)
 VALID_ISSUE_FIELDS: set[str] = {
-    "id", "title", "description", "design", "acceptance_criteria", "notes",
-    "external_ref", "status", "priority", "issue_type", "created_at",
-    "updated_at", "closed_at", "assignee", "labels", "dependency_count",
-    "dependent_count", "dependencies", "dependents",
+    "id",
+    "title",
+    "description",
+    "design",
+    "acceptance_criteria",
+    "notes",
+    "external_ref",
+    "status",
+    "priority",
+    "issue_type",
+    "created_at",
+    "updated_at",
+    "closed_at",
+    "assignee",
+    "labels",
+    "dependency_count",
+    "dependent_count",
+    "dependencies",
+    "dependents",
 }
 
 
@@ -739,18 +794,15 @@ def _filter_fields(obj: Issue, fields: list[str]) -> dict[str, Any]:
     requested = set(fields)
     invalid = requested - VALID_ISSUE_FIELDS
     if invalid:
-        raise ValueError(
-            f"Invalid field(s): {sorted(invalid)}. "
-            f"Valid fields: {sorted(VALID_ISSUE_FIELDS)}"
-        )
+        raise ValueError(f"Invalid field(s): {sorted(invalid)}. Valid fields: {sorted(VALID_ISSUE_FIELDS)}")
 
     result: dict[str, Any] = {}
     for field in fields:
         value = getattr(obj, field)
         # Handle nested Pydantic models
-        if hasattr(value, 'model_dump'):
+        if hasattr(value, "model_dump"):
             result[field] = value.model_dump()
-        elif isinstance(value, list) and value and hasattr(value[0], 'model_dump'):
+        elif isinstance(value, list) and value and hasattr(value[0], "model_dump"):
             result[field] = [item.model_dump() for item in value]
         else:
             result[field] = value
@@ -761,16 +813,20 @@ def _truncate_description(issue: Issue, max_length: int) -> Issue:
     """Return issue copy with truncated description if needed."""
     if issue.description and len(issue.description) > max_length:
         data = issue.model_dump()
-        data['description'] = issue.description[:max_length] + "..."
+        data["description"] = issue.description[:max_length] + "..."
         return Issue(**data)
     return issue
 
 
-@mcp.tool(name="ready", description="Find tasks that have no blockers and are ready to be worked on. Returns minimal format for context efficiency.", output_schema=None)
+@mcp.tool(
+    name="ready",
+    description="Find tasks that have no blockers and are ready to be worked on. Returns minimal format for context efficiency.",
+)
 @with_workspace
 async def ready_work(
     limit: int = 10,
     priority: int | None = None,
+    issue_type: str | None = None,
     assignee: str | None = None,
     labels: list[str] | None = None,
     labels_any: list[str] | None = None,
@@ -786,6 +842,7 @@ async def ready_work(
     Args:
         limit: Maximum issues to return (1-100, default 10)
         priority: Filter by priority level (0-4)
+        issue_type: Filter by type (task, bug, feature, epic, chore, decision, merge-request, or custom)
         assignee: Filter by assignee
         labels: Filter by labels (AND: must have ALL specified labels)
         labels_any: Filter by labels (OR: must have at least one)
@@ -802,6 +859,7 @@ async def ready_work(
     issues = await beads_ready_work(
         limit=limit,
         priority=priority,
+        issue_type=issue_type,
         assignee=assignee,
         labels=labels,
         labels_any=labels_any,
@@ -831,7 +889,7 @@ async def ready_work(
             total_count=len(minimal_issues),
             preview=minimal_issues[:PREVIEW_COUNT],
             preview_count=PREVIEW_COUNT,
-            hint=f"Showing {PREVIEW_COUNT} of {len(minimal_issues)} ready issues. Use show(issue_id) for full details."
+            hint=f"Showing {PREVIEW_COUNT} of {len(minimal_issues)} ready issues. Use show(issue_id) for full details.",
         )
 
     return minimal_issues
@@ -840,7 +898,6 @@ async def ready_work(
 @mcp.tool(
     name="list",
     description="List all issues with optional filters. When status='blocked', returns BlockedIssue with blocked_by info.",
-    output_schema=None,
 )
 @with_workspace
 async def list_issues(
@@ -863,7 +920,7 @@ async def list_issues(
     Args:
         status: Filter by status (open, in_progress, blocked, closed)
         priority: Filter by priority level (0-4)
-        issue_type: Filter by type (bug, feature, task, epic, chore)
+        issue_type: Filter by type (bug, feature, task, epic, chore, decision)
         assignee: Filter by assignee
         labels: Filter by labels (AND: must have ALL specified labels)
         labels_any: Filter by labels (OR: must have at least one)
@@ -912,7 +969,7 @@ async def list_issues(
             total_count=len(minimal_issues),
             preview=minimal_issues[:PREVIEW_COUNT],
             preview_count=PREVIEW_COUNT,
-            hint=f"Showing {PREVIEW_COUNT} of {len(minimal_issues)} issues. Use show(issue_id) for full details or add filters to narrow results."
+            hint=f"Showing {PREVIEW_COUNT} of {len(minimal_issues)} issues. Use show(issue_id) for full details or add filters to narrow results.",
         )
 
     return minimal_issues
@@ -921,7 +978,6 @@ async def list_issues(
 @mcp.tool(
     name="show",
     description="Show detailed information about a specific issue including dependencies and dependents.",
-    output_schema=None,
 )
 @with_workspace
 async def show_issue(
@@ -966,9 +1022,8 @@ async def show_issue(
 
 @mcp.tool(
     name="create",
-    description="""Create a new issue (bug, feature, task, epic, or chore) with optional design,
+    description="""Create a new issue (bug, feature, task, epic, chore, or decision) with optional design,
 acceptance criteria, and dependencies.""",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1012,10 +1067,33 @@ async def create_issue(
 
 
 @mcp.tool(
+    name="claim",
+    description="Atomically claim an issue for work (assignee + in_progress in one CAS-style operation).",
+)
+@with_workspace
+@require_context
+async def claim_issue(
+    issue_id: str,
+    workspace_root: str | None = None,
+    brief: bool = True,
+) -> Issue | OperationResult | None:
+    """Atomically claim an issue for work.
+
+    Args:
+        brief: If True (default), return minimal OperationResult; if False, return full Issue
+    """
+    issue = await beads_claim_issue(issue_id=issue_id)
+    if issue is None:
+        return None
+    if brief:
+        return OperationResult(id=issue.id, action="claimed")
+    return issue
+
+
+@mcp.tool(
     name="update",
     description="""Update an existing issue's status, priority, assignee, description, design notes,
-or acceptance criteria. Use this to claim work (set status=in_progress).""",
-    output_schema=None,
+or acceptance criteria. For atomic start-work semantics, prefer claim(issue_id).""",
 )
 @with_workspace
 @require_context
@@ -1070,7 +1148,6 @@ async def update_issue(
 @mcp.tool(
     name="close",
     description="Close (complete) an issue. Mark work as done when you've finished implementing/fixing it.",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1096,7 +1173,6 @@ async def close_issue(
 @mcp.tool(
     name="reopen",
     description="Reopen one or more closed issues. Sets status to 'open' and clears closed_at timestamp.",
-    output_schema=None,
 )
 @with_workspace
 @require_context
@@ -1120,8 +1196,10 @@ async def reopen_issue(
 
 @mcp.tool(
     name="dep",
-    description="""Add a dependency between issues. Types: blocks (hard blocker),
-related (soft link), parent-child (epic/subtask), discovered-from (found during work).""",
+    description="""Add a dependency between issues. Common types: blocks (hard blocker),
+related (soft link), parent-child (epic/subtask), discovered-from (found during work).
+The full set of supported dep types lives in internal/types/types.go and is
+validated by the bd CLI; pass any of them as a string.""",
 )
 @with_workspace
 @require_context
@@ -1152,7 +1230,6 @@ async def stats(workspace_root: str | None = None) -> Stats:
 @mcp.tool(
     name="blocked",
     description="Get blocked issues showing what dependencies are blocking them from being worked on.",
-    output_schema=None,
 )
 @with_workspace
 async def blocked(
@@ -1235,7 +1312,9 @@ async def admin(
         return await beads_detect_pollution(clean=clean)
 
     else:
-        raise ValueError(f"Unknown action: {action}. Use 'validate', 'repair', 'schema', 'debug', 'migration', or 'pollution'")
+        raise ValueError(
+            f"Unknown action: {action}. Use 'validate', 'repair', 'schema', 'debug', 'migration', or 'pollution'"
+        )
 
 
 async def async_main() -> None:

@@ -7,25 +7,34 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
-
-// validRefPattern matches valid Dolt commit hashes (32 hex chars) or branch names
-var validRefPattern = regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
 
 // validTablePattern matches valid table names
 var validTablePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
-// validateRef checks if a ref is safe to use in queries
+// validDatabasePattern matches valid MySQL database names (alphanumeric, underscore, hyphen)
+var validDatabasePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_\-]*$`)
+
+// validateRef checks if a ref is safe to use in queries.
+// Delegates to issueops.ValidateRef.
 func validateRef(ref string) error {
-	if ref == "" {
-		return fmt.Errorf("ref cannot be empty")
+	return issueops.ValidateRef(ref)
+}
+
+// ValidateDatabaseName checks if a database name is safe to use in queries.
+// Prevents SQL injection via backtick escaping in CREATE DATABASE statements.
+func ValidateDatabaseName(name string) error {
+	if name == "" {
+		return fmt.Errorf("database name cannot be empty")
 	}
-	if len(ref) > 128 {
-		return fmt.Errorf("ref too long")
+	if len(name) > 64 {
+		return fmt.Errorf("database name too long")
 	}
-	if !validRefPattern.MatchString(ref) {
-		return fmt.Errorf("invalid ref format: %s", ref)
+	if !validDatabasePattern.MatchString(name) {
+		return fmt.Errorf("invalid database name: %s", name)
 	}
 	return nil
 }
@@ -44,35 +53,40 @@ func validateTableName(table string) error {
 	return nil
 }
 
-// IssueHistory represents an issue at a specific point in history
-type IssueHistory struct {
+// issueHistory represents an issue at a specific point in history
+type issueHistory struct {
 	Issue      *types.Issue
 	CommitHash string
 	Committer  string
 	CommitDate time.Time
 }
 
-// GetIssueHistory returns the complete history of an issue
-func (s *DoltStore) GetIssueHistory(ctx context.Context, issueID string) ([]*IssueHistory, error) {
-	rows, err := s.db.QueryContext(ctx, `
+// getIssueHistory returns the complete history of an issue
+func (s *DoltStore) getIssueHistory(ctx context.Context, issueID string) ([]*issueHistory, error) {
+	// Wrap in a subquery to avoid Dolt's max1Row optimization on PK lookup.
+	// dolt_history_* tables return multiple rows per PK (one per commit),
+	// but the query planner incorrectly assumes WHERE id=? returns one row.
+	rows, err := s.queryContext(ctx, `
 		SELECT
 			id, title, description, design, acceptance_criteria, notes,
 			status, priority, issue_type, assignee, owner, created_by,
 			estimated_minutes, created_at, updated_at, closed_at, close_reason,
 			pinned, mol_type,
 			commit_hash, committer, commit_date
-		FROM dolt_history_issues
-		WHERE id = ?
-		ORDER BY commit_date DESC
+		FROM (
+			SELECT * FROM dolt_history_issues
+		) h
+		WHERE h.id = ?
+		ORDER BY h.commit_date DESC
 	`, issueID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue history: %w", err)
 	}
 	defer rows.Close()
 
-	var history []*IssueHistory
+	var history []*issueHistory
 	for rows.Next() {
-		var h IssueHistory
+		var h issueHistory
 		var issue types.Issue
 		var createdAtStr, updatedAtStr sql.NullString // TEXT columns - must parse manually
 		var closedAt sql.NullTime
@@ -131,196 +145,30 @@ func (s *DoltStore) GetIssueHistory(ctx context.Context, issueID string) ([]*Iss
 	return history, rows.Err()
 }
 
-// GetIssueAsOf returns an issue as it existed at a specific commit or time
-func (s *DoltStore) GetIssueAsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {
-	// Validate ref to prevent SQL injection
-	if err := validateRef(ref); err != nil {
-		return nil, fmt.Errorf("invalid ref: %w", err)
-	}
-
-	var issue types.Issue
-	var createdAtStr, updatedAtStr sql.NullString // TEXT columns - must parse manually
-	var closedAt sql.NullTime
-	var assignee, owner, contentHash sql.NullString
-	var estimatedMinutes sql.NullInt64
-
-	// nolint:gosec // G201: ref is validated by validateRef() above - AS OF requires literal
-	query := fmt.Sprintf(`
-		SELECT id, content_hash, title, description, status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, owner, updated_at, closed_at
-		FROM issues AS OF '%s'
-		WHERE id = ?
-	`, ref)
-
-	err := s.db.QueryRowContext(ctx, query, issueID).Scan(
-		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Status, &issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get issue as of %s: %w", ref, err)
-	}
-
-	// Parse timestamp strings (TEXT columns require manual parsing)
-	if createdAtStr.Valid {
-		issue.CreatedAt = parseTimeString(createdAtStr.String)
-	}
-	if updatedAtStr.Valid {
-		issue.UpdatedAt = parseTimeString(updatedAtStr.String)
-	}
-
-	if contentHash.Valid {
-		issue.ContentHash = contentHash.String
-	}
-	if closedAt.Valid {
-		issue.ClosedAt = &closedAt.Time
-	}
-	if assignee.Valid {
-		issue.Assignee = assignee.String
-	}
-	if owner.Valid {
-		issue.Owner = owner.String
-	}
-	if estimatedMinutes.Valid {
-		mins := int(estimatedMinutes.Int64)
-		issue.EstimatedMinutes = &mins
-	}
-
-	return &issue, nil
+// getIssueAsOf returns an issue as it existed at a specific commit or time
+func (s *DoltStore) getIssueAsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error) {
+	var result *types.Issue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.AsOfInTx(ctx, tx, issueID, ref)
+		return err
+	})
+	return result, err
 }
 
-// DiffEntry represents a change between two commits
-type DiffEntry struct {
-	TableName  string
-	DiffType   string // "added", "modified", "removed"
-	FromCommit string
-	ToCommit   string
-	RowID      string
-}
-
-// GetDiff returns changes between two commits
-func (s *DoltStore) GetDiff(ctx context.Context, fromRef, toRef string) ([]*DiffEntry, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT table_name, diff_type, from_commit, to_commit
-		FROM dolt_diff(?, ?)
-	`, fromRef, toRef)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get diff: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []*DiffEntry
-	for rows.Next() {
-		var e DiffEntry
-		if err := rows.Scan(&e.TableName, &e.DiffType, &e.FromCommit, &e.ToCommit); err != nil {
-			return nil, fmt.Errorf("failed to scan diff entry: %w", err)
-		}
-		entries = append(entries, &e)
-	}
-
-	return entries, rows.Err()
-}
-
-// GetIssueDiff returns detailed changes to a specific issue between commits
-func (s *DoltStore) GetIssueDiff(ctx context.Context, issueID, fromRef, toRef string) (*IssueDiff, error) {
-	// Validate refs to prevent SQL injection
-	if err := validateRef(fromRef); err != nil {
-		return nil, fmt.Errorf("invalid fromRef: %w", err)
-	}
-	if err := validateRef(toRef); err != nil {
-		return nil, fmt.Errorf("invalid toRef: %w", err)
-	}
-
-	// nolint:gosec // G201: refs are validated by validateRef() above
-	// Syntax: dolt_diff(from_ref, to_ref, 'table_name')
-	query := fmt.Sprintf(`
-		SELECT
-			from_id, to_id,
-			from_title, to_title,
-			from_status, to_status,
-			from_description, to_description,
-			diff_type
-		FROM dolt_diff('%s', '%s', 'issues')
-		WHERE from_id = ? OR to_id = ?
-	`, fromRef, toRef)
-
-	var diff IssueDiff
-	var fromID, toID, fromTitle, toTitle, fromStatus, toStatus sql.NullString
-	var fromDesc, toDesc sql.NullString
-
-	err := s.db.QueryRowContext(ctx, query, issueID, issueID).Scan(
-		&fromID, &toID,
-		&fromTitle, &toTitle,
-		&fromStatus, &toStatus,
-		&fromDesc, &toDesc,
-		&diff.DiffType,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get issue diff: %w", err)
-	}
-
-	if fromID.Valid {
-		diff.FromID = fromID.String
-	}
-	if toID.Valid {
-		diff.ToID = toID.String
-	}
-	if fromTitle.Valid {
-		diff.FromTitle = fromTitle.String
-	}
-	if toTitle.Valid {
-		diff.ToTitle = toTitle.String
-	}
-	if fromStatus.Valid {
-		diff.FromStatus = fromStatus.String
-	}
-	if toStatus.Valid {
-		diff.ToStatus = toStatus.String
-	}
-	if fromDesc.Valid {
-		diff.FromDescription = fromDesc.String
-	}
-	if toDesc.Valid {
-		diff.ToDescription = toDesc.String
-	}
-
-	return &diff, nil
-}
-
-// IssueDiff represents changes to an issue between two commits
-type IssueDiff struct {
-	DiffType        string // "added", "modified", "removed"
-	FromID          string
-	ToID            string
-	FromTitle       string
-	ToTitle         string
-	FromStatus      string
-	ToStatus        string
-	FromDescription string
-	ToDescription   string
-}
-
-// GetInternalConflicts returns any merge conflicts in the current state (internal format).
+// getInternalConflicts returns any merge conflicts in the current state (internal format).
 // For the public interface, use GetConflicts which returns storage.Conflict.
-func (s *DoltStore) GetInternalConflicts(ctx context.Context) ([]*TableConflict, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT table_name, num_conflicts FROM dolt_conflicts
-	`)
+func (s *DoltStore) getInternalConflicts(ctx context.Context) ([]*tableConflict, error) {
+	rows, err := s.queryContext(ctx,
+		"SELECT `table`, num_conflicts FROM dolt_conflicts")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get conflicts: %w", err)
 	}
 	defer rows.Close()
 
-	var conflicts []*TableConflict
+	var conflicts []*tableConflict
 	for rows.Next() {
-		var c TableConflict
+		var c tableConflict
 		if err := rows.Scan(&c.TableName, &c.NumConflicts); err != nil {
 			return nil, fmt.Errorf("failed to scan conflict: %w", err)
 		}
@@ -330,33 +178,13 @@ func (s *DoltStore) GetInternalConflicts(ctx context.Context) ([]*TableConflict,
 	return conflicts, rows.Err()
 }
 
-// TableConflict represents a Dolt table-level merge conflict (internal representation).
-type TableConflict struct {
+// tableConflict represents a Dolt table-level merge conflict (internal representation).
+type tableConflict struct {
 	TableName    string
 	NumConflicts int
 }
 
 // ResolveConflicts resolves conflicts using the specified strategy
 func (s *DoltStore) ResolveConflicts(ctx context.Context, table string, strategy string) error {
-	// Validate table name to prevent SQL injection
-	if err := validateTableName(table); err != nil {
-		return fmt.Errorf("invalid table name: %w", err)
-	}
-
-	var query string
-	switch strategy {
-	case "ours":
-		// Note: DOLT_CONFLICTS_RESOLVE requires literal value, but we've validated table is safe
-		query = fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--ours', '%s')", table)
-	case "theirs":
-		query = fmt.Sprintf("CALL DOLT_CONFLICTS_RESOLVE('--theirs', '%s')", table)
-	default:
-		return fmt.Errorf("unknown conflict resolution strategy: %s", strategy)
-	}
-
-	_, err := s.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to resolve conflicts: %w", err)
-	}
-	return nil
+	return versioncontrolops.ResolveConflicts(ctx, s.db, table, strategy)
 }

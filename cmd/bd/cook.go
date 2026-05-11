@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -226,8 +225,8 @@ func outputCookDryRun(resolved *formula.Formula, protoID string, runtimeMode boo
 		modeLabel = "runtime"
 		// Apply defaults for runtime mode display
 		for name, def := range resolved.Vars {
-			if _, provided := inputVars[name]; !provided && def.Default != "" {
-				inputVars[name] = def.Default
+			if _, provided := inputVars[name]; !provided && def.Default != nil {
+				inputVars[name] = *def.Default
 			}
 		}
 	}
@@ -267,8 +266,8 @@ func outputCookDryRun(resolved *formula.Formula, protoID string, runtimeMode boo
 			if def.Required {
 				attrs = append(attrs, "required")
 			}
-			if def.Default != "" {
-				attrs = append(attrs, fmt.Sprintf("default=%s", def.Default))
+			if def.Default != nil {
+				attrs = append(attrs, fmt.Sprintf("default=%s", *def.Default))
 			}
 			if len(def.Enum) > 0 {
 				attrs = append(attrs, fmt.Sprintf("enum=[%s]", strings.Join(def.Enum, ",")))
@@ -287,8 +286,8 @@ func outputCookEphemeral(resolved *formula.Formula, runtimeMode bool, inputVars 
 	if runtimeMode {
 		// Apply defaults from formula variable definitions
 		for name, def := range resolved.Vars {
-			if _, provided := inputVars[name]; !provided && def.Default != "" {
-				inputVars[name] = def.Default
+			if _, provided := inputVars[name]; !provided && def.Default != nil {
+				inputVars[name] = *def.Default
 			}
 		}
 
@@ -331,9 +330,6 @@ func persistCookFormula(ctx context.Context, resolved *formula.Formula, protoID 
 		return fmt.Errorf("cooking formula: %w", err)
 	}
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
-
 	if jsonOutput {
 		outputJSON(cookResult{
 			ProtoID:    result.ProtoID,
@@ -361,29 +357,21 @@ func runCook(cmd *cobra.Command, args []string) {
 	// Parse and validate flags
 	flags, err := parseCookFlags(cmd, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Validate store access for persist mode
 	if flags.persist {
 		CheckReadonly("cook --persist")
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: cook --persist requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon cook %s --persist ...\n", flags.formulaPath)
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 	}
 
 	// Load and resolve the formula
 	resolved, err := loadAndResolveFormula(flags.formulaPath, flags.searchPaths)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Apply prefix to proto ID if specified
@@ -410,16 +398,14 @@ func runCook(cmd *cobra.Command, args []string) {
 	// Handle ephemeral mode (default)
 	if !flags.persist {
 		if err := outputCookEphemeral(resolved, flags.runtimeMode, flags.inputVars, vars); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		return
 	}
 
 	// Handle persist mode
 	if err := persistCookFormula(rootCtx, resolved, protoID, flags.force, vars, bondPoints); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 }
 
@@ -456,14 +442,14 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 		rootDesc = "{{desc}}"
 	}
 
-	// Create root proto epic
+	// Create root proto molecule
 	rootIssue := &types.Issue{
 		ID:          protoID,
 		Title:       rootTitle,
 		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
-		IssueType:   types.TypeEpic,
+		IssueType:   types.TypeMolecule,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
@@ -502,8 +488,9 @@ func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 
 	// Build title from gate type and ID
 	title := fmt.Sprintf("Gate: %s", step.Gate.Type)
-	if step.Gate.ID != "" {
-		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, step.Gate.ID)
+	awaitID := gateAwaitID(step.Gate)
+	if awaitID != "" {
+		title = fmt.Sprintf("Gate: %s %s", step.Gate.Type, awaitID)
 	}
 
 	// Parse timeout if specified
@@ -522,12 +509,22 @@ func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 		Priority:    2,
 		IssueType:   "gate",
 		AwaitType:   step.Gate.Type,
-		AwaitID:     step.Gate.ID,
+		AwaitID:     awaitID,
 		Timeout:     timeout,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
+}
+
+func gateAwaitID(gate *formula.Gate) string {
+	if gate == nil {
+		return ""
+	}
+	if gate.AwaitID != "" {
+		return gate.AwaitID
+	}
+	return gate.ID
 }
 
 // processStepToIssue converts a formula.Step to a types.Issue.
@@ -553,6 +550,7 @@ func processStepToIssue(step *formula.Step, parentID string) *types.Issue {
 		ID:             issueID,
 		Title:          step.Title, // Keep {{variables}} for substitution at pour time
 		Description:    step.Description,
+		Notes:          step.Notes,
 		Status:         types.StatusOpen,
 		Priority:       priority,
 		IssueType:      issueType,
@@ -571,6 +569,13 @@ func processStepToIssue(step *formula.Step, parentID string) *types.Issue {
 	if step.WaitsFor != "" {
 		gateLabel := fmt.Sprintf("gate:%s", step.WaitsFor)
 		issue.Labels = append(issue.Labels, gateLabel)
+	}
+
+	// Carry step metadata through to the issue (GH#3341).
+	if len(step.Metadata) > 0 {
+		if metaJSON, err := json.Marshal(step.Metadata); err == nil {
+			issue.Metadata = metaJSON
+		}
 	}
 
 	return issue
@@ -658,7 +663,6 @@ func collectSteps(steps []*formula.Step, parentID string,
 	}
 }
 
-
 // resolveAndCookFormula loads a formula by name, resolves it, applies all transformations,
 // and returns an in-memory TemplateSubgraph ready for instantiation.
 // This is the main entry point for ephemeral proto cooking.
@@ -735,8 +739,8 @@ func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, con
 		// Merge with formula defaults for complete evaluation
 		mergedVars := make(map[string]string)
 		for name, def := range resolved.Vars {
-			if def != nil && def.Default != "" {
-				mergedVars[name] = def.Default
+			if def != nil && def.Default != nil {
+				mergedVars[name] = *def.Default
 			}
 		}
 		for k, v := range conditionVars {
@@ -748,6 +752,27 @@ func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, con
 			return nil, fmt.Errorf("filtering steps by condition: %w", err)
 		}
 		resolved.Steps = filteredSteps
+	}
+
+	// Handle standalone expansion formulas (bd-qzb).
+	// Expansion formulas store content in Template, not Steps. Materialize
+	// the template into Steps using a synthetic "main" target so the normal
+	// cooking pipeline can process them.
+	if resolved.Type == formula.TypeExpansion && len(resolved.Template) > 0 {
+		expansionVars := make(map[string]string)
+		for name, def := range resolved.Vars {
+			if def != nil && def.Default != nil {
+				expansionVars[name] = *def.Default
+			}
+		}
+		if conditionVars != nil {
+			for k, v := range conditionVars {
+				expansionVars[k] = v
+			}
+		}
+		if err := formula.MaterializeExpansion(resolved, "main", expansionVars); err != nil {
+			return nil, fmt.Errorf("standalone expansion %q: %w", formulaName, err)
+		}
 	}
 
 	// Cook to in-memory subgraph, including variable definitions for default handling
@@ -770,14 +795,15 @@ func cookFormulaToSubgraphWithVars(f *formula.Formula, protoID string, vars map[
 			}
 		}
 	}
-	// Attach recommended phase from formula (warn on pour of vapor formulas)
+	// Attach recommended phase and pour flag from formula
 	subgraph.Phase = f.Phase
+	subgraph.Pour = f.Pour
 	return subgraph, nil
 }
 
 // cookFormula creates a proto bead from a resolved formula.
 // protoID is the final ID for the proto (may include a prefix).
-func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
+func cookFormula(ctx context.Context, s storage.DoltStorage, f *formula.Formula, protoID string) (*cookFormulaResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -804,14 +830,14 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 		rootDesc = "{{desc}}"
 	}
 
-	// Create root proto epic using provided protoID (may include prefix)
+	// Create root proto molecule using provided protoID (may include prefix)
 	rootIssue := &types.Issue{
 		ID:          protoID,
 		Title:       rootTitle,
 		Description: rootDesc,
 		Status:      types.StatusOpen,
 		Priority:    2,
-		IssueType:   types.TypeEpic,
+		IssueType:   types.TypeMolecule,
 		IsTemplate:  true,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
@@ -830,20 +856,14 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 		collectDependencies(step, idMapping, &deps)
 	}
 
-	// Create all issues using batch with skip prefix validation
-	opts := storage.BatchCreateOptions{
-		SkipPrefixValidation: true, // Molecules use mol-* prefix
-		OrphanHandling:       storage.OrphanAllow,
-	}
-	if err := s.CreateIssuesWithFullOptions(ctx, issues, actor, opts); err != nil {
-		return nil, fmt.Errorf("failed to create issues: %w", err)
-	}
+	// Create issues, labels, and dependencies in a single atomic transaction.
+	// This prevents orphaned issues if label/dependency creation fails.
+	err := transact(ctx, s, fmt.Sprintf("bd: cook formula %s", protoID), func(tx storage.Transaction) error {
+		// Create all issues
+		if err := tx.CreateIssues(ctx, issues, actor); err != nil {
+			return fmt.Errorf("failed to create issues: %w", err)
+		}
 
-	// Track if we need cleanup on failure
-	issuesCreated := true
-
-	// Add labels and dependencies in a transaction
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
 		// Add labels
 		for _, l := range labels {
 			if err := tx.AddLabel(ctx, l.issueID, l.label, actor); err != nil {
@@ -862,18 +882,6 @@ func cookFormula(ctx context.Context, s storage.Storage, f *formula.Formula, pro
 	})
 
 	if err != nil {
-		// Clean up: delete the issues we created since labels/deps failed
-		if issuesCreated {
-			cleanupErr := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
-				for i := len(issues) - 1; i >= 0; i-- {
-					_ = tx.DeleteIssue(ctx, issues[i].ID) // Best effort cleanup
-				}
-				return nil
-			})
-			if cleanupErr != nil {
-				return nil, fmt.Errorf("%w (cleanup also failed: %v)", err, cleanupErr)
-			}
-		}
 		return nil, err
 	}
 
@@ -953,7 +961,7 @@ func collectDependencies(step *formula.Step, idMapping map[string]string, deps *
 }
 
 // deleteProtoSubgraph deletes a proto and all its children.
-func deleteProtoSubgraph(ctx context.Context, s storage.Storage, protoID string) error {
+func deleteProtoSubgraph(ctx context.Context, s storage.DoltStorage, protoID string) error {
 	// Load the subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, s, protoID)
 	if err != nil {
@@ -961,7 +969,7 @@ func deleteProtoSubgraph(ctx context.Context, s storage.Storage, protoID string)
 	}
 
 	// Delete in reverse order (children first)
-	return s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	return transact(ctx, s, fmt.Sprintf("bd: delete proto subgraph %s", protoID), func(tx storage.Transaction) error {
 		for i := len(subgraph.Issues) - 1; i >= 0; i-- {
 			issue := subgraph.Issues[i]
 			if err := tx.DeleteIssue(ctx, issue.ID); err != nil {
@@ -1032,11 +1040,18 @@ func substituteFormulaVars(f *formula.Formula, vars map[string]string) {
 	substituteStepVars(f.Steps, vars)
 }
 
-// substituteStepVars recursively substitutes variables in step titles and descriptions.
+// substituteStepVars recursively substitutes variables in step fields.
 func substituteStepVars(steps []*formula.Step, vars map[string]string) {
 	for _, step := range steps {
 		step.Title = substituteVariables(step.Title, vars)
 		step.Description = substituteVariables(step.Description, vars)
+		step.Notes = substituteVariables(step.Notes, vars)
+		if step.Gate != nil {
+			step.Gate.Type = substituteVariables(step.Gate.Type, vars)
+			step.Gate.ID = substituteVariables(step.Gate.ID, vars)
+			step.Gate.AwaitID = substituteVariables(step.Gate.AwaitID, vars)
+			step.Gate.Timeout = substituteVariables(step.Gate.Timeout, vars)
+		}
 		if len(step.Children) > 0 {
 			substituteStepVars(step.Children, vars)
 		}

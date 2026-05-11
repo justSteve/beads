@@ -36,8 +36,9 @@ Variable syntax (both work - we detect which side is the concrete value):
   --var feature-auth=branch    Substitution-style: value=variable
 
 Output locations (first writable wins):
-  1. .beads/formulas/       (project-level, default)
-  2. ~/.beads/formulas/     (user-level, if project not writable)
+  1. <resolved-beads-dir>/formulas/ (project-level, default)
+  2. <checkout-root>/.beads/formulas/ (repo-local formulas)
+  3. ~/.beads/formulas/     (user-level, if project not writable)
 
 Examples:
   bd mol distill bd-o5xe my-workflow
@@ -104,13 +105,7 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 
 	// mol distill requires direct store access for reading the epic
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: mol distill requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol distill %s ...\n", args[0])
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
-		os.Exit(1)
+		FatalError("no database connection")
 	}
 
 	varFlags, _ := cmd.Flags().GetStringArray("var")
@@ -120,15 +115,13 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 	// Resolve epic ID
 	epicID, err := utils.ResolvePartialID(ctx, store, args[0])
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: '%s' not found\n", args[0])
-		os.Exit(1)
+		FatalError("'%s' not found", args[0])
 	}
 
 	// Load the epic subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, store, epicID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading epic: %v\n", err)
-		os.Exit(1)
+		FatalError("loading epic: %v", err)
 	}
 
 	// Determine formula name
@@ -147,8 +140,7 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 		for _, v := range varFlags {
 			findText, varName, err := parseDistillVar(v, searchableText)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			replacements[findText] = varName
 		}
@@ -165,9 +157,11 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 		// Find first writable formula directory
 		outputPath = findWritableFormulaDir(formulaName)
 		if outputPath == "" {
-			fmt.Fprintf(os.Stderr, "Error: no writable formula directory found\n")
-			fmt.Fprintf(os.Stderr, "Try: mkdir -p .beads/formulas\n")
-			os.Exit(1)
+			hint := "Try creating one of the formula search paths"
+			if searchPaths := getFormulaSearchPaths(); len(searchPaths) > 0 {
+				hint = fmt.Sprintf("Try: mkdir -p %s", searchPaths[0])
+			}
+			FatalErrorWithHint("no writable formula directory found", hint)
 		}
 	}
 
@@ -189,21 +183,18 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 	// Ensure output directory exists
 	dir := filepath.Dir(outputPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", dir, err)
-		os.Exit(1)
+		FatalError("creating directory %s: %v", dir, err)
 	}
 
 	// Write formula
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error encoding formula: %v\n", err)
-		os.Exit(1)
+		FatalError("encoding formula: %v", err)
 	}
 
 	// #nosec G306 -- Formula files are not sensitive
 	if err := os.WriteFile(outputPath, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing formula: %v\n", err)
-		os.Exit(1)
+		FatalError("writing formula: %v", err)
 	}
 
 	result := &DistillResult{
@@ -255,8 +246,8 @@ func findWritableFormulaDir(formulaName string) string {
 			// Check if we can write to it
 			testPath := filepath.Join(dir, ".write-test")
 			if f, err := os.Create(testPath); err == nil { //nolint:gosec // testPath is constructed from known search paths
-				_ = f.Close()
-				_ = os.Remove(testPath)
+				_ = f.Close()           // Best effort cleanup
+				_ = os.Remove(testPath) // Best effort cleanup of temp file
 				return filepath.Join(dir, formulaName+formula.FormulaExt)
 			}
 		}
@@ -275,11 +266,13 @@ func getVarNames(replacements map[string]string) []string {
 
 // subgraphToFormula converts a molecule subgraph to a formula
 func subgraphToFormula(subgraph *TemplateSubgraph, name string, replacements map[string]string) *formula.Formula {
-	// Helper to apply replacements
+	// Helper to apply replacements. Uses word-boundary regex to avoid
+	// substring corruption (e.g., "4" matching inside "404").
 	applyReplacements := func(text string) string {
 		result := text
 		for value, varName := range replacements {
-			result = strings.ReplaceAll(result, value, "{{"+varName+"}}")
+			pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(value) + `\b`)
+			result = pattern.ReplaceAllString(result, "{{"+varName+"}}")
 		}
 		return result
 	}

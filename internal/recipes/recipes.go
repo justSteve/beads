@@ -67,14 +67,14 @@ var BuiltinRecipes = map[string]Recipe{
 	"claude": {
 		Name:        "Claude Code",
 		Type:        TypeHooks,
-		Description: "Claude Code hooks (SessionStart, PreCompact)",
+		Description: "Claude Code hooks (SessionStart)",
 		GlobalPath:  "~/.claude/settings.json",
 		ProjectPath: ".claude/settings.local.json",
 	},
 	"gemini": {
 		Name:        "Gemini CLI",
 		Type:        TypeHooks,
-		Description: "Gemini CLI hooks (SessionStart, PreCompress)",
+		Description: "Gemini CLI hooks (SessionStart)",
 		GlobalPath:  "~/.gemini/settings.json",
 		ProjectPath: ".gemini/settings.json",
 	},
@@ -88,7 +88,19 @@ var BuiltinRecipes = map[string]Recipe{
 		Name:        "Codex CLI",
 		Path:        "AGENTS.md",
 		Type:        TypeSection,
-		Description: "Codex CLI AGENTS.md section",
+		Description: "Codex CLI skill guidance",
+	},
+	"mux": {
+		Name:        "Mux",
+		Path:        "AGENTS.md",
+		Type:        TypeSection,
+		Description: "Mux AGENTS.md section",
+	},
+	"opencode": {
+		Name:        "OpenCode",
+		Path:        "AGENTS.md",
+		Type:        TypeSection,
+		Description: "OpenCode AGENTS.md section",
 	},
 	"aider": {
 		Name:        "Aider",
@@ -206,7 +218,7 @@ func SaveUserRecipe(beadsDir, name, path string) error {
 	}
 
 	// Ensure directory exists
-	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
 		return fmt.Errorf("create beads dir: %w", err)
 	}
 

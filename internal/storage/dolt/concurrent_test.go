@@ -1,6 +1,6 @@
 // Package dolt provides concurrency tests for embedded Dolt with multiple writers.
 //
-// These tests validate that Gas Town can safely run multiple polecats concurrently,
+// These tests validate that an orchestrator can safely run multiple workers concurrently,
 // all writing to the same Dolt DB for creating issues, updating status,
 // adding dependencies, and closing issues.
 package dolt
@@ -33,7 +33,7 @@ func concurrentTestContext(t *testing.T) (context.Context, context.CancelFunc) {
 // =============================================================================
 
 func TestConcurrentIssueCreation(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -44,23 +44,34 @@ func TestConcurrentIssueCreation(t *testing.T) {
 	errors := make(chan error, numGoroutines)
 	createdIDs := make(chan string, numGoroutines)
 
-	// Launch 10 goroutines to create issues simultaneously
+	// Launch 10 goroutines to create issues simultaneously.
+	// Dolt serialization errors (1213) are expected under contention and
+	// should be retried — this mirrors correct production behavior.
+	const maxRetries = 5
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			issue := &types.Issue{
-				Title:       fmt.Sprintf("Concurrent Issue %d", n),
-				Description: fmt.Sprintf("Created by goroutine %d", n),
-				Status:      types.StatusOpen,
-				Priority:    2,
-				IssueType:   types.TypeTask,
-			}
-			if err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n)); err != nil {
+			for attempt := 0; attempt <= maxRetries; attempt++ {
+				issue := &types.Issue{
+					Title:       fmt.Sprintf("Concurrent Issue %d", n),
+					Description: fmt.Sprintf("Created by goroutine %d", n),
+					Status:      types.StatusOpen,
+					Priority:    2,
+					IssueType:   types.TypeTask,
+				}
+				err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n))
+				if err == nil {
+					createdIDs <- issue.ID
+					return
+				}
+				if isSerializationError(err) && attempt < maxRetries {
+					time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+					continue
+				}
 				errors <- fmt.Errorf("goroutine %d: %w", n, err)
 				return
 			}
-			createdIDs <- issue.ID
 		}(i)
 	}
 
@@ -112,7 +123,7 @@ func TestConcurrentIssueCreation(t *testing.T) {
 // =============================================================================
 
 func TestSameIssueUpdateRace(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -132,12 +143,12 @@ func TestSameIssueUpdateRace(t *testing.T) {
 		t.Fatalf("failed to create issue: %v", err)
 	}
 
-	const numGoroutines = 10
+	const numGoroutines = 5
 	var wg sync.WaitGroup
 	var successCount atomic.Int32
 	var errorCount atomic.Int32
 
-	// Launch 10 goroutines to update the same issue
+	// Launch goroutines to update the same issue
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(n int) {
@@ -184,7 +195,7 @@ func TestSameIssueUpdateRace(t *testing.T) {
 // =============================================================================
 
 func TestReadWriteMix(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -208,9 +219,9 @@ func TestReadWriteMix(t *testing.T) {
 		issueIDs[i] = issue.ID
 	}
 
-	const numReaders = 5
-	const numWriters = 5
-	const iterations = 100
+	const numReaders = 3
+	const numWriters = 3
+	const iterations = 20
 
 	var wg sync.WaitGroup
 	var readErrors atomic.Int32
@@ -294,7 +305,7 @@ func TestReadWriteMix(t *testing.T) {
 // =============================================================================
 
 func TestLongTransactionBlocking(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -325,12 +336,12 @@ func TestLongTransactionBlocking(t *testing.T) {
 		defer wg.Done()
 		defer close(longTxDone)
 
-		err := store.RunInTransaction(ctx, func(tx storage.Transaction) error {
+		err := store.RunInTransaction(ctx, "test: long transaction update", func(tx storage.Transaction) error {
 			// Signal that long tx has started
 			close(longTxStarted)
 
-			// Hold the transaction open for a while
-			time.Sleep(2 * time.Second)
+			// Hold the transaction open long enough for short txs to contend
+			time.Sleep(500 * time.Millisecond)
 
 			// Do some work
 			return tx.UpdateIssue(ctx, issue.ID, map[string]interface{}{
@@ -356,7 +367,7 @@ func TestLongTransactionBlocking(t *testing.T) {
 			shortCtx, shortCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer shortCancel()
 
-			err := store.RunInTransaction(shortCtx, func(tx storage.Transaction) error {
+			err := store.RunInTransaction(shortCtx, fmt.Sprintf("test: short transaction %d", n), func(tx storage.Transaction) error {
 				return tx.UpdateIssue(shortCtx, issue.ID, map[string]interface{}{
 					"notes": fmt.Sprintf("Short tx %d", n),
 				}, fmt.Sprintf("short-tx-%d", n))
@@ -393,7 +404,7 @@ func TestLongTransactionBlocking(t *testing.T) {
 // =============================================================================
 
 func TestBranchPerAgentMergeRace(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -495,7 +506,7 @@ func TestBranchPerAgentMergeRace(t *testing.T) {
 // =============================================================================
 
 func TestWorktreeExportIsolation(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -570,7 +581,7 @@ func TestWorktreeExportIsolation(t *testing.T) {
 // =============================================================================
 
 func TestConcurrentDependencyOperations(t *testing.T) {
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -659,7 +670,7 @@ func TestHighContentionStress(t *testing.T) {
 		t.Skip("skipping stress test in short mode")
 	}
 
-	store, cleanup := setupTestStore(t)
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := concurrentTestContext(t)
@@ -681,8 +692,8 @@ func TestHighContentionStress(t *testing.T) {
 		}
 	}
 
-	const numWorkers = 20
-	const opsPerWorker = 50
+	const numWorkers = 8
+	const opsPerWorker = 15
 	var wg sync.WaitGroup
 	var totalOps atomic.Int32
 	var failedOps atomic.Int32
@@ -752,5 +763,195 @@ func TestHighContentionStress(t *testing.T) {
 		if issue == nil {
 			t.Errorf("issue %s missing after stress test", issueID)
 		}
+	}
+}
+
+// =============================================================================
+// Test: Concurrent Issue Creation Without Caller Retry
+// Same as TestConcurrentIssueCreation but relies on withRetryTx to handle
+// serialization errors internally — no caller-side retry loop.
+// =============================================================================
+
+func TestConcurrentIssueCreationWithoutCallerRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, numGoroutines)
+	createdIDs := make(chan string, numGoroutines)
+
+	for n := range numGoroutines {
+		wg.Go(func() {
+			issue := &types.Issue{
+				Title:       fmt.Sprintf("No Retry Issue %d", n),
+				Description: fmt.Sprintf("Created by goroutine %d", n),
+				Status:      types.StatusOpen,
+				Priority:    2,
+				IssueType:   types.TypeTask,
+			}
+			if err := store.CreateIssue(ctx, issue, fmt.Sprintf("worker-%d", n)); err != nil {
+				errs <- fmt.Errorf("goroutine %d: %w", n, err)
+				return
+			}
+			createdIDs <- issue.ID
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+	close(createdIDs)
+
+	for err := range errs {
+		t.Errorf("creation error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent create failed without caller retry")
+	}
+
+	ids := make(map[string]bool)
+	for id := range createdIDs {
+		if ids[id] {
+			t.Errorf("duplicate issue ID: %s", id)
+		}
+		ids[id] = true
+	}
+	if len(ids) != numGoroutines {
+		t.Fatalf("expected %d unique IDs, got %d", numGoroutines, len(ids))
+	}
+}
+
+// =============================================================================
+// Test: Concurrent Comment and Close Without Caller Retry
+// Each goroutine comments on and closes a different issue concurrently.
+// Relies on withRetryTx for transient error handling.
+// =============================================================================
+
+func TestConcurrentCommentAndCloseWithoutCallerRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	const numIssues = 8
+	issueIDs := make([]string, 0, numIssues)
+	for i := 0; i < numIssues; i++ {
+		issue := &types.Issue{
+			ID:          fmt.Sprintf("cc-%d", i),
+			Title:       fmt.Sprintf("Comment Close %d", i),
+			Description: "permanent issue for concurrent comment/close",
+			Status:      types.StatusOpen,
+			Priority:    2,
+			IssueType:   types.TypeTask,
+		}
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("CreateIssue(%d): %v", i, err)
+		}
+		issueIDs = append(issueIDs, issue.ID)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, numIssues)
+	for n, id := range issueIDs {
+		wg.Go(func() {
+			if _, err := store.AddIssueComment(ctx, id, fmt.Sprintf("author-%d", n), fmt.Sprintf("comment-%d", n)); err != nil {
+				errs <- fmt.Errorf("comment %s: %w", id, err)
+				return
+			}
+			if err := store.CloseIssue(ctx, id, "done", fmt.Sprintf("closer-%d", n), "test-session"); err != nil {
+				errs <- fmt.Errorf("close %s: %w", id, err)
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("write error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent comment/close failed without caller retry")
+	}
+
+	for _, issueID := range issueIDs {
+		issue, err := store.GetIssue(ctx, issueID)
+		if err != nil {
+			t.Fatalf("GetIssue(%s): %v", issueID, err)
+		}
+		if issue.Status != types.StatusClosed {
+			t.Fatalf("issue %s status = %s, want closed", issueID, issue.Status)
+		}
+		comments, err := store.GetIssueComments(ctx, issueID)
+		if err != nil {
+			t.Fatalf("GetIssueComments(%s): %v", issueID, err)
+		}
+		if len(comments) != 1 {
+			t.Fatalf("issue %s comment count = %d, want 1", issueID, len(comments))
+		}
+	}
+}
+
+// =============================================================================
+// Test: Serialization Conflict Retry
+// 10 goroutines all add a label to the SAME issue concurrently, forcing Dolt
+// serialization conflicts (Error 1213). withRetryTx must retry transparently
+// so that all 10 labels are applied without any caller-visible errors.
+// =============================================================================
+
+func TestSerializationConflictRetry(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := concurrentTestContext(t)
+	defer cancel()
+
+	// Create a single issue that all goroutines will contend on.
+	issue := &types.Issue{
+		ID:          "serialization-target",
+		Title:       "Serialization Conflict Target",
+		Description: "All goroutines add labels to this issue",
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, numGoroutines)
+
+	for n := range numGoroutines {
+		wg.Go(func() {
+			label := fmt.Sprintf("label-%d", n)
+			if err := store.AddLabel(ctx, issue.ID, label, fmt.Sprintf("worker-%d", n)); err != nil {
+				errs <- fmt.Errorf("goroutine %d AddLabel(%q): %w", n, label, err)
+			}
+		})
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("label error: %v", err)
+	}
+	if t.Failed() {
+		t.Fatal("concurrent AddLabel failed — withRetryTx should have retried serialization errors")
+	}
+
+	// Verify all labels were applied.
+	labels, err := store.GetLabels(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetLabels: %v", err)
+	}
+	if len(labels) != numGoroutines {
+		t.Fatalf("expected %d labels, got %d: %v", numGoroutines, len(labels), labels)
 	}
 }

@@ -18,7 +18,20 @@ import (
 
 var testBDBinary string
 
+// testDoltPort is the port of the isolated test Dolt server (0 = not running).
+var testDoltPort int
+
 func TestMain(m *testing.M) {
+	os.Setenv("BEADS_TEST_MODE", "1")
+
+	// Start an isolated Dolt server so integration tests don't hit production.
+	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+	} else {
+		defer testutil.TerminateDoltContainer()
+		testDoltPort = testutil.DoltContainerPortInt()
+	}
+
 	// Build bd binary once for all tests
 	binName := "bd"
 	if runtime.GOOS == "windows" {
@@ -30,29 +43,35 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "Failed to create temp dir for bd binary: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmpDir)
 
 	// Find module root directory (where go.mod lives)
 	modRootCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
 	modRootOut, err := modRootCmd.Output()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to find module root: %v\n", err)
+		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
 	modRoot := strings.TrimSpace(string(modRootOut))
 
 	testBDBinary = filepath.Join(tmpDir, binName)
-	cmd := exec.Command("go", "build", "-o", testBDBinary, "./cmd/bd")
+	cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", testBDBinary, "./cmd/bd")
 	cmd.Dir = modRoot // Build from module root where ./cmd/bd exists
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to build bd binary: %v\n%s\n", err, out)
+		os.RemoveAll(tmpDir)
 		os.Exit(1)
 	}
 
 	// Optimize git for tests
 	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 
-	os.Exit(m.Run())
+	code := m.Run()
+
+	os.RemoveAll(tmpDir)
+	os.Unsetenv("BEADS_DOLT_PORT")
+	os.Unsetenv("BEADS_TEST_MODE")
+	os.Exit(code)
 }
 
 // getBDPath returns the test bd binary path
@@ -83,6 +102,9 @@ func TestHashIDs_MultiCloneConverge(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow git e2e test")
 	}
+	if testDoltPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	t.Parallel()
 	tmpDir := testutil.TempDirInMemory(t)
 
@@ -104,7 +126,7 @@ func TestHashIDs_MultiCloneConverge(t *testing.T) {
 
 	// Sync all clones once (hash IDs prevent collisions, don't need multiple rounds)
 	for _, clone := range []string{cloneA, cloneB, cloneC} {
-		runCmdOutputWithEnvAllowError(t, clone, map[string]string{"BEADS_NO_DAEMON": "1"}, true, bdPath, "sync")
+		runCmdOutputWithEnvAllowError(t, clone, map[string]string{}, true, bdPath, "sync")
 	}
 
 	// Verify all clones have all 3 issues
@@ -136,6 +158,9 @@ func TestHashIDs_IdenticalContentDedup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow git e2e test")
 	}
+	if testDoltPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	t.Parallel()
 	tmpDir := testutil.TempDirInMemory(t)
 
@@ -155,7 +180,7 @@ func TestHashIDs_IdenticalContentDedup(t *testing.T) {
 
 	// Sync both clones once (hash IDs handle dedup automatically)
 	for _, clone := range []string{cloneA, cloneB} {
-		runCmdOutputWithEnvAllowError(t, clone, map[string]string{"BEADS_NO_DAEMON": "1"}, true, bdPath, "sync")
+		runCmdOutputWithEnvAllowError(t, clone, map[string]string{}, true, bdPath, "sync")
 	}
 
 	// Verify both clones have exactly 1 issue (deduplication worked)
@@ -222,13 +247,12 @@ func setupClone(t *testing.T, tmpDir, remoteDir, name, bdPath string) string {
 
 func createIssueInClone(t *testing.T, cloneDir, title string) {
 	t.Helper()
-	runCmdWithEnv(t, cloneDir, map[string]string{"BEADS_NO_DAEMON": "1"}, getBDCommand(), "create", title, "-t", "task", "-p", "1", "--json")
+	runCmdWithEnv(t, cloneDir, map[string]string{}, getBDCommand(), "create", title, "-t", "task", "-p", "1", "--json")
 }
 
 func getTitlesFromClone(t *testing.T, cloneDir string) map[string]bool {
 	t.Helper()
 	listJSON := runCmdOutputWithEnv(t, cloneDir, map[string]string{
-		"BEADS_NO_DAEMON":   "1",
 		"BD_NO_AUTO_IMPORT": "1",
 	}, getBDCommand(), "list", "--json")
 
@@ -282,12 +306,12 @@ func installGitHooks(t *testing.T, repoDir string) {
 	bdCmd := strings.ReplaceAll(getBDCommand(), "\\", "/")
 
 	preCommit := fmt.Sprintf(`#!/bin/sh
-%s --no-daemon export -o .beads/issues.jsonl >/dev/null 2>&1 || true
+%s export -o .beads/issues.jsonl >/dev/null 2>&1 || true
 git add .beads/issues.jsonl >/dev/null 2>&1 || true
 exit 0
 `, bdCmd)
 	postMerge := fmt.Sprintf(`#!/bin/sh
-%s --no-daemon import -i .beads/issues.jsonl >/dev/null 2>&1 || true
+%s import -i .beads/issues.jsonl >/dev/null 2>&1 || true
 exit 0
 `, bdCmd)
 	os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte(preCommit), 0755)

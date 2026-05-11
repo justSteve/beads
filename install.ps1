@@ -1,6 +1,6 @@
 # Beads (bd) Windows installer
 # Usage:
-#   irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -12,6 +12,25 @@ function Write-Info($Message)    { Write-Host "==> $Message" -ForegroundColor Cy
 function Write-Success($Message) { Write-Host "==> $Message" -ForegroundColor Green }
 function Write-WarningMsg($Message) { Write-Warning $Message }
 function Write-Err($Message)     { Write-Host "Error: $Message" -ForegroundColor Red }
+
+# Create 'beads' alias (copy of bd.exe)
+# On Windows, symlinks require admin privileges, so we create a copy instead
+function Create-BeadsAlias {
+    param([string]$BinDir)
+
+    $bdPath = Join-Path $BinDir "bd.exe"
+    $beadsPath = Join-Path $BinDir "beads.exe"
+
+    if (Test-Path $bdPath) {
+        Write-Info "Creating 'beads' alias..."
+        try {
+            Copy-Item -Path $bdPath -Destination $beadsPath -Force
+            Write-Success "Created 'beads.exe' alias -> bd.exe"
+        } catch {
+            Write-WarningMsg "Failed to create beads.exe alias: $_"
+        }
+    }
+}
 
 function Test-GoSupport {
     $goCmd = Get-Command go -ErrorAction SilentlyContinue
@@ -61,7 +80,7 @@ function Install-WithGo {
 
     Write-Info "Installing bd via go install..."
     try {
-        & go install github.com/steveyegge/beads/cmd/bd@latest
+        & go install -tags gms_pure_go github.com/steveyegge/beads/cmd/bd@latest
         if ($LASTEXITCODE -ne 0) {
             Write-WarningMsg "go install exited with code $LASTEXITCODE"
             return $false
@@ -88,11 +107,151 @@ function Install-WithGo {
 
     if (-not (Test-Path $bdPath)) {
         Write-WarningMsg "bd.exe not found in $binDir after install"
+    } else {
+        # Create 'beads' alias
+        Create-BeadsAlias -BinDir $binDir
     }
 
     $pathEntries = [Environment]::GetEnvironmentVariable("PATH", "Process").Split([IO.Path]::PathSeparator) | ForEach-Object { $_.Trim() }
     if (-not ($pathEntries -contains $binDir)) {
         Write-WarningMsg "$binDir is not in your PATH. Add it with:`n  setx PATH `"$Env:PATH;$binDir`""
+    }
+
+    return $true
+}
+
+function Get-WindowsArch {
+    try {
+        $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+    } catch {
+        $arch = $env:PROCESSOR_ARCHITECTURE
+    }
+
+    switch ($arch) {
+        "X64" { return "amd64" }
+        "AMD64" { return "amd64" }
+        "Arm64" { return "arm64" }
+        "ARM64" { return "arm64" }
+        default { return $null }
+    }
+}
+
+function Get-ExpectedReleaseChecksum {
+    param(
+        [Parameter(Mandatory)]$Release,
+        [Parameter(Mandatory)][string]$AssetName,
+        [Parameter(Mandatory)][string]$TempRoot
+    )
+
+    $checksumsAsset = $Release.assets | Where-Object { $_.name -eq "checksums.txt" } | Select-Object -First 1
+    if (-not $checksumsAsset) {
+        Write-WarningMsg "Release does not include checksums.txt; refusing unverified install."
+        return $null
+    }
+
+    $checksumsPath = Join-Path $TempRoot "checksums.txt"
+    try {
+        Invoke-WebRequest -Uri $checksumsAsset.browser_download_url -OutFile $checksumsPath
+    } catch {
+        Write-WarningMsg "Failed to download checksums.txt: $_"
+        return $null
+    }
+
+    foreach ($line in Get-Content -Path $checksumsPath) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "") {
+            continue
+        }
+
+        $parts = $trimmed -split '\s+'
+        if ($parts.Count -ge 2 -and $parts[1].TrimStart("*") -eq $AssetName) {
+            return $parts[0].ToLowerInvariant()
+        }
+    }
+
+    Write-WarningMsg "No checksum entry found for $AssetName in checksums.txt"
+    return $null
+}
+
+function Install-FromRelease {
+    Write-Info "Installing bd from GitHub releases..."
+
+    $arch = Get-WindowsArch
+    if (-not $arch) {
+        Write-WarningMsg "Unsupported Windows architecture. Falling back to source install."
+        return $false
+    }
+
+    $apiUrl = "https://api.github.com/repos/gastownhall/beads/releases/latest"
+    try {
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "beads-install" }
+    } catch {
+        Write-WarningMsg "Failed to fetch latest release: $_"
+        return $false
+    }
+
+    $tag = $release.tag_name
+    if (-not $tag) {
+        Write-WarningMsg "Failed to parse latest release tag."
+        return $false
+    }
+
+    $version = $tag.TrimStart("v")
+    $assetName = "beads_${version}_windows_${arch}.zip"
+    $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+    if (-not $asset) {
+        Write-WarningMsg "No prebuilt asset found for $assetName. Falling back to source install."
+        return $false
+    }
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("beads-install-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempRoot | Out-Null
+    $zipPath = Join-Path $tempRoot $assetName
+
+    try {
+        Write-Info "Downloading $assetName..."
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+
+        Write-Info "Verifying release checksum..."
+        $expectedChecksum = Get-ExpectedReleaseChecksum -Release $release -AssetName $assetName -TempRoot $tempRoot
+        if (-not $expectedChecksum) {
+            return $false
+        }
+
+        $actualChecksum = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualChecksum -ne $expectedChecksum) {
+            Write-WarningMsg "Checksum mismatch for $assetName; refusing to install."
+            return $false
+        }
+
+        Write-Success "Checksum verified for $assetName"
+
+        Write-Info "Extracting archive..."
+        Microsoft.PowerShell.Archive\Expand-Archive -Path $zipPath -DestinationPath $tempRoot -Force
+
+        $bdPath = Join-Path $tempRoot "bd.exe"
+        if (-not (Test-Path $bdPath)) {
+            Write-WarningMsg "bd.exe not found in release archive. Falling back to source install."
+            return $false
+        }
+
+        $installDir = Join-Path $env:LOCALAPPDATA "Programs\bd"
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+
+        Copy-Item -Path $bdPath -Destination (Join-Path $installDir "bd.exe") -Force
+        Write-Success "bd installed to $installDir\bd.exe"
+
+        $Script:LastInstallPath = Join-Path $installDir "bd.exe"
+
+        $pathEntries = [Environment]::GetEnvironmentVariable("PATH", "Process").Split([IO.Path]::PathSeparator) | ForEach-Object { $_.Trim() }
+        if (-not ($pathEntries -contains $installDir)) {
+            Write-WarningMsg "$installDir is not in your PATH. Add it with:`n  setx PATH `"$Env:PATH;$installDir`""
+        }
+    } catch {
+        Write-WarningMsg "Failed to install from releases: $_"
+        return $false
+    } finally {
+        Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     return $true
@@ -127,7 +286,7 @@ function Install-FromSource {
             }
         } else {
             Write-Info "Cloning repository..."
-            & git clone --depth 1 https://github.com/steveyegge/beads.git $repoPath
+            & git clone --depth 1 https://github.com/gastownhall/beads.git $repoPath
             if ($LASTEXITCODE -ne 0) {
                 throw "git clone failed with exit code $LASTEXITCODE"
             }
@@ -136,7 +295,7 @@ function Install-FromSource {
         Push-Location $repoPath
         try {
             Write-Info "Compiling bd.exe..."
-            & go build -o bd.exe ./cmd/bd
+            & go build -tags gms_pure_go -o bd.exe ./cmd/bd
             if ($LASTEXITCODE -ne 0) {
                 throw "go build failed with exit code $LASTEXITCODE"
             }
@@ -150,8 +309,11 @@ function Install-FromSource {
         Copy-Item -Path (Join-Path $repoPath "bd.exe") -Destination (Join-Path $installDir "bd.exe") -Force
         Write-Success "bd installed to $installDir\bd.exe"
 
-            # Record where we installed the binary when building from source
-            $Script:LastInstallPath = Join-Path $installDir "bd.exe"
+        # Create 'beads' alias
+        Create-BeadsAlias -BinDir $installDir
+
+        # Record where we installed the binary when building from source
+        $Script:LastInstallPath = Join-Path $installDir "bd.exe"
 
         $pathEntries = [Environment]::GetEnvironmentVariable("PATH", "Process").Split([IO.Path]::PathSeparator) | ForEach-Object { $_.Trim() }
         if (-not ($pathEntries -contains $installDir)) {
@@ -277,27 +439,32 @@ function Print-GoInstallInstructions {
 
 $installed = $false
 
-if ($goSupport.Present -and $goSupport.MeetsRequirement) {
-    $installed = Install-WithGo
-    if (-not $installed) {
-        Write-WarningMsg "go install failed; attempting to build from source..."
-        $installed = Install-FromSource
+$installed = Install-FromRelease
+if (-not $installed) {
+    if ($goSupport.Present -and $goSupport.MeetsRequirement) {
+        $installed = Install-WithGo
+        if (-not $installed) {
+            Write-WarningMsg "go install failed; attempting to build from source..."
+            $installed = Install-FromSource
+        }
+    } elseif ($goSupport.Present -and -not $goSupport.MeetsRequirement) {
+        Write-Err "Go 1.24 or newer is required (found: $($goSupport.RawVersion)). Please upgrade Go or use your package manager."
+        Print-GoInstallInstructions
+        exit 1
+    } else {
+        # No Go present - do not attempt to auto-download or auto-install Go.
+        Write-Err "Go is not installed. bd requires Go 1.24+ to build from source."
+        Print-GoInstallInstructions
+        exit 1
     }
-} elseif ($goSupport.Present -and -not $goSupport.MeetsRequirement) {
-    Write-Err "Go 1.24 or newer is required (found: $($goSupport.RawVersion)). Please upgrade Go or use your package manager."
-    Print-GoInstallInstructions
-    exit 1
-} else {
-    # No Go present - do not attempt to auto-download or auto-install Go.
-    Write-Err "Go is not installed. bd requires Go 1.24+ to build from source."
-    Print-GoInstallInstructions
-    exit 1
 }
 
 if ($installed) {
     Verify-Install | Out-Null
-    Write-Success "Installation complete. Run 'bd quickstart' inside a repo to begin."
+    Write-Success "Installation complete. You can use either 'bd' or 'beads' to run the command."
+    Write-Host "Run 'bd quickstart' inside a repo to begin." -ForegroundColor Cyan
 } else {
     Write-Err "Installation failed. Please install Go 1.24+ and try again."
     exit 1
 }
+

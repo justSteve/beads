@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 
 	"github.com/spf13/cobra"
@@ -38,7 +37,7 @@ This command discovers molecules waiting at a gate step where:
 4. No agent currently has this molecule hooked
 
 This enables discovery-based resume without explicit waiter tracking.
-The Deacon patrol uses this to find and dispatch gate-ready molecules.
+The patrol system uses this to find and dispatch gate-ready molecules.
 
 Examples:
   bd mol ready --gated           # Find all gate-ready molecules
@@ -49,22 +48,15 @@ Examples:
 func runMolReadyGated(cmd *cobra.Command, args []string) {
 	ctx := rootCtx
 
-	// mol ready --gated requires direct store access
+	// --gated mode requires direct store access
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: mol ready --gated requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol ready --gated\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
-		os.Exit(1)
+		FatalError("no database connection")
 	}
 
 	// Find gate-ready molecules
 	molecules, err := findGateReadyMolecules(ctx, store)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	if jsonOutput {
@@ -100,7 +92,7 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("To dispatch a molecule:")
-	fmt.Println("  gt sling <agent> --mol <molecule-id>")
+	fmt.Println("  bd sling <agent> --mol <molecule-id>")
 }
 
 // findGateReadyMolecules finds molecules where a gate has closed and work can resume.
@@ -111,14 +103,13 @@ func runMolReadyGated(cmd *cobra.Command, args []string) {
 // 3. Check if that step is now ready (unblocked)
 // 4. Find the parent molecule
 // 5. Filter out molecules that are already hooked by someone
-func findGateReadyMolecules(ctx context.Context, s storage.Storage) ([]*GatedMolecule, error) {
+func findGateReadyMolecules(ctx context.Context, s storage.DoltStorage) ([]*GatedMolecule, error) {
 	// Step 1: Find all closed gate beads
 	gateType := types.IssueType("gate")
 	closedStatus := types.StatusClosed
 	gateFilter := types.IssueFilter{
 		IssueType: &gateType,
 		Status:    &closedStatus,
-		Limit:     100,
 	}
 
 	closedGates, err := s.SearchIssues(ctx, "", gateFilter)
@@ -131,8 +122,7 @@ func findGateReadyMolecules(ctx context.Context, s storage.Storage) ([]*GatedMol
 	}
 
 	// Step 2: Get ready work to check which steps are ready
-	// IncludeMolSteps: true because we specifically need to see molecule steps here
-	readyIssues, err := s.GetReadyWork(ctx, types.WorkFilter{Limit: 500, IncludeMolSteps: true})
+	readyIssues, err := s.GetReadyWork(ctx, types.WorkFilter{})
 	if err != nil {
 		return nil, fmt.Errorf("getting ready work: %w", err)
 	}
@@ -145,64 +135,70 @@ func findGateReadyMolecules(ctx context.Context, s storage.Storage) ([]*GatedMol
 	hookedStatus := types.StatusHooked
 	hookedFilter := types.IssueFilter{
 		Status: &hookedStatus,
-		Limit:  100,
 	}
 	hookedIssues, err := s.SearchIssues(ctx, "", hookedFilter)
 	if err != nil {
 		// Non-fatal: just continue without filtering
 		hookedIssues = nil
 	}
+	// Batch-find parent molecules for hooked issues (bd-hn4q)
 	hookedMolecules := make(map[string]bool)
-	for _, issue := range hookedIssues {
-		// If the hooked issue is a molecule root, mark it
-		hookedMolecules[issue.ID] = true
-		// Also find parent molecule for hooked steps
-		if parentMol := findParentMolecule(ctx, s, issue.ID); parentMol != "" {
-			hookedMolecules[parentMol] = true
+	if len(hookedIssues) > 0 {
+		hookedIDs := make([]string, len(hookedIssues))
+		for i, issue := range hookedIssues {
+			hookedIDs[i] = issue.ID
+			hookedMolecules[issue.ID] = true // Mark hooked issue itself
+		}
+		hookedRoots := findParentMolecules(ctx, s, hookedIDs)
+		for _, molID := range hookedRoots {
+			hookedMolecules[molID] = true
 		}
 	}
 
-	// Step 4: For each closed gate, find issues that depend on it (were blocked)
-	moleculeMap := make(map[string]*GatedMolecule)
+	// Step 4: For each closed gate, collect all dependents that are ready,
+	// then batch-find their parent molecules (bd-hn4q)
+	type gateDependent struct {
+		gate      *types.Issue
+		dependent *types.Issue
+	}
+	var readyDependents []gateDependent
+	var readyDepIDs []string
 
 	for _, gate := range closedGates {
-		// Find issues that depend on this gate (GetDependents returns issues where depends_on_id = gate.ID)
 		dependents, err := s.GetDependents(ctx, gate.ID)
 		if err != nil {
 			continue
 		}
-
 		for _, dependent := range dependents {
-			// Check if the previously blocked step is now ready
-			if !readyIDs[dependent.ID] {
-				continue
+			if readyIDs[dependent.ID] {
+				readyDependents = append(readyDependents, gateDependent{gate: gate, dependent: dependent})
+				readyDepIDs = append(readyDepIDs, dependent.ID)
 			}
+		}
+	}
 
-			// Find the parent molecule
-			moleculeID := findParentMolecule(ctx, s, dependent.ID)
-			if moleculeID == "" {
-				continue
-			}
+	// Batch-find molecule roots for all ready dependents
+	depMolRoots := findParentMolecules(ctx, s, readyDepIDs)
 
-			// Skip if already hooked
-			if hookedMolecules[moleculeID] {
-				continue
-			}
-
-			// Get molecule details
+	moleculeMap := make(map[string]*GatedMolecule)
+	for _, gd := range readyDependents {
+		moleculeID := depMolRoots[gd.dependent.ID]
+		if moleculeID == "" {
+			continue
+		}
+		if hookedMolecules[moleculeID] {
+			continue
+		}
+		if _, exists := moleculeMap[moleculeID]; !exists {
 			moleculeIssue, err := s.GetIssue(ctx, moleculeID)
 			if err != nil || moleculeIssue == nil {
 				continue
 			}
-
-			// Add to results (dedupe by molecule ID)
-			if _, exists := moleculeMap[moleculeID]; !exists {
-				moleculeMap[moleculeID] = &GatedMolecule{
-					MoleculeID:    moleculeID,
-					MoleculeTitle: moleculeIssue.Title,
-					ClosedGate:    gate,
-					ReadyStep:     dependent,
-				}
+			moleculeMap[moleculeID] = &GatedMolecule{
+				MoleculeID:    moleculeID,
+				MoleculeTitle: moleculeIssue.Title,
+				ClosedGate:    gd.gate,
+				ReadyStep:     gd.dependent,
 			}
 		}
 	}

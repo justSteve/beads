@@ -1,10 +1,11 @@
+//go:build cgo
+
 package main
 
 import (
 	"bytes"
 	"context"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 // - Even if Help() fails (e.g., output redirection fails), we still exit with code 1
 // - The error from Help() is rare (typically I/O errors writing to stderr)
 // - Since we're already in an error state, ignoring Help() errors is acceptable
+// NOT parallel: see TestSearchCommand_MissingQueryShowsHelp comment (cobra OutOrStdout race).
 func TestSearchCommand_HelpErrorHandling(t *testing.T) {
 	// Create a test command similar to searchCmd
 	cmd := &cobra.Command{
@@ -75,7 +77,8 @@ func TestSearchCommand_HelpErrorHandling(t *testing.T) {
 	})
 }
 
-// TestSearchCommand_HelpSuppression verifies that #nosec comment is appropriate
+// TestSearchCommand_HelpSuppression verifies that #nosec comment is appropriate.
+// NOT parallel: see TestSearchCommand_MissingQueryShowsHelp comment (cobra OutOrStdout race).
 func TestSearchCommand_HelpSuppression(t *testing.T) {
 	// This test documents why ignoring cmd.Help() error is safe:
 	//
@@ -116,7 +119,10 @@ func (fw *failingWriter) Write(p []byte) (n int, err error) {
 	return 0, io.ErrClosedPipe // Simulate I/O error
 }
 
-// TestSearchCommand_MissingQueryShowsHelp verifies the intended behavior
+// TestSearchCommand_MissingQueryShowsHelp verifies the intended behavior.
+// NOT parallel: cmd.Help() calls cobra's OutOrStdout() which reads os.Stdout
+// even when cmd.SetOut() is set (it evaluates os.Stdout as the default argument).
+// This races with captureStdout() in parallel tests that redirect os.Stdout.
 func TestSearchCommand_MissingQueryShowsHelp(t *testing.T) {
 	// This test verifies that when query is missing, we:
 	// 1. Print error message to stderr
@@ -124,6 +130,7 @@ func TestSearchCommand_MissingQueryShowsHelp(t *testing.T) {
 	// 3. Exit with code 1
 
 	// We can't test os.Exit() directly, but we can verify the logic up to that point
+	var errBuf bytes.Buffer
 	cmd := &cobra.Command{
 		Use:   "search [query]",
 		Short: "Test",
@@ -134,20 +141,10 @@ func TestSearchCommand_MissingQueryShowsHelp(t *testing.T) {
 			}
 
 			if query == "" {
-				// Capture stderr
-				oldStderr := os.Stderr
-				r, w, _ := os.Pipe()
-				os.Stderr = w
-
+				// Use cobra's SetErr to capture stderr without redirecting os.Stderr (bd-cqjoi)
 				cmd.PrintErrf("Error: search query is required\n")
 
-				w.Close()
-				os.Stderr = oldStderr
-
-				var buf bytes.Buffer
-				io.Copy(&buf, r)
-
-				if buf.String() == "" {
+				if errBuf.String() == "" {
 					t.Error("Expected error message to stderr")
 				}
 
@@ -159,12 +156,15 @@ func TestSearchCommand_MissingQueryShowsHelp(t *testing.T) {
 		},
 	}
 
+	cmd.SetOut(&bytes.Buffer{}) // Prevent cmd.Help() from reading os.Stdout (races with captureStdout)
+	cmd.SetErr(&errBuf)
 	cmd.SetArgs([]string{}) // No query
 	_ = cmd.Execute()
 }
 
 // TestSearchWithDateAndPriorityFilters tests bd search with date range and priority filters
 func TestSearchWithDateAndPriorityFilters(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	testDB := filepath.Join(tmpDir, ".beads", "beads.db")
 	s := newTestStore(t, testDB)
@@ -299,9 +299,9 @@ func TestSearchWithDateAndPriorityFilters(t *testing.T) {
 		minPrio := 0
 		maxPrio := 2
 		results, err := s.SearchIssues(ctx, "auth", types.IssueFilter{
-			PriorityMin:   &minPrio,
-			PriorityMax:   &maxPrio,
-			CreatedAfter:  &twoDaysAgo,
+			PriorityMin:  &minPrio,
+			PriorityMax:  &maxPrio,
+			CreatedAfter: &twoDaysAgo,
 		})
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)

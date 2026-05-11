@@ -5,33 +5,6 @@ import (
 	"time"
 )
 
-func TestTruncateString(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		maxLen int
-		want   string
-	}{
-		{"no truncation needed", "hello", 10, "hello"},
-		{"exact length", "hello", 5, "hello"},
-		{"truncate with ellipsis", "hello world", 8, "hello..."},
-		{"very short max", "hello", 3, "hel"},
-		{"max of 4", "hello world", 4, "h..."},
-		{"empty string", "", 5, ""},
-		// Note: truncateString operates on bytes, not runes
-		{"unicode", "hello\u4e16\u754c", 15, "hello\u4e16\u754c"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := truncateString(tt.input, tt.maxLen)
-			if got != tt.want {
-				t.Errorf("truncateString(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestPluralize(t *testing.T) {
 	tests := []struct {
 		count int
@@ -58,8 +31,8 @@ func TestFormatTimeAgo(t *testing.T) {
 	now := time.Now()
 
 	tests := []struct {
-		name    string
-		t       time.Time
+		name         string
+		t            time.Time
 		wantContains string
 	}{
 		{"just now", now.Add(-30 * time.Second), "just now"},
@@ -76,31 +49,6 @@ func TestFormatTimeAgo(t *testing.T) {
 			got := formatTimeAgo(tt.t)
 			if got != tt.wantContains {
 				t.Errorf("formatTimeAgo() = %q, want %q", got, tt.wantContains)
-			}
-		})
-	}
-}
-
-func TestContainsLabel(t *testing.T) {
-	tests := []struct {
-		name   string
-		labels []string
-		label  string
-		want   bool
-	}{
-		{"empty labels", []string{}, "bug", false},
-		{"single match", []string{"bug"}, "bug", true},
-		{"no match", []string{"feature", "enhancement"}, "bug", false},
-		{"match in list", []string{"bug", "feature", "urgent"}, "feature", true},
-		{"case sensitive", []string{"Bug"}, "bug", false},
-		{"nil labels", nil, "bug", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := containsLabel(tt.labels, tt.label)
-			if got != tt.want {
-				t.Errorf("containsLabel(%v, %q) = %v, want %v", tt.labels, tt.label, got, tt.want)
 			}
 		})
 	}
@@ -201,14 +149,4 @@ func TestTruncateDescription(t *testing.T) {
 	}
 }
 
-// Test showCleanupDeprecationHint - just ensure it doesn't panic
-func TestShowCleanupDeprecationHint(t *testing.T) {
-	// This function just prints to stdout, so we just verify it doesn't panic
-	showCleanupDeprecationHint()
-}
-
-// Test clearAutoFlushState - ensure it doesn't panic when called without initialization
-func TestClearAutoFlushState(t *testing.T) {
-	// This should not panic even if flush manager isn't initialized
-	clearAutoFlushState()
-}
+// TestShowCleanupDeprecationHint removed: showCleanupDeprecationHint was removed in pruning.

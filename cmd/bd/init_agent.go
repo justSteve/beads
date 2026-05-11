@@ -7,45 +7,21 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
-// landingThePlaneSection is the "landing the plane" instructions for AI agents
-// This gets appended to AGENTS.md and @AGENTS.md during bd init
-const landingThePlaneSection = `
-## Landing the Plane (Session Completion)
+// addAgentsInstructions creates or updates the agents file with embedded template content.
+// agentFile is the target filename (e.g. "AGENTS.md" or "BEADS.md").
+// If templatePath is non-empty, the custom template file is used instead of the embedded default.
+// profile controls which template variant to render (full or minimal); defaults to minimal.
+// opts controls conditional content (e.g. omitting bd dolt push when no remote is configured).
+func addAgentsInstructions(agentFile string, verbose bool, templatePath string, profile agents.Profile, opts agents.RenderOpts) {
+	if profile == "" {
+		profile = agents.ProfileMinimal
+	}
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until ` + "`git push`" + ` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ` + "```bash" + `
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ` + "```" + `
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until ` + "`git push`" + ` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-`
-
-// addLandingThePlaneInstructions adds "landing the plane" instructions to AGENTS.md
-func addLandingThePlaneInstructions(verbose bool) {
-	// File to update (AGENTS.md is the standard comprehensive documentation file)
-	agentFile := "AGENTS.md"
-
-	if err := updateAgentFile(agentFile, verbose); err != nil {
+	if err := updateAgentFile(agentFile, verbose, templatePath, profile, opts); err != nil {
 		// Non-fatal - continue with other files
 		if verbose {
 			fmt.Fprintf(os.Stderr, "Warning: failed to update %s: %v\n", agentFile, err)
@@ -53,62 +29,98 @@ func addLandingThePlaneInstructions(verbose bool) {
 	}
 }
 
-// updateAgentFile creates or updates an agent instructions file with landing the plane section
-func updateAgentFile(filename string, verbose bool) error {
+// updateAgentFile creates or updates an agent instructions file with embedded template content.
+// When a beads section already exists (legacy or current), it is updated to the latest
+// versioned format so that `bd init` never silently locks in stale sections.
+// If the file already has a full profile and a minimal profile is requested, the full
+// profile is preserved to avoid information loss.
+func updateAgentFile(filename string, verbose bool, templatePath string, profile agents.Profile, opts agents.RenderOpts) error {
 	// Check if file exists
-	//nolint:gosec // G304: filename comes from hardcoded list in addLandingThePlaneInstructions
+	//nolint:gosec // G304: filename validated by config.ValidateAgentsFile or defaulted to AGENTS.md
 	content, err := os.ReadFile(filename)
 	if os.IsNotExist(err) {
-		// File doesn't exist - create it with basic structure
-		newContent := fmt.Sprintf(`# Agent Instructions
+		// File doesn't exist - create from template
+		var newContent string
+		if templatePath != "" {
+			//nolint:gosec // G304: templatePath comes from --agents-template flag
+			data, readErr := os.ReadFile(templatePath)
+			if readErr != nil {
+				return fmt.Errorf("failed to read template %s: %w", templatePath, readErr)
+			}
+			newContent = string(data)
+		} else {
+			newContent = agents.EmbeddedDefault()
+		}
 
-This project uses **bd** (beads) for issue tracking. Run `+"`bd onboard`"+` to get started.
-
-## Quick Reference
-
-`+"```bash"+`
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --status in_progress  # Claim work
-bd close <id>         # Complete work
-bd sync               # Sync with git
-`+"```"+`
-%s
-`, landingThePlaneSection)
+		// Replace the beads section with the requested profile.
+		// EmbeddedDefault() ships with profile:full; swap to the requested profile
+		// (which defaults to minimal). Also handles legacy markers without profile metadata.
+		if strings.Contains(newContent, "BEGIN BEADS INTEGRATION") {
+			if replaced, changed, err := agents.ReplaceSectionWithOpts(newContent, profile, opts); err == nil && changed {
+				newContent = replaced
+			}
+		}
 
 		// #nosec G306 - markdown needs to be readable
 		if err := os.WriteFile(filename, []byte(newContent), 0644); err != nil {
 			return fmt.Errorf("failed to create %s: %w", filename, err)
 		}
 		if verbose {
-			fmt.Printf("  %s Created %s with landing-the-plane instructions\n", ui.RenderPass("✓"), filename)
+			fmt.Printf("  %s Created %s with agent instructions\n", ui.RenderPass("✓"), filename)
 		}
 		return nil
 	} else if err != nil {
 		return fmt.Errorf("failed to read %s: %w", filename, err)
 	}
 
-	// File exists - check if it already has landing the plane section
-	if strings.Contains(string(content), "Landing the Plane") {
-		if verbose {
-			fmt.Printf("  %s already has landing-the-plane instructions\n", filename)
+	// File exists - check if it already has our sections
+	contentStr := string(content)
+	hasBeads := strings.Contains(contentStr, "BEGIN BEADS INTEGRATION")
+
+	if hasBeads {
+		// Preserve existing full profile when minimal is requested (avoid information loss)
+		effectiveProfile := profile
+		existingMeta := agents.ParseMarker(contentStr[strings.Index(contentStr, "<!-- BEGIN BEADS INTEGRATION"):])
+		if existingMeta != nil && existingMeta.Profile == agents.ProfileFull && profile == agents.ProfileMinimal {
+			effectiveProfile = agents.ProfileFull
+			if verbose {
+				fmt.Printf("  ℹ %s already has full profile; preserving (higher-information) content\n", filename)
+			}
+		}
+
+		// Update existing section to latest versioned format (upgrades legacy markers)
+		updated, changed, replaceErr := agents.ReplaceSectionWithOpts(contentStr, effectiveProfile, opts)
+		if replaceErr != nil {
+			return fmt.Errorf("failed to update beads section in %s: %w", filename, replaceErr)
+		}
+		if changed {
+			// #nosec G306 - markdown needs to be readable
+			if err := os.WriteFile(filename, []byte(updated), 0644); err != nil {
+				return fmt.Errorf("failed to update %s: %w", filename, err)
+			}
+			if verbose {
+				fmt.Printf("  %s Updated beads section in %s to latest format\n", ui.RenderPass("✓"), filename)
+			}
+		} else if verbose {
+			fmt.Printf("  %s already has current agent instructions\n", filename)
 		}
 		return nil
 	}
 
-	// Append the landing the plane section
-	newContent := string(content)
+	// Append beads section with profile metadata
+	newContent := contentStr
 	if !strings.HasSuffix(newContent, "\n") {
 		newContent += "\n"
 	}
-	newContent += landingThePlaneSection
+
+	newContent += "\n" + agents.RenderSectionWithOpts(profile, opts)
 
 	// #nosec G306 - markdown needs to be readable
 	if err := os.WriteFile(filename, []byte(newContent), 0644); err != nil {
 		return fmt.Errorf("failed to update %s: %w", filename, err)
 	}
 	if verbose {
-		fmt.Printf("  %s Added landing-the-plane instructions to %s\n", ui.RenderPass("✓"), filename)
+		fmt.Printf("  %s Added agent instructions to %s\n", ui.RenderPass("✓"), filename)
 	}
 	return nil
 }
@@ -140,27 +152,32 @@ func setupClaudeSettings(verbose bool) error {
 		existingSettings = make(map[string]interface{})
 	}
 
-	// Add or update the prompt with onboard instruction
-	onboardPrompt := "Before starting any work, run 'bd onboard' to understand the current project state and available issues."
+	// Add or update the prompt with prime instruction
+	primePrompt := "Before starting any work, run 'bd prime' to understand the current project state and available issues."
 
-	// Check if prompt already contains onboard instruction
+	// Check if prompt already contains prime or onboard instruction
 	if promptValue, exists := existingSettings["prompt"]; exists {
 		if promptStr, ok := promptValue.(string); ok {
-			if strings.Contains(promptStr, "bd onboard") {
+			if strings.Contains(promptStr, "bd prime") {
 				if verbose {
-					fmt.Printf("Claude settings already configured with bd onboard instruction\n")
+					fmt.Printf("Claude settings already configured with bd prime instruction\n")
 				}
 				return nil
 			}
-			// Update existing prompt to include onboard instruction
-			existingSettings["prompt"] = promptStr + "\n\n" + onboardPrompt
+			// Migrate legacy "bd onboard" references to "bd prime"
+			if strings.Contains(promptStr, "bd onboard") {
+				existingSettings["prompt"] = strings.ReplaceAll(promptStr, "bd onboard", "bd prime")
+			} else {
+				// Update existing prompt to include prime instruction
+				existingSettings["prompt"] = promptStr + "\n\n" + primePrompt
+			}
 		} else {
 			// Existing prompt is not a string, replace it
-			existingSettings["prompt"] = onboardPrompt
+			existingSettings["prompt"] = primePrompt
 		}
 	} else {
-		// Add new prompt with onboard instruction
-		existingSettings["prompt"] = onboardPrompt
+		// Add new prompt with prime instruction
+		existingSettings["prompt"] = primePrompt
 	}
 
 	// Write updated settings
@@ -175,7 +192,7 @@ func setupClaudeSettings(verbose bool) error {
 	}
 
 	if verbose {
-		fmt.Printf("Configured Claude settings with bd onboard instruction\n")
+		fmt.Printf("Configured Claude settings with bd prime instruction\n")
 	}
 
 	return nil

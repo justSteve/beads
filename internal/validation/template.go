@@ -73,10 +73,53 @@ func ValidateTemplate(issueType types.IssueType, description string) error {
 
 // LintIssue checks an existing issue for missing template sections.
 // Unlike ValidateTemplate, this operates on a full Issue struct.
+// It checks both Description and AcceptanceCriteria fields.
+// A non-empty AcceptanceCriteria field satisfies the "Acceptance Criteria"
+// (or "Success Criteria" for epics) requirement without needing a heading. (GH#2468)
 // Returns nil if the issue passes validation or has no requirements.
 func LintIssue(issue *types.Issue) error {
 	if issue == nil {
 		return nil
 	}
-	return ValidateTemplate(issue.IssueType, issue.Description)
+	text := issue.Description
+	if issue.AcceptanceCriteria != "" {
+		text = text + "\n" + issue.AcceptanceCriteria
+	}
+	err := ValidateTemplate(issue.IssueType, text)
+	if err == nil || issue.AcceptanceCriteria == "" {
+		return err
+	}
+
+	// A non-empty AcceptanceCriteria field satisfies "Acceptance Criteria"
+	// or "Success Criteria" requirements even without the heading text.
+	templateErr, ok := err.(*TemplateError)
+	if !ok {
+		return err
+	}
+	var remaining []MissingSection
+	for _, m := range templateErr.Missing {
+		heading := strings.ToLower(strings.TrimPrefix(m.Heading, "## "))
+		if heading == "acceptance criteria" || heading == "success criteria" {
+			continue // satisfied by the dedicated field
+		}
+		remaining = append(remaining, m)
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	templateErr.Missing = remaining
+	return templateErr
+}
+
+// ValidateCloseReason checks if a close reason meets minimum quality standards.
+// Returns nil if the reason is acceptable. Used by validation.on-close config.
+func ValidateCloseReason(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || strings.EqualFold(reason, "closed") {
+		return fmt.Errorf("close reason is empty or default; provide a summary of what was done")
+	}
+	if len(reason) < 20 {
+		return fmt.Errorf("close reason is terse (%d chars); aim for 20+ characters describing what was done", len(reason))
+	}
+	return nil
 }

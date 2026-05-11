@@ -6,11 +6,9 @@ package main
 import (
 	"context"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
 )
 
@@ -25,35 +23,20 @@ type CommandContext struct {
 	DBPath       string
 	Actor        string
 	JSONOutput   bool
-	NoDaemon     bool
 	SandboxMode  bool
-	AllowStale   bool
-	NoDb         bool
 	ReadonlyMode bool
 	LockTimeout  time.Duration
 	Verbose      bool
 	Quiet        bool
 
+	ServerMode        bool
+	ProxiedServerMode bool
+
 	// Runtime state
-	Store        storage.Storage
-	DaemonClient *rpc.Client
-	DaemonStatus DaemonStatus
-	RootCtx      context.Context
-	RootCancel   context.CancelFunc
-	HookRunner   *hooks.Runner
-
-	// Auto-flush state (grouped with protecting mutex)
-	FlushManager      *FlushManager
-	AutoFlushEnabled  bool
-	FlushMutex        sync.Mutex
-	StoreMutex        sync.Mutex // Protects Store access from background goroutine
-	StoreActive       bool       // Tracks if Store is available
-	FlushFailureCount int        // Consecutive flush failures
-	LastFlushError    error      // Last flush error for debugging
-	SkipFinalFlush    bool       // Set by sync command to prevent re-export
-
-	// Auto-import state
-	AutoImportEnabled bool
+	Store      storage.DoltStorage
+	RootCtx    context.Context
+	RootCancel context.CancelFunc
+	HookRunner *hooks.Runner
 
 	// Version tracking
 	VersionUpgradeDetected bool
@@ -76,10 +59,7 @@ var testModeUseGlobals bool
 // initCommandContext creates and initializes a new CommandContext.
 // Called from PersistentPreRun to set up runtime state.
 func initCommandContext() {
-	cmdCtx = &CommandContext{
-		AutoFlushEnabled:  true,
-		AutoImportEnabled: true,
-	}
+	cmdCtx = &CommandContext{}
 }
 
 // GetCommandContext returns the current CommandContext.
@@ -112,9 +92,9 @@ func shouldUseGlobals() bool {
 // migration period, and they can be gradually replaced with direct
 // cmdCtx access as files are updated.
 
-// getStore returns the current storage backend (daemon client or direct SQLite).
+// getStore returns the current storage backend.
 // This is the primary way commands should access storage.
-func getStore() storage.Storage {
+func getStore() storage.DoltStorage {
 	if shouldUseGlobals() {
 		return store // fallback to legacy global during transition
 	}
@@ -122,7 +102,7 @@ func getStore() storage.Storage {
 }
 
 // setStore updates the storage backend in the CommandContext.
-func setStore(s storage.Storage) {
+func setStore(s storage.DoltStorage) {
 	if cmdCtx != nil {
 		cmdCtx.Store = s
 	}
@@ -143,22 +123,6 @@ func setActor(a string) {
 		cmdCtx.Actor = a
 	}
 	actor = a
-}
-
-// getDaemonClient returns the RPC client for daemon mode, or nil in direct mode.
-func getDaemonClient() *rpc.Client {
-	if shouldUseGlobals() {
-		return daemonClient
-	}
-	return cmdCtx.DaemonClient
-}
-
-// setDaemonClient updates the daemon client in the CommandContext.
-func setDaemonClient(c *rpc.Client) {
-	if cmdCtx != nil {
-		cmdCtx.DaemonClient = c
-	}
-	daemonClient = c
 }
 
 // isJSONOutput returns true if JSON output mode is enabled.
@@ -234,86 +198,6 @@ func setHookRunner(h *hooks.Runner) {
 	hookRunner = h
 }
 
-// isAutoFlushEnabled returns true if auto-flush is enabled.
-func isAutoFlushEnabled() bool {
-	if shouldUseGlobals() {
-		return autoFlushEnabled
-	}
-	return cmdCtx.AutoFlushEnabled
-}
-
-// setAutoFlushEnabled updates the auto-flush flag.
-func setAutoFlushEnabled(enabled bool) {
-	if cmdCtx != nil {
-		cmdCtx.AutoFlushEnabled = enabled
-	}
-	autoFlushEnabled = enabled
-}
-
-// isAutoImportEnabled returns true if auto-import is enabled.
-func isAutoImportEnabled() bool {
-	if shouldUseGlobals() {
-		return autoImportEnabled
-	}
-	return cmdCtx.AutoImportEnabled
-}
-
-// setAutoImportEnabled updates the auto-import flag.
-func setAutoImportEnabled(enabled bool) {
-	if cmdCtx != nil {
-		cmdCtx.AutoImportEnabled = enabled
-	}
-	autoImportEnabled = enabled
-}
-
-// getFlushManager returns the flush manager instance.
-func getFlushManager() *FlushManager {
-	if shouldUseGlobals() {
-		return flushManager
-	}
-	return cmdCtx.FlushManager
-}
-
-// setFlushManager updates the flush manager.
-func setFlushManager(fm *FlushManager) {
-	if cmdCtx != nil {
-		cmdCtx.FlushManager = fm
-	}
-	flushManager = fm
-}
-
-// getDaemonStatus returns the current daemon status.
-func getDaemonStatus() DaemonStatus {
-	if shouldUseGlobals() {
-		return daemonStatus
-	}
-	return cmdCtx.DaemonStatus
-}
-
-// setDaemonStatus updates the daemon status.
-func setDaemonStatus(ds DaemonStatus) {
-	if cmdCtx != nil {
-		cmdCtx.DaemonStatus = ds
-	}
-	daemonStatus = ds
-}
-
-// isNoDaemon returns true if daemon mode is disabled.
-func isNoDaemon() bool {
-	if shouldUseGlobals() {
-		return noDaemon
-	}
-	return cmdCtx.NoDaemon
-}
-
-// setNoDaemon updates the no-daemon flag.
-func setNoDaemon(nd bool) {
-	if cmdCtx != nil {
-		cmdCtx.NoDaemon = nd
-	}
-	noDaemon = nd
-}
-
 // isReadonlyMode returns true if read-only mode is enabled.
 func isReadonlyMode() bool {
 	if shouldUseGlobals() {
@@ -330,72 +214,24 @@ func getLockTimeout() time.Duration {
 	return cmdCtx.LockTimeout
 }
 
-// isSkipFinalFlush returns true if final flush should be skipped.
-func isSkipFinalFlush() bool {
-	if shouldUseGlobals() {
-		return skipFinalFlush
-	}
-	return cmdCtx.SkipFinalFlush
-}
-
-// setSkipFinalFlush updates the skip final flush flag.
-func setSkipFinalFlush(skip bool) {
-	if cmdCtx != nil {
-		cmdCtx.SkipFinalFlush = skip
-	}
-	skipFinalFlush = skip
-}
-
 // lockStore acquires the store mutex for thread-safe access.
 func lockStore() {
-	if cmdCtx != nil {
-		cmdCtx.StoreMutex.Lock()
-	} else {
-		storeMutex.Lock()
-	}
+	storeMutex.Lock()
 }
 
 // unlockStore releases the store mutex.
 func unlockStore() {
-	if cmdCtx != nil {
-		cmdCtx.StoreMutex.Unlock()
-	} else {
-		storeMutex.Unlock()
-	}
+	storeMutex.Unlock()
 }
 
 // isStoreActive returns true if the store is currently available.
 func isStoreActive() bool {
-	if cmdCtx != nil {
-		return cmdCtx.StoreActive
-	}
 	return storeActive
 }
 
 // setStoreActive updates the store active flag.
 func setStoreActive(active bool) {
-	if cmdCtx != nil {
-		cmdCtx.StoreActive = active
-	}
 	storeActive = active
-}
-
-// lockFlush acquires the flush mutex for thread-safe flush operations.
-func lockFlush() {
-	if cmdCtx != nil {
-		cmdCtx.FlushMutex.Lock()
-	} else {
-		flushMutex.Lock()
-	}
-}
-
-// unlockFlush releases the flush mutex.
-func unlockFlush() {
-	if cmdCtx != nil {
-		cmdCtx.FlushMutex.Unlock()
-	} else {
-		flushMutex.Unlock()
-	}
 }
 
 // isVerbose returns true if verbose mode is enabled.
@@ -412,22 +248,6 @@ func isQuiet() bool {
 		return quietFlag
 	}
 	return cmdCtx.Quiet
-}
-
-// isNoDb returns true if no-db mode is enabled.
-func isNoDb() bool {
-	if shouldUseGlobals() {
-		return noDb
-	}
-	return cmdCtx.NoDb
-}
-
-// setNoDb updates the no-db flag.
-func setNoDb(nd bool) {
-	if cmdCtx != nil {
-		cmdCtx.NoDb = nd
-	}
-	noDb = nd
 }
 
 // isSandboxMode returns true if sandbox mode is enabled.
@@ -526,17 +346,8 @@ func setTraceFile(f *os.File) {
 	traceFile = f
 }
 
-// isAllowStale returns true if staleness checks should be skipped.
-func isAllowStale() bool {
-	if shouldUseGlobals() {
-		return allowStale
-	}
-	return cmdCtx.AllowStale
-}
-
 // syncCommandContext copies all legacy global values to the CommandContext.
 // This is called after initialization is complete to ensure cmdCtx has all values.
-// During the transition period, this keeps cmdCtx in sync with globals.
 func syncCommandContext() {
 	if shouldUseGlobals() {
 		return
@@ -546,33 +357,21 @@ func syncCommandContext() {
 	cmdCtx.DBPath = dbPath
 	cmdCtx.Actor = actor
 	cmdCtx.JSONOutput = jsonOutput
-	cmdCtx.NoDaemon = noDaemon
 	cmdCtx.SandboxMode = sandboxMode
-	cmdCtx.AllowStale = allowStale
-	cmdCtx.NoDb = noDb
 	cmdCtx.ReadonlyMode = readonlyMode
 	cmdCtx.LockTimeout = lockTimeout
 	cmdCtx.Verbose = verboseFlag
 	cmdCtx.Quiet = quietFlag
 
+	// Storage mode
+	cmdCtx.ServerMode = serverMode
+	cmdCtx.ProxiedServerMode = proxiedServerMode
+
 	// Runtime state
 	cmdCtx.Store = store
-	cmdCtx.DaemonClient = daemonClient
-	cmdCtx.DaemonStatus = daemonStatus
 	cmdCtx.RootCtx = rootCtx
 	cmdCtx.RootCancel = rootCancel
 	cmdCtx.HookRunner = hookRunner
-
-	// Auto-flush state
-	cmdCtx.FlushManager = flushManager
-	cmdCtx.AutoFlushEnabled = autoFlushEnabled
-	cmdCtx.StoreActive = storeActive
-	cmdCtx.FlushFailureCount = flushFailureCount
-	cmdCtx.LastFlushError = lastFlushError
-	cmdCtx.SkipFinalFlush = skipFinalFlush
-
-	// Auto-import state
-	cmdCtx.AutoImportEnabled = autoImportEnabled
 
 	// Version tracking
 	cmdCtx.VersionUpgradeDetected = versionUpgradeDetected

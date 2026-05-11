@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 
@@ -58,19 +59,19 @@ func runRename(cmd *cobra.Command, args []string) error {
 	// Check if old issue exists
 	oldIssue, err := store.GetIssue(ctx, oldID)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("issue %s not found", oldID)
+		}
 		return fmt.Errorf("failed to get issue %s: %w", oldID, err)
-	}
-	if oldIssue == nil {
-		return fmt.Errorf("issue %s not found", oldID)
 	}
 
 	// Check if new ID already exists
-	existing, err := store.GetIssue(ctx, newID)
-	if err != nil {
-		return fmt.Errorf("failed to check for existing issue: %w", err)
-	}
-	if existing != nil {
+	_, err = store.GetIssue(ctx, newID)
+	if err == nil {
 		return fmt.Errorf("issue %s already exists", newID)
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("failed to check for existing issue: %w", err)
 	}
 
 	// Update the issue ID
@@ -88,14 +89,13 @@ func runRename(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Renamed %s -> %s\n", ui.RenderWarn(oldID), ui.RenderAccent(newID))
 
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
+	commandDidWrite.Store(true)
 
 	return nil
 }
 
 // updateReferencesInAllIssues updates text references to the old ID in all issues
-func updateReferencesInAllIssues(ctx context.Context, store storage.Storage, oldID, newID, actor string) error {
+func updateReferencesInAllIssues(ctx context.Context, store storage.DoltStorage, oldID, newID, actor string) error {
 	// Get all issues
 	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {

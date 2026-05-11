@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -10,6 +12,7 @@ import (
 )
 
 func TestCreateSuite(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	testDB := filepath.Join(tmpDir, ".beads", "beads.db")
 	s := newTestStore(t, testDB)
@@ -489,7 +492,7 @@ func TestCreateSuite(t *testing.T) {
 	// GH#820: Tests for DueAt and DeferUntil fields
 	t.Run("WithDueAt", func(t *testing.T) {
 		// Create issue with due date
-		dueTime := time.Now().Add(24 * time.Hour) // Due in 24 hours
+		dueTime := time.Now().UTC().Truncate(time.Second).Add(24 * time.Hour) // Due in 24 hours
 		issue := &types.Issue{
 			Title:     "Issue with due date",
 			Priority:  1,
@@ -521,7 +524,7 @@ func TestCreateSuite(t *testing.T) {
 
 	t.Run("WithDeferUntil", func(t *testing.T) {
 		// Create issue with defer_until
-		deferTime := time.Now().Add(2 * time.Hour) // Defer for 2 hours
+		deferTime := time.Now().UTC().Truncate(time.Second).Add(2 * time.Hour) // Defer for 2 hours
 		issue := &types.Issue{
 			Title:      "Issue with defer",
 			Priority:   1,
@@ -553,7 +556,7 @@ func TestCreateSuite(t *testing.T) {
 
 	t.Run("WithBothDueAndDefer", func(t *testing.T) {
 		// Create issue with both due and defer
-		dueTime := time.Now().Add(48 * time.Hour)  // Due in 48 hours
+		dueTime := time.Now().Add(48 * time.Hour)   // Due in 48 hours
 		deferTime := time.Now().Add(24 * time.Hour) // Defer for 24 hours
 		issue := &types.Issue{
 			Title:      "Issue with both due and defer",
@@ -580,6 +583,262 @@ func TestCreateSuite(t *testing.T) {
 		}
 		if retrieved.DeferUntil == nil {
 			t.Fatal("expected DeferUntil to be set")
+		}
+	})
+
+	t.Run("ParentChildLabelInheritance", func(t *testing.T) {
+		// Create parent with labels
+		parent := &types.Issue{
+			Title:     "Epic parent with labels",
+			Priority:  1,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeEpic,
+		}
+		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
+			t.Fatalf("failed to create parent: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "branch:feature-x", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "epic", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+
+		// Create child via parent pattern (GetNextChildID + AddDependency)
+		childID, err := s.GetNextChildID(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get next child ID: %v", err)
+		}
+		child := &types.Issue{
+			ID:        childID,
+			Title:     "Child inherits labels",
+			Priority:  2,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+		}
+		if err := s.CreateIssue(ctx, child, "test"); err != nil {
+			t.Fatalf("failed to create child: %v", err)
+		}
+		dep := &types.Dependency{
+			IssueID:     child.ID,
+			DependsOnID: parent.ID,
+			Type:        types.DepParentChild,
+		}
+		if err := s.AddDependency(ctx, dep, "test"); err != nil {
+			t.Fatalf("failed to add dependency: %v", err)
+		}
+
+		// Simulate label inheritance: fetch parent labels and add to child
+		parentLabels, err := s.GetLabels(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get parent labels: %v", err)
+		}
+		for _, l := range parentLabels {
+			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+				t.Fatalf("failed to add inherited label %s: %v", l, err)
+			}
+		}
+
+		// Verify child has both parent labels
+		childLabels, err := s.GetLabels(ctx, child.ID)
+		if err != nil {
+			t.Fatalf("failed to get child labels: %v", err)
+		}
+		labelMap := make(map[string]bool)
+		for _, l := range childLabels {
+			labelMap[l] = true
+		}
+		if !labelMap["branch:feature-x"] {
+			t.Error("expected child to have label 'branch:feature-x'")
+		}
+		if !labelMap["epic"] {
+			t.Error("expected child to have label 'epic'")
+		}
+		if len(childLabels) != 2 {
+			t.Errorf("expected 2 labels, got %d: %v", len(childLabels), childLabels)
+		}
+	})
+
+	t.Run("ParentChildLabelInheritanceMerge", func(t *testing.T) {
+		// Parent has labels "a", "b". Child created with explicit "c".
+		parent := &types.Issue{
+			Title:     "Parent with a,b labels",
+			Priority:  1,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeEpic,
+		}
+		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
+			t.Fatalf("failed to create parent: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "a", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "b", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+
+		childID, err := s.GetNextChildID(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get next child ID: %v", err)
+		}
+		child := &types.Issue{
+			ID:        childID,
+			Title:     "Child with explicit label c",
+			Priority:  2,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+		}
+		if err := s.CreateIssue(ctx, child, "test"); err != nil {
+			t.Fatalf("failed to create child: %v", err)
+		}
+
+		// User-specified labels
+		userLabels := []string{"c", "a"} // "a" overlaps with parent
+
+		// Simulate label inheritance merge (dedup)
+		parentLabels, err := s.GetLabels(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get parent labels: %v", err)
+		}
+		merged := make(map[string]bool)
+		for _, l := range userLabels {
+			merged[l] = true
+		}
+		for _, l := range parentLabels {
+			merged[l] = true
+		}
+
+		// Add all merged labels (AddLabel is idempotent)
+		for l := range merged {
+			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+				t.Fatalf("failed to add label %s: %v", l, err)
+			}
+		}
+
+		childLabels, err := s.GetLabels(ctx, child.ID)
+		if err != nil {
+			t.Fatalf("failed to get child labels: %v", err)
+		}
+		if len(childLabels) != 3 {
+			t.Errorf("expected 3 labels (a, b, c), got %d: %v", len(childLabels), childLabels)
+		}
+		labelMap := make(map[string]bool)
+		for _, l := range childLabels {
+			labelMap[l] = true
+		}
+		for _, expected := range []string{"a", "b", "c"} {
+			if !labelMap[expected] {
+				t.Errorf("expected label %q not found", expected)
+			}
+		}
+	})
+
+	t.Run("ParentChildNoLabels", func(t *testing.T) {
+		// Parent has no labels. Child should have no labels and no error.
+		parent := &types.Issue{
+			Title:     "Parent without labels",
+			Priority:  1,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeEpic,
+		}
+		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
+			t.Fatalf("failed to create parent: %v", err)
+		}
+
+		childID, err := s.GetNextChildID(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get next child ID: %v", err)
+		}
+		child := &types.Issue{
+			ID:        childID,
+			Title:     "Child of labelless parent",
+			Priority:  2,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+		}
+		if err := s.CreateIssue(ctx, child, "test"); err != nil {
+			t.Fatalf("failed to create child: %v", err)
+		}
+
+		// Simulate label inheritance with no parent labels
+		parentLabels, err := s.GetLabels(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get parent labels: %v", err)
+		}
+		if len(parentLabels) != 0 {
+			t.Errorf("expected 0 parent labels, got %d", len(parentLabels))
+		}
+
+		childLabels, err := s.GetLabels(ctx, child.ID)
+		if err != nil {
+			t.Fatalf("failed to get child labels: %v", err)
+		}
+		if len(childLabels) != 0 {
+			t.Errorf("expected 0 child labels, got %d", len(childLabels))
+		}
+	})
+
+	t.Run("ParentChildNoInheritLabels", func(t *testing.T) {
+		// Simulate --no-inherit-labels: parent has labels, child gets only explicit ones
+		parent := &types.Issue{
+			Title:     "Parent with labels for no-inherit test",
+			Priority:  1,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeEpic,
+		}
+		if err := s.CreateIssue(ctx, parent, "test"); err != nil {
+			t.Fatalf("failed to create parent: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "branch:main", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+		if err := s.AddLabel(ctx, parent.ID, "priority:high", "test"); err != nil {
+			t.Fatalf("failed to add label: %v", err)
+		}
+
+		childID, err := s.GetNextChildID(ctx, parent.ID)
+		if err != nil {
+			t.Fatalf("failed to get next child ID: %v", err)
+		}
+		child := &types.Issue{
+			ID:        childID,
+			Title:     "Child without inherited labels",
+			Priority:  2,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+		}
+		if err := s.CreateIssue(ctx, child, "test"); err != nil {
+			t.Fatalf("failed to create child: %v", err)
+		}
+
+		// With --no-inherit-labels, only add explicit user labels
+		userLabels := []string{"my-label"}
+		for _, l := range userLabels {
+			if err := s.AddLabel(ctx, child.ID, l, "test"); err != nil {
+				t.Fatalf("failed to add label %s: %v", l, err)
+			}
+		}
+
+		childLabels, err := s.GetLabels(ctx, child.ID)
+		if err != nil {
+			t.Fatalf("failed to get child labels: %v", err)
+		}
+		if len(childLabels) != 1 {
+			t.Errorf("expected 1 label, got %d: %v", len(childLabels), childLabels)
+		}
+		if len(childLabels) > 0 && childLabels[0] != "my-label" {
+			t.Errorf("expected 'my-label', got %q", childLabels[0])
+		}
+		// Verify parent labels were NOT inherited
+		labelMap := make(map[string]bool)
+		for _, l := range childLabels {
+			labelMap[l] = true
+		}
+		if labelMap["branch:main"] {
+			t.Error("did not expect inherited label 'branch:main'")
+		}
+		if labelMap["priority:high"] {
+			t.Error("did not expect inherited label 'priority:high'")
 		}
 	})
 

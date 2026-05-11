@@ -9,7 +9,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
 	"golang.org/x/term"
 )
@@ -25,10 +24,10 @@ var (
 var federationCmd = &cobra.Command{
 	Use:     "federation",
 	GroupID: "sync",
-	Short:   "Manage peer-to-peer federation with other Gas Towns",
+	Short:   "Manage peer-to-peer federation with other workspaces",
 	Long: `Manage peer-to-peer federation between Dolt-backed beads databases.
 
-Federation enables synchronized issue tracking across multiple Gas Towns,
+Federation enables synchronized issue tracking across multiple workspaces,
 each maintaining their own Dolt database while sharing updates via remotes.
 
 Requires the Dolt storage backend.`,
@@ -130,17 +129,11 @@ func init() {
 	rootCmd.AddCommand(federationCmd)
 }
 
-func getFederatedStore() (*dolt.DoltStore, error) {
-	fs, ok := storage.AsFederated(store)
-	if !ok {
-		return nil, fmt.Errorf("federation requires Dolt backend (current backend does not support federation)")
+func getFederatedStore() (storage.DoltStorage, error) {
+	if store == nil {
+		return nil, fmt.Errorf("no store available")
 	}
-	// Type assert to get the concrete DoltStore for Sync method
-	ds, ok := fs.(*dolt.DoltStore)
-	if !ok {
-		return nil, fmt.Errorf("internal error: federated storage is not DoltStore")
-	}
-	return ds, nil
+	return store, nil
 }
 
 func runFederationSync(cmd *cobra.Command, args []string) {
@@ -179,7 +172,7 @@ func runFederationSync(cmd *cobra.Command, args []string) {
 	}
 
 	// Sync with each peer
-	var results []*dolt.SyncResult
+	var results []*storage.SyncResult
 	for _, peer := range peers {
 		if !jsonOutput {
 			fmt.Printf("%s Syncing with %s...\n", ui.RenderAccent("🔄"), peer)
@@ -275,7 +268,7 @@ func runFederationStatus(cmd *cobra.Command, args []string) {
 	}
 
 	// Get pending local changes
-	doltStatus, _ := ds.Status(ctx)
+	doltStatus, _ := ds.Status(ctx) // Best effort: nil status means federation not available
 	pendingChanges := 0
 	if doltStatus != nil {
 		pendingChanges = len(doltStatus.Staged) + len(doltStatus.Unstaged)
@@ -296,7 +289,7 @@ func runFederationStatus(cmd *cobra.Command, args []string) {
 		}
 
 		// Get sync status
-		status, _ := ds.SyncStatus(ctx, peer)
+		status, _ := ds.SyncStatus(ctx, peer) // Best effort: nil status means sync info unavailable
 		ps.Status = status
 
 		// Test connectivity by attempting a fetch
@@ -304,7 +297,7 @@ func runFederationStatus(cmd *cobra.Command, args []string) {
 		if fetchErr == nil {
 			ps.Reachable = true
 			// Re-get status after successful fetch for accurate ahead/behind
-			status, _ = ds.SyncStatus(ctx, peer)
+			status, _ = ds.SyncStatus(ctx, peer) // Best effort: nil status means sync info unavailable
 			ps.Status = status
 		} else {
 			ps.ReachError = fetchErr.Error()
@@ -366,11 +359,6 @@ func runFederationAddPeer(cmd *cobra.Command, args []string) {
 	name := args[0]
 	url := args[1]
 
-	fs, ok := storage.AsFederated(store)
-	if !ok {
-		FatalErrorRespectJSON("federation requires Dolt backend")
-	}
-
 	// If user is provided but password is not, prompt for it
 	password := federationPassword
 	if federationUser != "" && password == "" {
@@ -401,12 +389,12 @@ func runFederationAddPeer(cmd *cobra.Command, args []string) {
 			Password:    password,
 			Sovereignty: sov,
 		}
-		if err := fs.AddFederationPeer(ctx, peer); err != nil {
+		if err := store.AddFederationPeer(ctx, peer); err != nil {
 			FatalErrorRespectJSON("failed to add peer: %v", err)
 		}
 	} else {
 		// No credentials, just add the remote
-		if err := fs.AddRemote(ctx, name, url); err != nil {
+		if err := store.AddRemote(ctx, name, url); err != nil {
 			FatalErrorRespectJSON("failed to add peer: %v", err)
 		}
 	}
@@ -435,12 +423,7 @@ func runFederationRemovePeer(cmd *cobra.Command, args []string) {
 
 	name := args[0]
 
-	fs, ok := storage.AsFederated(store)
-	if !ok {
-		FatalErrorRespectJSON("federation requires Dolt backend")
-	}
-
-	if err := fs.RemoveRemote(ctx, name); err != nil {
+	if err := store.RemoveRemote(ctx, name); err != nil {
 		FatalErrorRespectJSON("failed to remove peer: %v", err)
 	}
 
@@ -457,12 +440,7 @@ func runFederationRemovePeer(cmd *cobra.Command, args []string) {
 func runFederationListPeers(cmd *cobra.Command, args []string) {
 	ctx := rootCtx
 
-	fs, ok := storage.AsFederated(store)
-	if !ok {
-		FatalErrorRespectJSON("federation requires Dolt backend")
-	}
-
-	remotes, err := fs.ListRemotes(ctx)
+	remotes, err := store.ListRemotes(ctx)
 	if err != nil {
 		FatalErrorRespectJSON("failed to list peers: %v", err)
 	}

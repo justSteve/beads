@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -15,12 +14,9 @@ var (
 var historyCmd = &cobra.Command{
 	Use:     "history <id>",
 	GroupID: "views",
-	Short:   "Show version history for an issue (requires Dolt backend)",
+	Short:   "Show version history for an issue",
 	Long: `Show the complete version history of an issue, including all commits
 where the issue was modified.
-
-This command requires the Dolt storage backend. If you're using SQLite,
-you'll see an error message suggesting to use Dolt for versioning features.
 
 Examples:
   bd history bd-123           # Show all history for issue bd-123
@@ -30,24 +26,24 @@ Examples:
 		ctx := rootCtx
 		issueID := args[0]
 
-		// Check if storage supports versioning
-		vs, ok := storage.AsVersioned(store)
-		if !ok {
-			FatalErrorRespectJSON("history requires Dolt backend (current backend does not support versioning)")
-		}
-
 		// Get issue history
-		history, err := vs.History(ctx, issueID)
+		history, err := store.History(ctx, issueID)
 		if err != nil {
 			FatalErrorRespectJSON("failed to get history: %v", err)
 		}
 
+		// Empty-history short-circuit handles both formats: --json gets []
+		// (so consumers piping to jq don't break), human format gets prose.
 		if len(history) == 0 {
+			if jsonOutput {
+				outputJSON(history)
+				return
+			}
 			fmt.Printf("No history found for issue %s\n", issueID)
 			return
 		}
 
-		// Apply limit if specified
+		// Apply limit only to non-empty history; slicing an empty slice is a no-op.
 		if historyLimit > 0 && historyLimit < len(history) {
 			history = history[:historyLimit]
 		}

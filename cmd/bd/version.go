@@ -4,17 +4,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/rpc"
 )
 
 var (
 	// Version is the current version of bd (overridden by ldflags at build time)
-    Version = "0.49.1"
+	Version = "1.0.4"
 	// Build can be set via ldflags at compile time
 	Build = "dev"
 	// Commit and branch the git revision the binary was built from (optional ldflag)
@@ -26,18 +27,11 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(cmd *cobra.Command, args []string) {
-		checkDaemon, _ := cmd.Flags().GetBool("daemon")
-
-		if checkDaemon {
-			showDaemonVersion()
-			return
-		}
-
 		commit := resolveCommitHash()
 		branch := resolveBranch()
 
 		if jsonOutput {
-			result := map[string]string{
+			result := map[string]interface{}{
 				"version": Version,
 				"build":   Build,
 			}
@@ -57,59 +51,19 @@ var versionCmd = &cobra.Command{
 				fmt.Printf("bd version %s (%s)\n", Version, Build)
 			}
 		}
+
+		// Check for multiple bd binaries in PATH
+		if dups := findDuplicateBinaries(); len(dups) > 1 {
+			fmt.Fprintf(os.Stderr, "\nWarning: multiple 'bd' binaries found in PATH:\n")
+			for _, p := range dups {
+				fmt.Fprintf(os.Stderr, "  %s\n", p)
+			}
+			fmt.Fprintf(os.Stderr, "The first one is being used. Remove duplicates to avoid confusion.\n")
+		}
 	},
 }
 
-func showDaemonVersion() {
-	// Connect to daemon (PersistentPreRun skips version command)
-	// We need to find the database path first to get the socket path
-	if dbPath == "" {
-		// Use public API to find database (same logic as PersistentPreRun)
-		if foundDB := beads.FindDatabasePath(); foundDB != "" {
-			dbPath = foundDB
-		}
-	}
-
-	socketPath := getSocketPath()
-	client, err := rpc.TryConnect(socketPath)
-	if err != nil || client == nil {
-		fmt.Fprintf(os.Stderr, "Error: daemon is not running\n")
-		fmt.Fprintf(os.Stderr, "Hint: start daemon with 'bd daemon'\n")
-		os.Exit(1)
-	}
-	defer func() { _ = client.Close() }()
-
-	health, err := client.Health()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error checking daemon health: %v\n", err)
-		os.Exit(1)
-	}
-
-	if jsonOutput {
-		outputJSON(map[string]interface{}{
-			"daemon_version": health.Version,
-			"client_version": Version,
-			"compatible":     health.Compatible,
-			"daemon_uptime":  health.Uptime,
-		})
-	} else {
-		fmt.Printf("Daemon version: %s\n", health.Version)
-		fmt.Printf("Client version: %s\n", Version)
-		if health.Compatible {
-			fmt.Printf("Compatibility: ✓ compatible\n")
-		} else {
-			fmt.Printf("Compatibility: ✗ incompatible (restart daemon recommended)\n")
-		}
-		fmt.Printf("Daemon uptime: %.1f seconds\n", health.Uptime)
-	}
-
-	if !health.Compatible {
-		os.Exit(1)
-	}
-}
-
 func init() {
-	versionCmd.Flags().Bool("daemon", false, "Check daemon version and compatibility")
 	rootCmd.AddCommand(versionCmd)
 }
 
@@ -163,4 +117,38 @@ func resolveBranch() string {
 	}
 
 	return ""
+}
+
+// findDuplicateBinaries searches PATH for all "bd" executables.
+// Returns their full paths. If len > 1, there are duplicates.
+func findDuplicateBinaries() []string {
+	name := "bd"
+	if runtime.GOOS == "windows" {
+		name = "bd.exe"
+	}
+
+	seen := make(map[string]bool)
+	var paths []string
+
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		candidate := filepath.Join(dir, name)
+		// Resolve symlinks so we don't double-count
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			// Try the raw path (might be a valid binary without symlinks)
+			resolved = candidate
+		}
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		if !seen[resolved] {
+			seen[resolved] = true
+			paths = append(paths, candidate)
+		}
+	}
+	return paths
 }

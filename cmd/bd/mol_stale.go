@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -59,48 +57,16 @@ func runMolStale(cmd *cobra.Command, args []string) {
 	unassignedOnly, _ := cmd.Flags().GetBool("unassigned")
 	showAll, _ := cmd.Flags().GetBool("all")
 
-	// Get storage (direct or daemon)
 	var result *StaleResult
 	var err error
 
-	if daemonClient != nil {
-		// Daemon mode - use RPC to get stale molecules
-		rpcResp, rpcErr := daemonClient.MolStale(&rpc.MolStaleArgs{
-			BlockingOnly:   blockingOnly,
-			UnassignedOnly: unassignedOnly,
-			ShowAll:        showAll,
-		})
-		if rpcErr != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", rpcErr)
-			os.Exit(1)
-		}
-		// Convert RPC response to local StaleResult
-		result = &StaleResult{
-			TotalCount:    rpcResp.TotalCount,
-			BlockingCount: rpcResp.BlockingCount,
-		}
-		for _, mol := range rpcResp.StaleMolecules {
-			result.StaleMolecules = append(result.StaleMolecules, &StaleMolecule{
-				ID:             mol.ID,
-				Title:          mol.Title,
-				TotalChildren:  mol.TotalChildren,
-				ClosedChildren: mol.ClosedChildren,
-				Assignee:       mol.Assignee,
-				BlockingIssues: mol.BlockingIssues,
-				BlockingCount:  mol.BlockingCount,
-			})
-		}
-	} else {
-		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
-		}
-
-		result, err = findStaleMolecules(ctx, store, blockingOnly, unassignedOnly, showAll)
+	if store == nil {
+		FatalError("no database connection")
 	}
+
+	result, err = findStaleMolecules(ctx, store, blockingOnly, unassignedOnly, showAll)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	if jsonOutput {
@@ -150,7 +116,7 @@ func runMolStale(cmd *cobra.Command, args []string) {
 }
 
 // findStaleMolecules queries the database for stale molecules
-func findStaleMolecules(ctx context.Context, s storage.Storage, blockingOnly, unassignedOnly, showAll bool) (*StaleResult, error) {
+func findStaleMolecules(ctx context.Context, s storage.DoltStorage, blockingOnly, unassignedOnly, showAll bool) (*StaleResult, error) {
 	// Get all epics eligible for closure (complete but unclosed)
 	epicStatuses, err := s.GetEpicsEligibleForClosure(ctx)
 	if err != nil {
@@ -236,7 +202,6 @@ func init() {
 	molStaleCmd.Flags().Bool("blocking", false, "Only show molecules blocking other work")
 	molStaleCmd.Flags().Bool("unassigned", false, "Only show unassigned molecules")
 	molStaleCmd.Flags().Bool("all", false, "Include molecules with 0 children")
-	molStaleCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 
 	molCmd.AddCommand(molStaleCmd)
 }

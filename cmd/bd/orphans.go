@@ -7,11 +7,14 @@ import (
 	"sort"
 	"strings"
 
+	"context"
+
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 // doctorFindOrphanedIssues is the function used to find orphaned issues.
@@ -34,13 +37,18 @@ Examples:
   bd orphans              # Show orphaned issues
   bd orphans --json       # Machine-readable output
   bd orphans --details    # Show full commit information
-  bd orphans --fix        # Close orphaned issues with confirmation`,
+  bd orphans --fix        # Close orphaned issues with confirmation
+  bd orphans --label theme:personal             # Only orphans with this label
+  bd orphans --label-any theme:personal,theme:ventures  # Orphans with either label`,
 	Run: func(cmd *cobra.Command, args []string) {
 		path := "."
-		orphans, err := findOrphanedIssues(path)
+		labels, _ := cmd.Flags().GetStringSlice("label")
+		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
+		labels = utils.NormalizeLabels(labels)
+		labelsAny = utils.NormalizeLabels(labelsAny)
+		orphans, err := findOrphanedIssues(path, labels, labelsAny)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		fix, _ := cmd.Flags().GetBool("fix")
@@ -107,32 +115,68 @@ type orphanIssueOutput struct {
 	LatestCommitMessage string `json:"latest_commit_message,omitempty"`
 }
 
-// getIssueProvider returns an IssueProvider based on the current configuration.
-// If --db flag is set, it creates a provider from that database path.
-// Otherwise, it uses the global store (already opened in PersistentPreRun).
-func getIssueProvider() (types.IssueProvider, func(), error) {
-	// If --db flag is set and we have a dbPath, create a provider from that path
-	if dbPath != "" {
-		provider, err := storage.NewLocalProvider(dbPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to open database at %s: %w", dbPath, err)
-		}
-		return provider, func() { _ = provider.Close() }, nil
-	}
+// doltStoreProvider wraps storage.DoltStorage to implement types.IssueProvider.
+type doltStoreProvider struct {
+	labels    []string // AND semantics: issue must have ALL these labels
+	labelsAny []string // OR semantics: issue must have AT LEAST ONE of these labels
+}
 
-	// Use the global store (already opened by PersistentPreRun)
+func (p *doltStoreProvider) GetOpenIssues(ctx context.Context) ([]*types.Issue, error) {
+	openStatus := types.StatusOpen
+	openIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{
+		Status:    &openStatus,
+		Labels:    p.labels,
+		LabelsAny: p.labelsAny,
+	})
+	if err != nil {
+		return nil, err
+	}
+	inProgressStatus := types.StatusInProgress
+	inProgressIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{
+		Status:    &inProgressStatus,
+		Labels:    p.labels,
+		LabelsAny: p.labelsAny,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(openIssues, inProgressIssues...), nil
+}
+
+func (p *doltStoreProvider) GetIssuePrefix() string {
+	// YAML config takes precedence — in shared-server mode the DB
+	// may belong to a different project (GH#2469).
+	if yamlPrefix := config.GetString("issue-prefix"); yamlPrefix != "" {
+		return yamlPrefix
+	}
+	ctx := context.Background()
+	prefix, err := store.GetConfig(ctx, "issue_prefix")
+	if err != nil || prefix == "" {
+		return "bd"
+	}
+	return prefix
+}
+
+// getIssueProviderFn is the function used to create an IssueProvider.
+// It is a variable so tests can substitute a mock without needing a real store.
+var getIssueProviderFn = func(labels, labelsAny []string) (types.IssueProvider, func(), error) {
 	if store != nil {
-		provider := storage.NewStorageProvider(store)
-		return provider, func() {}, nil // No cleanup needed for global store
+		return &doltStoreProvider{labels: labels, labelsAny: labelsAny}, func() {}, nil
 	}
-
 	return nil, nil, fmt.Errorf("no database available")
+}
+
+// getIssueProvider returns an IssueProvider backed by the global Dolt store.
+// labels and labelsAny are passed through to SearchIssues for label filtering.
+func getIssueProvider(labels, labelsAny []string) (types.IssueProvider, func(), error) {
+	return getIssueProviderFn(labels, labelsAny)
 }
 
 // findOrphanedIssues wraps the shared doctor package function and converts to output format.
 // It respects the --db flag for cross-repo orphan detection.
-func findOrphanedIssues(path string) ([]orphanIssueOutput, error) {
-	provider, cleanup, err := getIssueProvider()
+// labels and labelsAny are passed to the issue provider to restrict which issues are considered.
+func findOrphanedIssues(path string, labels, labelsAny []string) ([]orphanIssueOutput, error) {
+	provider, cleanup, err := getIssueProvider(labels, labelsAny)
 	if err != nil {
 		return nil, fmt.Errorf("unable to find orphaned issues: %w", err)
 	}
@@ -164,5 +208,7 @@ func closeIssue(issueID string) error {
 func init() {
 	orphansCmd.Flags().BoolP("fix", "f", false, "Close orphaned issues with confirmation")
 	orphansCmd.Flags().Bool("details", false, "Show full commit information")
+	orphansCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
+	orphansCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
 	rootCmd.AddCommand(orphansCmd)
 }

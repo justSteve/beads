@@ -8,7 +8,7 @@ Beads (`bd`) is an issue tracker designed specifically for AI-supervised coding 
 - Track work with a simple CLI
 - Discover and link related tasks during development
 - Maintain context across coding sessions
-- Auto-sync issues via JSONL for git workflows
+- Auto-sync issues via Dolt for distributed workflows
 
 ## Installation
 
@@ -16,7 +16,7 @@ Beads (`bd`) is an issue tracker designed specifically for AI-supervised coding 
 
 1. Install beads CLI:
 ```bash
-curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 2. Install Python and uv (for MCP server):
@@ -33,7 +33,7 @@ There are two ways to install the beads plugin:
 
 ```bash
 # In Claude Code
-/plugin marketplace add steveyegge/beads
+/plugin marketplace add gastownhall/beads
 /plugin install beads
 ```
 
@@ -41,7 +41,7 @@ There are two ways to install the beads plugin:
 
 ```bash
 # Clone the repository (shell command)
-git clone https://github.com/steveyegge/beads
+git clone https://github.com/gastownhall/beads
 cd beads
 ```
 
@@ -219,8 +219,8 @@ The MCP server supports these environment variables:
 - **`BEADS_PATH`** - Path to bd executable (default: `bd` in PATH)
 - **`BEADS_DB`** - Path to beads database file (default: auto-discover from cwd)
 - **`BEADS_ACTOR`** - Actor name for audit trail (default: `$USER`)
-- **`BEADS_NO_AUTO_FLUSH`** - Disable automatic JSONL sync (default: `false`)
-- **`BEADS_NO_AUTO_IMPORT`** - Disable automatic JSONL import (default: `false`)
+- **`BEADS_NO_AUTO_FLUSH`** - Disable automatic sync (default: `false`)
+- **`BEADS_NO_AUTO_IMPORT`** - Disable automatic import (default: `false`)
 
 To customize, edit your Claude Code MCP settings or the plugin configuration.
 
@@ -270,25 +270,21 @@ To customize, edit your Claude Code MCP settings or the plugin configuration.
 # 6. Repeat
 ```
 
-## Auto-Sync with Git
+## Auto-Sync with Dolt
 
-Beads automatically syncs issues to `.beads/issues.jsonl`:
-- **Export**: After any CRUD operation (5-second debounce)
-- **Import**: When JSONL is newer than DB (e.g., after `git pull`)
+Beads automatically commits changes to Dolt history after every write operation. This enables seamless collaboration:
 
-This enables seamless collaboration:
 ```bash
 # Make changes
 bd create "Add feature" -p 1
 
-# Changes auto-export after 5 seconds
-# Commit when ready
-git add .beads/issues.jsonl
-git commit -m "Add feature tracking"
+# Changes are automatically committed to Dolt history
+# Sync with remotes when ready:
+bd dolt push
 
-# After pull, JSONL auto-imports
-git pull
-bd ready  # Shows issues ready to work on (with fresh data from git)
+# Pull changes from collaborators:
+bd dolt pull
+bd ready  # Shows issues ready to work on (with fresh data)
 ```
 
 ## Updating
@@ -310,10 +306,13 @@ The plugin requires the `bd` CLI to be installed. Update it separately:
 
 ```bash
 # Quick update
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
-# Or with go
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Or with Go (server-mode only)
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Or with Go (embedded-capable)
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### 3. Version Compatibility
@@ -377,7 +376,7 @@ Beads follows semantic versioning. The plugin version tracks the bd CLI version:
 
 ## Learn More
 
-- **GitHub**: https://github.com/steveyegge/beads
+- **GitHub**: https://github.com/gastownhall/beads
 - **Documentation**: See README.md in the repository
 - **Examples**: Check `examples/` directory for integration patterns
 - **MCP Server**: See `integrations/beads-mcp/` for server details

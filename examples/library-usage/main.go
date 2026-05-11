@@ -10,7 +10,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads"
 )
 
 func main() {
@@ -25,7 +25,7 @@ func main() {
 	fmt.Printf("Using database: %s\n\n", dbPath)
 
 	// Open the database
-	store, err := beads.NewSQLiteStorage(dbPath)
+	store, err := beads.Open(ctx, dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open storage: %v", err)
 	}
@@ -94,7 +94,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to add comment: %v", err)
 	}
-	fmt.Printf("Added comment #%d\n", comment.ID)
+	fmt.Printf("Added comment #%s\n", comment.ID)
 
 	// Example 6: Update issue status
 	fmt.Println("\n=== Updating Status ===")

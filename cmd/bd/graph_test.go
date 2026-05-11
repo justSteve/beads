@@ -84,7 +84,7 @@ func TestPadRight(t *testing.T) {
 			name:  "empty string",
 			s:     "",
 			width: 3,
-			want:   "   ",
+			want:  "   ",
 		},
 		{
 			name:  "unicode safe",
@@ -106,9 +106,9 @@ func TestPadRight(t *testing.T) {
 
 func TestRenderNodeBox(t *testing.T) {
 	tests := []struct {
-		name   string
-		node   *GraphNode
-		width  int
+		name     string
+		node     *GraphNode
+		width    int
 		notEmpty bool
 	}{
 		{
@@ -408,6 +408,89 @@ func TestComputeLayout(t *testing.T) {
 		// test-2 depends on test-1, should be layer 1
 		if layout.Nodes["test-2"].Layer != 1 {
 			t.Errorf("test-2 layer = %d, want 1", layout.Nodes["test-2"].Layer)
+		}
+	})
+
+	t.Run("children lifted to parent layer (GH#1748)", func(t *testing.T) {
+		// Scenario: epic is blocked by a blocker (layer 1),
+		// children have no blocking deps but should be in the same layer as parent.
+		blocker := &types.Issue{ID: "blocker-1", Title: "Blocker issue"}
+		epic := &types.Issue{ID: "epic-1", Title: "My Epic", IssueType: "epic"}
+		child1 := &types.Issue{ID: "child-1", Title: "Task A"}
+		child2 := &types.Issue{ID: "child-2", Title: "Task B"}
+		subgraph := &TemplateSubgraph{
+			Root:   blocker,
+			Issues: []*types.Issue{blocker, epic, child1, child2},
+			Dependencies: []*types.Dependency{
+				{IssueID: "epic-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+				{IssueID: "child-1", DependsOnID: "epic-1", Type: types.DepParentChild},
+				{IssueID: "child-2", DependsOnID: "epic-1", Type: types.DepParentChild},
+			},
+			IssueMap: map[string]*types.Issue{
+				"blocker-1": blocker, "epic-1": epic,
+				"child-1": child1, "child-2": child2,
+			},
+		}
+		layout := computeLayout(subgraph)
+		// blocker has no deps → layer 0
+		if layout.Nodes["blocker-1"].Layer != 0 {
+			t.Errorf("blocker layer = %d, want 0", layout.Nodes["blocker-1"].Layer)
+		}
+		// epic is blocked → layer 1
+		if layout.Nodes["epic-1"].Layer != 1 {
+			t.Errorf("epic layer = %d, want 1", layout.Nodes["epic-1"].Layer)
+		}
+		// children should be lifted to parent's layer (1), not layer 0
+		if layout.Nodes["child-1"].Layer != 1 {
+			t.Errorf("child-1 layer = %d, want 1 (should match parent)", layout.Nodes["child-1"].Layer)
+		}
+		if layout.Nodes["child-2"].Layer != 1 {
+			t.Errorf("child-2 layer = %d, want 1 (should match parent)", layout.Nodes["child-2"].Layer)
+		}
+	})
+
+	t.Run("child with own blocker stays in higher layer", func(t *testing.T) {
+		// If a child has its own blocking dep putting it higher than the parent,
+		// keep the child's higher layer.
+		blocker := &types.Issue{ID: "blocker-1", Title: "Blocker"}
+		epic := &types.Issue{ID: "epic-1", Title: "Epic", IssueType: "epic"}
+		child := &types.Issue{ID: "child-1", Title: "Child"}
+		subgraph := &TemplateSubgraph{
+			Root:   blocker,
+			Issues: []*types.Issue{blocker, epic, child},
+			Dependencies: []*types.Dependency{
+				{IssueID: "epic-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+				{IssueID: "child-1", DependsOnID: "epic-1", Type: types.DepParentChild},
+				{IssueID: "child-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+			},
+			IssueMap: map[string]*types.Issue{
+				"blocker-1": blocker, "epic-1": epic, "child-1": child,
+			},
+		}
+		layout := computeLayout(subgraph)
+		// child blocked by blocker → layer 1 (same as epic, which is also correct)
+		if layout.Nodes["child-1"].Layer < layout.Nodes["epic-1"].Layer {
+			t.Errorf("child layer = %d, should be >= parent layer %d",
+				layout.Nodes["child-1"].Layer, layout.Nodes["epic-1"].Layer)
+		}
+	})
+
+	t.Run("nil root does not panic", func(t *testing.T) {
+		subgraph := &TemplateSubgraph{
+			Root:         nil,
+			Issues:       []*types.Issue{{ID: "orphan-1", Title: "Orphan"}},
+			Dependencies: []*types.Dependency{},
+			IssueMap:     map[string]*types.Issue{"orphan-1": {ID: "orphan-1", Title: "Orphan"}},
+		}
+		layout := computeLayout(subgraph)
+		if layout == nil {
+			t.Fatal("computeLayout returned nil")
+		}
+		if layout.RootID != "" {
+			t.Errorf("RootID = %q, want empty string for nil root", layout.RootID)
+		}
+		if len(layout.Nodes) != 1 {
+			t.Errorf("len(Nodes) = %d, want 1", len(layout.Nodes))
 		}
 	})
 }

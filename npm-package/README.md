@@ -27,8 +27,8 @@ Beads is an issue tracker designed specifically for AI coding agents. It provide
 - 🔗 **Dependency tracking** - Four dependency types (blocks, related, parent-child, discovered-from)
 - 📋 **Ready work detection** - Automatically finds issues with no open blockers
 - 🤖 **Agent-friendly** - `--json` flags for programmatic integration
-- 📦 **Git-versioned** - JSONL records stored in git, synced across machines
-- 🌍 **Distributed by design** - Share one logical database via git
+- 📦 **Version-controlled** - Dolt database with full history and branching
+- 🌍 **Distributed by design** - Share one logical database via Dolt remotes
 
 ## Quick Start
 
@@ -65,8 +65,8 @@ bd show bd-a1b2
 # List all issues
 bd list --json
 
-# Update status
-bd update bd-a1b2 --status in_progress
+# Start work
+bd update bd-a1b2 --claim
 
 # Add dependency
 bd dep add bd-f14c bd-a1b2
@@ -97,13 +97,13 @@ This package downloads the appropriate native binary for your platform:
 
 ## Full Documentation
 
-For complete documentation, see the [beads GitHub repository](https://github.com/steveyegge/beads):
+For complete documentation, see the [beads GitHub repository](https://github.com/gastownhall/beads):
 
-- [Complete README](https://github.com/steveyegge/beads#readme)
-- [Quick Start Guide](https://github.com/steveyegge/beads/blob/main/docs/QUICKSTART.md)
-- [Installation Guide](https://github.com/steveyegge/beads/blob/main/docs/INSTALLING.md)
-- [FAQ](https://github.com/steveyegge/beads/blob/main/docs/FAQ.md)
-- [Troubleshooting](https://github.com/steveyegge/beads/blob/main/docs/TROUBLESHOOTING.md)
+- [Complete README](https://github.com/gastownhall/beads#readme)
+- [Quick Start (documentation site)](https://gastownhall.github.io/beads/getting-started/quickstart) · [repo pointer](https://github.com/gastownhall/beads/blob/main/docs/QUICKSTART.md)
+- [Installation Guide](https://github.com/gastownhall/beads/blob/main/docs/INSTALLING.md)
+- [FAQ](https://github.com/gastownhall/beads/blob/main/docs/FAQ.md)
+- [Troubleshooting](https://github.com/gastownhall/beads/blob/main/docs/TROUBLESHOOTING.md)
 
 ## Why npm Package vs WASM?
 
@@ -120,5 +120,5 @@ MIT - See [LICENSE](LICENSE) for details.
 
 ## Support
 
-- [GitHub Issues](https://github.com/steveyegge/beads/issues)
-- [Documentation](https://github.com/steveyegge/beads)
+- [GitHub Issues](https://github.com/gastownhall/beads/issues)
+- [Documentation](https://github.com/gastownhall/beads)

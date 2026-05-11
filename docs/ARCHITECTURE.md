@@ -2,9 +2,9 @@
 
 This document describes bd's overall architecture - the data model, sync mechanism, and how components fit together. For internal implementation details (FlushManager, Blocked Cache), see [INTERNALS.md](INTERNALS.md).
 
-## The Three-Layer Data Model
+## The Two-Layer Data Model
 
-bd's core design enables a distributed, git-backed issue tracker that feels like a centralized database. The "magic" comes from three synchronized layers:
+bd's core design enables a distributed, Dolt-powered issue tracker that feels like a centralized database. The architecture has two synchronized layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -13,54 +13,43 @@ bd's core design enables a distributed, git-backed issue tracker that feels like
 │  bd create, list, update, close, ready, show, dep, sync, ...    │
 │  - Cobra commands in cmd/bd/                                     │
 │  - All commands support --json for programmatic use              │
-│  - Tries daemon RPC first, falls back to direct DB access        │
+│  - Direct DB access (server mode via dolt sql-server)            │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                                v
 ┌─────────────────────────────────────────────────────────────────┐
-│                     SQLite Database                              │
-│                     (.beads/beads.db)                            │
+│                      Dolt Database                               │
+│                      (.beads/dolt/)                               │
 │                                                                  │
-│  - Local working copy (gitignored)                               │
+│  - Version-controlled SQL database with cell-level merge         │
+│  - Server mode via dolt sql-server (multi-writer capable)        │
 │  - Fast queries, indexes, foreign keys                           │
 │  - Issues, dependencies, labels, comments, events                │
-│  - Each machine has its own copy                                 │
+│  - Automatic Dolt commits on every write                         │
+│  - Native push/pull to Dolt remotes                              │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
-                         auto-sync
-                        (5s debounce)
+                        Dolt push/pull
+                    (or federation peer sync)
                                │
                                v
 ┌─────────────────────────────────────────────────────────────────┐
-│                       JSONL File                                 │
-│                   (.beads/issues.jsonl)                          │
+│                     Remote (Dolt or Git)                          │
 │                                                                  │
-│  - Git-tracked source of truth                                   │
-│  - One JSON line per entity (issue, dep, label, comment)         │
-│  - Merge-friendly: additions rarely conflict                     │
-│  - Shared across machines via git push/pull                      │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                          git push/pull
-                               │
-                               v
-┌─────────────────────────────────────────────────────────────────┐
-│                     Remote Repository                            │
-│                    (GitHub, GitLab, etc.)                        │
-│                                                                  │
-│  - Stores JSONL as part of normal repo history                   │
+│  - Dolt remotes (DoltHub, S3, GCS, filesystem)                   │
 │  - All collaborators share the same issue database               │
+│  - Cell-level merge for conflict resolution                      │
 │  - Protected branch support via separate sync branch             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why This Design?
 
-**SQLite for speed:** Local queries complete in milliseconds. Complex dependency graphs, full-text search, and joins are fast.
+**Dolt for versioned SQL:** Queries complete in milliseconds with full SQL support. Dolt adds native version control — every write is automatically committed to Dolt history, providing a complete audit trail. Cell-level merge resolves conflicts automatically.
 
-**JSONL for git:** One entity per line means git diffs are readable and merges usually succeed automatically. No binary database files in version control.
+**Dolt for distribution:** Native push/pull to Dolt remotes (DoltHub, S3, GCS). No special sync server needed. Issues travel with your code. Offline work just works.
 
-**Git for distribution:** No special sync server needed. Issues travel with your code. Offline work just works.
+**Export and backup:** `bd export` outputs issue JSONL for data migration and interoperability. Use `bd backup init` / `bd backup sync` to push Dolt-native backups (preserving full commit history) to a filesystem path or DoltHub, and `bd backup restore` to restore from them.
 
 ## Write Path
 
@@ -68,56 +57,37 @@ When you create or modify an issue:
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   CLI Command   │───▶│  SQLite Write   │───▶│  Mark Dirty     │
-│   (bd create)   │    │  (immediate)    │    │  (trigger sync) │
-└─────────────────┘    └─────────────────┘    └────────┬────────┘
-                                                       │
-                                              5-second debounce
-                                                       │
-                                                       v
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Git Commit    │◀───│  JSONL Export   │◀───│  FlushManager   │
-│   (git hooks)   │    │  (incremental)  │    │  (background)   │
+│   CLI Command   │───▶│   Dolt Write    │───▶│  Dolt Commit    │
+│   (bd create)   │    │  (immediate)    │    │  (automatic)    │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-1. **Command executes:** `bd create "New feature"` writes to SQLite immediately
-2. **Mark dirty:** The operation marks the database as needing export
-3. **Debounce window:** Wait 5 seconds for batch operations (configurable)
-4. **Export to JSONL:** Only changed entities are appended/updated
-5. **Git commit:** If git hooks are installed, changes auto-commit
+1. **Command executes:** `bd create "New feature"` writes to Dolt immediately
+2. **Dolt commit:** Every write is automatically committed to Dolt history
+3. **Sync:** Use `bd dolt push` to share changes with Dolt remotes
 
 Key implementation:
-- Export: `cmd/bd/export.go`, `cmd/bd/autoflush.go`
-- FlushManager: `internal/flush/` (see [INTERNALS.md](INTERNALS.md))
-- Dirty tracking: `internal/storage/sqlite/dirty_issues.go`
+- Dolt storage: `internal/storage/dolt/`
+- Export (for portability): `cmd/bd/export.go`
 
 ## Read Path
 
-When you query issues after a `git pull`:
+All queries run directly against the local Dolt database:
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   git pull      │───▶│  Auto-Import    │───▶│  SQLite Update  │
-│   (new JSONL)   │    │  (on next cmd)  │    │  (merge logic)  │
-└─────────────────┘    └─────────────────┘    └────────┬────────┘
-                                                       │
-                                                       v
-                                               ┌─────────────────┐
-                                               │  CLI Query      │
-                                               │  (bd ready)     │
-                                               └─────────────────┘
+┌─────────────────┐    ┌─────────────────┐
+│   CLI Query     │───▶│   Dolt Query    │
+│   (bd ready)    │    │   (SQL)         │
+└─────────────────┘    └─────────────────┘
 ```
 
-1. **Git pull:** Fetches updated JSONL from remote
-2. **Auto-import detection:** First bd command checks if JSONL is newer than DB
-3. **Import to SQLite:** Parse JSONL, merge with local state using content hashes
-4. **Query:** Commands read from fast local SQLite
+1. **Query:** Commands read from fast local Dolt database via SQL
+2. **Sync:** Use `bd dolt pull` to fetch updates from Dolt remotes
 
 Key implementation:
-- Import: `cmd/bd/import.go`, `cmd/bd/autoimport.go`
-- Auto-import logic: `internal/autoimport/autoimport.go`
-- Collision detection: `internal/importer/importer.go`
+- Backup restore: `cmd/bd/backup_restore.go`
+- Issue bootstrap/migration: `cmd/bd/init.go`
+- Dolt storage: `internal/storage/dolt/`
 
 ## Hash-Based Collision Prevention
 
@@ -146,17 +116,18 @@ Branch B: bd create "Add Stripe"  → bd-f14c (no collision)
 1. **Issue creation:** Generate random UUID, derive short hash as ID
 2. **Progressive scaling:** IDs start at 4 chars, grow to 5-6 chars as database grows
 3. **Content hashing:** Each issue has a content hash for change detection
-4. **Import merge:** Same ID + different content = update, same ID + same content = skip
+4. **Merge logic:** Same ID + different content = update, same ID + same content = skip
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Import Logic                              │
+│                        Merge Logic                               │
+│             (used by Dolt pull and init --from-jsonl)            │
 │                                                                  │
-│  For each issue in JSONL:                                       │
+│  For each issue in incoming data:                                │
 │    1. Compute content hash                                       │
 │    2. Look up existing issue by ID                               │
 │    3. Compare hashes:                                            │
-│       - Same hash → skip (already imported)                      │
+│       - Same hash → skip (already present)                       │
 │       - Different hash → update (newer version)                  │
 │       - No match → create (new issue)                            │
 └─────────────────────────────────────────────────────────────────┘
@@ -166,50 +137,47 @@ This eliminates the need for central coordination while ensuring all machines co
 
 See [COLLISION_MATH.md](COLLISION_MATH.md) for birthday paradox calculations on hash length vs collision probability.
 
-## Daemon Architecture
+## Server Architecture
 
-Each workspace runs its own background daemon for auto-sync:
+Each workspace can run its own Dolt server for multi-writer access:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Per-Workspace Daemon                         │
+│                     Dolt Server Mode                              │
 │                                                                  │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │
-│  │ RPC Server  │    │  Auto-Sync  │    │  Background │         │
-│  │ (bd.sock)   │    │  Manager    │    │  Tasks      │         │
-│  └─────────────┘    └─────────────┘    └─────────────┘         │
-│         │                  │                  │                  │
-│         └──────────────────┴──────────────────┘                  │
+│  ┌─────────────┐    ┌─────────────┐                             │
+│  │ RPC Server  │    │ dolt        │                             │
+│  │             │    │ sql-server  │                             │
+│  └─────────────┘    └─────────────┘                             │
+│         │                  │                                     │
+│         └──────────────────┘                                     │
 │                            │                                     │
 │                            v                                     │
 │                   ┌─────────────┐                                │
-│                   │   SQLite    │                                │
+│                   │    Dolt     │                                │
 │                   │   Database  │                                │
 │                   └─────────────┘                                │
 └─────────────────────────────────────────────────────────────────┘
 
-     CLI commands ───RPC───▶ Daemon ───SQL───▶ Database
+     CLI commands ───SQL───▶ dolt sql-server ───▶ Database
                               or
-     CLI commands ───SQL───▶ Database (if daemon unavailable)
+     CLI commands ───SQL───▶ Database (embedded mode)
 ```
 
-**Why daemons?**
-- Batches multiple operations before export
-- Holds database connection open (faster queries)
-- Coordinates auto-sync timing
-- One daemon per workspace (LSP-like model)
+**Server mode:**
+- Connects to `dolt sql-server` (multi-writer, high-concurrency)
+- PID file at `.beads/dolt-server.pid`
+- Logs at `.beads/dolt-server.log`
+- **Shared server mode** (opt-in): all projects share a single Dolt server at
+  `~/.beads/shared-server/` instead of per-project servers. Enable via
+  `dolt.shared-server: true` in config.yaml or `BEADS_DOLT_SHARED_SERVER=1`.
+
+**Embedded mode:**
+- Direct database access (single-writer, no server process)
 
 **Communication:**
-- Unix domain socket at `.beads/bd.sock` (Windows: named pipes)
 - Protocol defined in `internal/rpc/protocol.go`
-- CLI tries daemon first, falls back to direct DB access
-
-**Lifecycle:**
-- Auto-starts on first bd command (unless `BEADS_NO_DAEMON=1`)
-- Auto-restarts after version upgrades
-- Managed via `bd daemons` command
-
-See [DAEMON.md](DAEMON.md) for operational details.
+- Used by Dolt server mode for multi-writer access
 
 ## Data Types
 
@@ -241,9 +209,9 @@ open ──▶ in_progress ──▶ closed
          (reopen)
 ```
 
-### JSONL Issue Schema
+### Issue Schema
 
-Each issue in `.beads/issues.jsonl` is a JSON object with the following fields. Fields marked with `(optional)` use `omitempty` and are excluded when empty/zero.
+Each issue in the Dolt database (and in JSONL exports via `bd export`) has the following fields. Fields marked with `(optional)` use `omitempty` and are excluded when empty/zero.
 
 **Core Identification:**
 
@@ -309,18 +277,15 @@ Each issue in `.beads/issues.jsonl` is a JSON object with the following fields. 
 | `delete_reason` | string | Why deleted (optional) |
 | `original_type` | string | Issue type before deletion (optional) |
 
-**Note:** Fields with `json:"-"` tags (like `content_hash`, `source_repo`, `id_prefix`) are internal and never exported to JSONL.
+**Note:** Fields with `json:"-"` tags (like `content_hash`, `source_repo`, `id_prefix`) are internal and not included in exports.
 
 ## Directory Structure
 
 ```
 .beads/
-├── beads.db          # SQLite database (gitignored)
-├── issues.jsonl      # JSONL source of truth (git-tracked)
-├── bd.sock           # Daemon socket (gitignored)
-├── daemon.log        # Daemon logs (gitignored)
-├── config.yaml       # Project config (optional)
-└── export_hashes.db  # Export tracking (gitignored)
+├── dolt/             # Dolt database, sql-server.pid, sql-server.log (gitignored)
+├── metadata.json     # Backend config (local, gitignored)
+└── config.yaml       # Project config (optional)
 ```
 
 ## Key Code Paths
@@ -329,11 +294,11 @@ Each issue in `.beads/issues.jsonl` is a JSON object with the following fields. 
 |------|-------|
 | CLI entry | `cmd/bd/main.go` |
 | Storage interface | `internal/storage/storage.go` |
-| SQLite implementation | `internal/storage/sqlite/` |
+| Dolt implementation | `internal/storage/dolt/` |
 | RPC protocol | `internal/rpc/protocol.go`, `server_*.go` |
-| Export logic | `cmd/bd/export.go`, `autoflush.go` |
-| Import logic | `cmd/bd/import.go`, `internal/importer/` |
-| Auto-sync | `internal/autoimport/`, `internal/flush/` |
+| Export logic (portability) | `cmd/bd/export.go` |
+| Backup restore | `cmd/bd/backup_restore.go` |
+| Issue bootstrap/migration | `cmd/bd/init.go` |
 
 ## Wisps and Molecules
 
@@ -351,15 +316,15 @@ Each issue in `.beads/issues.jsonl` is a JSON object with the following fields. 
 ```
 
 1. **Create:** Create wisps from a molecule template
-2. **Execute:** Agent works through wisp steps (local SQLite only)
+2. **Execute:** Agent works through wisp steps (local database only)
 3. **Squash:** Compress wisps into a permanent digest issue
 
 ### Why Wisps Don't Sync
 
 Wisps are intentionally **local-only**:
 
-- They exist only in the spawning agent's SQLite database
-- They are **never exported to JSONL**
+- They exist only in the spawning agent's local database
+- They are **never exported or synced**
 - They cannot resurrect from other clones (they were never there)
 - They are **hard-deleted** when squashed (no tombstones needed)
 
@@ -374,7 +339,7 @@ This design enables:
 
 | Aspect | Regular Issues | Wisps |
 |--------|---------------|-------|
-| Exported to JSONL | Yes | No |
+| Synced to remotes | Yes | No |
 | Tombstone on delete | Yes | No |
 | Can resurrect | Yes (without tombstone) | No (never synced) |
 | Deletion method | `CreateTombstone()` | `DeleteIssue()` (hard delete) |
@@ -391,8 +356,7 @@ The `bd mol squash` command uses hard delete intentionally - tombstones would be
 
 - [MOLECULES.md](MOLECULES.md) - Molecular chemistry metaphor (protos, pour, bond, squash, burn)
 - [INTERNALS.md](INTERNALS.md) - FlushManager, Blocked Cache implementation details
-- [DAEMON.md](DAEMON.md) - Daemon management and configuration
-- [EXTENDING.md](EXTENDING.md) - Adding custom tables to SQLite
+- [ADVANCED.md](ADVANCED.md) - Advanced features and configuration
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - Recovery procedures and common issues
 - [FAQ.md](FAQ.md) - Common questions about the architecture
 - [COLLISION_MATH.md](COLLISION_MATH.md) - Hash collision probability analysis

@@ -117,18 +117,36 @@ func HasType(allowed ...types.IssueType) IssueValidator {
 	}
 }
 
-// ForUpdate returns a validator chain for update operations.
+// EpicHasOpenChildren validates that an epic does not have open children.
+// If the issue is an epic with open children, returns an error unless force is true.
+// Non-epic issues pass through without validation.
+func EpicHasOpenChildren(force bool, openChildCount int) IssueValidator {
+	return func(id string, issue *types.Issue) error {
+		if issue == nil || force {
+			return nil
+		}
+		if issue.IssueType != types.TypeEpic {
+			return nil
+		}
+		if openChildCount > 0 {
+			return fmt.Errorf("epic %s has %d open child issue(s); close children first or use --force to override", id, openChildCount)
+		}
+		return nil
+	}
+}
+
+// forUpdate returns a validator chain for update operations.
 // Validates: issue exists and is not a template.
-func ForUpdate() IssueValidator {
+func forUpdate() IssueValidator {
 	return Chain(
 		Exists(),
 		NotTemplate(),
 	)
 }
 
-// ForClose returns a validator chain for close operations.
+// forClose returns a validator chain for close operations.
 // Validates: issue exists, is not a template, and is not pinned (unless force).
-func ForClose(force bool) IssueValidator {
+func forClose(force bool) IssueValidator {
 	return Chain(
 		Exists(),
 		NotTemplate(),
@@ -136,18 +154,18 @@ func ForClose(force bool) IssueValidator {
 	)
 }
 
-// ForDelete returns a validator chain for delete operations.
+// forDelete returns a validator chain for delete operations.
 // Validates: issue exists and is not a template.
-func ForDelete() IssueValidator {
+func forDelete() IssueValidator {
 	return Chain(
 		Exists(),
 		NotTemplate(),
 	)
 }
 
-// ForReopen returns a validator chain for reopen operations.
+// forReopen returns a validator chain for reopen operations.
 // Validates: issue exists, is not a template, and is closed.
-func ForReopen() IssueValidator {
+func forReopen() IssueValidator {
 	return Chain(
 		Exists(),
 		NotTemplate(),

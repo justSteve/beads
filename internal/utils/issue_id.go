@@ -2,6 +2,8 @@ package utils
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -95,6 +97,86 @@ func isLikelyHash(s string) bool {
 		}
 	}
 	return hasDigit
+}
+
+// ExtractIssuePrefixKnown extracts the prefix from an issue ID using a list of
+// known-valid prefixes before falling back to the heuristic ExtractIssuePrefix.
+//
+// When the valid prefixes are known from config (issue_prefix + allowed_prefixes),
+// this gives deterministic results for multi-hyphen prefixes that the heuristic
+// might misclassify (e.g., "me-py-toolkit-abcd" where "abcd" looks word-like).
+//
+// Prefixes are checked longest-first so overlapping entries (e.g., "hq" and "hq-cv")
+// resolve to the most specific match.
+func ExtractIssuePrefixKnown(issueID string, knownPrefixes []string) string {
+	// Normalize: trim whitespace, strip trailing hyphens, drop empties
+	var cleaned []string
+	for _, p := range knownPrefixes {
+		p = strings.TrimSpace(p)
+		p = strings.TrimSuffix(p, "-")
+		if p != "" {
+			cleaned = append(cleaned, p)
+		}
+	}
+
+	// Sort by length descending so longest match wins
+	sort.Slice(cleaned, func(i, j int) bool {
+		return len(cleaned[i]) > len(cleaned[j])
+	})
+
+	for _, p := range cleaned {
+		if strings.HasPrefix(issueID, p+"-") {
+			return p
+		}
+	}
+
+	// No known prefix matched; fall back to heuristic
+	return ExtractIssuePrefix(issueID)
+}
+
+// NaturalCompareIDs compares two issue IDs with numeric-aware sorting.
+// Segments separated by "." or "-" are compared numerically when both
+// are pure digits, otherwise lexicographically. This ensures bd-E.4
+// sorts before bd-E.10 (GH#3477).
+func NaturalCompareIDs(a, b string) int {
+	sa := splitIDSegments(a)
+	sb := splitIDSegments(b)
+	for i := 0; i < len(sa) && i < len(sb); i++ {
+		if sa[i] == sb[i] {
+			continue
+		}
+		na, aErr := strconv.Atoi(sa[i])
+		nb, bErr := strconv.Atoi(sb[i])
+		if aErr == nil && bErr == nil {
+			if na != nb {
+				return na - nb
+			}
+			continue
+		}
+		if sa[i] < sb[i] {
+			return -1
+		}
+		return 1
+	}
+	return len(sa) - len(sb)
+}
+
+// splitIDSegments splits an ID into segments by "." and "-" separators.
+func splitIDSegments(id string) []string {
+	var segments []string
+	start := 0
+	for i, r := range id {
+		if r == '.' || r == '-' {
+			if i > start {
+				segments = append(segments, id[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(id) {
+		segments = append(segments, id[start:])
+	}
+	return segments
 }
 
 // ExtractIssueNumber extracts the number from an issue ID like "bd-123" -> 123

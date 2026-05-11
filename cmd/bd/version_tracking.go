@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // localVersionFile is the gitignored file that stores the last bd version used locally.
@@ -33,37 +35,21 @@ func trackBdVersion() {
 	localVersionPath := filepath.Join(beadsDir, localVersionFile)
 	lastVersion := readLocalVersion(localVersionPath)
 
-	// Check if version changed
+	// Check if version changed (only flag actual upgrades, not downgrades)
 	if lastVersion != "" && lastVersion != Version {
-		// Version upgrade detected!
-		versionUpgradeDetected = true
-		previousVersion = lastVersion
+		if doctor.CompareVersions(Version, lastVersion) > 0 {
+			// Version upgrade detected!
+			versionUpgradeDetected = true
+			previousVersion = lastVersion
+		}
 	}
 
 	// Update local version file (best effort)
 	// Only write if version actually changed to minimize I/O
 	if lastVersion != Version {
-		_ = writeLocalVersion(localVersionPath, Version)
+		_ = writeLocalVersion(localVersionPath, Version) // Best effort: version tracking is advisory
 	}
 
-	// Also ensure metadata.json exists with proper defaults (for JSONL export name)
-	// but don't use it for version tracking anymore
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil {
-		return
-	}
-	if cfg == nil {
-		// No config file yet - create one
-		cfg = configfile.DefaultConfig()
-
-		// Auto-detect actual JSONL file instead of using hardcoded default
-		// This prevents mismatches when metadata.json gets deleted (git clean, merge conflict, etc.)
-		if actualJSONL := findActualJSONLFile(beadsDir); actualJSONL != "" {
-			cfg.JSONLExport = actualJSONL
-		}
-
-		_ = cfg.Save(beadsDir) // Best effort
-	}
 }
 
 // readLocalVersion reads the last bd version from the local version file.
@@ -142,86 +128,63 @@ func maybeShowUpgradeNotification() {
 	// Display notification
 	fmt.Printf("🔄 bd upgraded from v%s to v%s since last use\n", previousVersion, Version)
 	fmt.Println("💡 Run 'bd upgrade review' to see what changed")
-	fmt.Println("💊 Run 'bd doctor' to verify upgrade completed cleanly")
+	if usesSQLServer() {
+		fmt.Println("💊 Run 'bd doctor' to verify upgrade completed cleanly")
+	}
 
 	fmt.Println()
 }
 
-// findActualJSONLFile scans .beads/ for the actual JSONL file in use.
-// Prefers issues.jsonl over beads.jsonl (canonical name), skips backups and merge artifacts.
-// Returns empty string if no JSONL file is found.
-func findActualJSONLFile(beadsDir string) string {
-	entries, err := os.ReadDir(beadsDir)
-	if err != nil {
-		return ""
-	}
-
-	var candidates []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-
-		// Must end with .jsonl
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-
-		// Skip merge artifacts and backups
-		lowerName := strings.ToLower(name)
-		if strings.Contains(lowerName, "backup") ||
-			strings.Contains(lowerName, ".orig") ||
-			strings.Contains(lowerName, ".bak") ||
-			strings.Contains(lowerName, "~") ||
-			strings.HasPrefix(lowerName, "backup_") {
-			continue
-		}
-
-		candidates = append(candidates, name)
-	}
-
-	if len(candidates) == 0 {
-		return ""
-	}
-
-	// Prefer issues.jsonl over beads.jsonl (canonical name)
-	for _, name := range candidates {
-		if name == "issues.jsonl" {
-			return name
-		}
-	}
-
-	// Fall back to first candidate (including beads.jsonl as legacy)
-	return candidates[0]
-}
-
 // autoMigrateOnVersionBump automatically migrates the database when CLI version changes.
 // This function is best-effort - failures are silent to avoid disrupting commands.
-// Called from PersistentPreRun after daemon check but before opening DB for main operation.
+// Called from PersistentPreRun before opening DB for main operation.
 //
-// IMPORTANT: This must be called AFTER determining we're in direct mode (no daemon)
-// and BEFORE opening the database, to avoid: 1) conflicts with daemon, 2) opening DB twice.
-func autoMigrateOnVersionBump(dbPath string) {
+// IMPORTANT: This must be called BEFORE opening the database to avoid opening DB twice.
+//
+// beadsDir is the path to the .beads directory.
+func autoMigrateOnVersionBump(beadsDir string) {
 	// Only migrate if version upgrade was detected
 	if !versionUpgradeDetected {
 		return
 	}
 
-	// Validate dbPath
-	if dbPath == "" {
-		debug.Logf("auto-migrate: skipping migration, no database path")
+	// Validate beadsDir
+	if beadsDir == "" {
+		debug.Logf("auto-migrate: skipping migration, no beads directory")
 		return
 	}
 
-	// Check if database exists
+	// Load config to determine the correct database path for this backend
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		debug.Logf("auto-migrate: failed to load config: %v", err)
+		return
+	}
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+
+	// Check if database exists at the backend-appropriate path
+	dbPath := cfg.DatabasePath(beadsDir)
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		// No database file - nothing to migrate
+		// No database - nothing to migrate
 		debug.Logf("auto-migrate: skipping migration, database does not exist: %s", dbPath)
 		return
 	}
 
-	// Open database to check current version
+	// GH#2137: If upgrading from pre-0.56, the dolt database may have been
+	// created by the old embedded Dolt mode. Recover by reinitializing.
+	if previousVersion != "" && doctor.CompareVersions(previousVersion, "0.56.0") < 0 {
+		recovered, recErr := doltserver.RecoverPreV56DoltDir(dbPath)
+		if recErr != nil {
+			debug.Logf("auto-migrate: pre-v56 recovery failed: %v", recErr)
+		}
+		if recovered {
+			debug.Logf("auto-migrate: rebuilt pre-v56 dolt database at %s", dbPath)
+		}
+	}
+
+	// Open database using factory (respects backend config from metadata.json)
 	// Use rootCtx if available and not canceled, otherwise use Background
 	ctx := rootCtx
 	if ctx == nil || ctx.Err() != nil {
@@ -229,19 +192,19 @@ func autoMigrateOnVersionBump(dbPath string) {
 		ctx = context.Background()
 	}
 
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := dolt.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		// Failed to open database - skip migration
 		debug.Logf("auto-migrate: failed to open database: %v", err)
 		return
 	}
 
-	// Get current database version
-	dbVersion, err := store.GetMetadata(ctx, "bd_version")
+	// Get current database version (clone-local, dolt-ignored)
+	dbVersion, err := store.GetLocalMetadata(ctx, "bd_version")
 	if err != nil {
 		// Failed to read version - skip migration
 		debug.Logf("auto-migrate: failed to read database version: %v", err)
-		_ = store.Close()
+		_ = store.Close() // Best effort cleanup on error path
 		return
 	}
 
@@ -249,18 +212,41 @@ func autoMigrateOnVersionBump(dbPath string) {
 	if dbVersion == Version {
 		// Database is already at current version
 		debug.Logf("auto-migrate: database already at version %s", Version)
-		_ = store.Close()
+		_ = store.Close() // Best effort cleanup on error path
+		return
+	}
+
+	// Check for downgrade: refuse to overwrite a newer version with an older one (gt-e3uiy)
+	maxVersion, _ := store.GetLocalMetadata(ctx, "bd_version_max")
+	if dbVersion != "" && doctor.CompareVersions(Version, dbVersion) < 0 {
+		debug.Logf("auto-migrate: refusing downgrade from %s to %s", dbVersion, Version)
+		_ = store.Close() // Best effort cleanup on error path
+		return
+	}
+	if maxVersion != "" && doctor.CompareVersions(Version, maxVersion) < 0 {
+		debug.Logf("auto-migrate: refusing downgrade (max version %s > current %s)", maxVersion, Version)
+		_ = store.Close() // Best effort cleanup on error path
 		return
 	}
 
 	// Perform migration: update database version
 	debug.Logf("auto-migrate: migrating database from %s to %s", dbVersion, Version)
-	if err := store.SetMetadata(ctx, "bd_version", Version); err != nil {
+	if err := store.SetLocalMetadata(ctx, "bd_version", Version); err != nil {
 		// Migration failed - log and continue
 		debug.Logf("auto-migrate: failed to update database version: %v", err)
-		_ = store.Close()
+		_ = store.Close() // Best effort cleanup on error path
 		return
 	}
+
+	// Update max version tracking
+	if maxVersion == "" || doctor.CompareVersions(Version, maxVersion) > 0 {
+		if err := store.SetLocalMetadata(ctx, "bd_version_max", Version); err != nil {
+			debug.Logf("auto-migrate: failed to update max version: %v", err)
+		}
+	}
+
+	// No Dolt commit needed — local_metadata is dolt-ignored and persists
+	// in the working set for the lifetime of the server session.
 
 	// Close database
 	if err := store.Close(); err != nil {

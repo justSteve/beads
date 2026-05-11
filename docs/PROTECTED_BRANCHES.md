@@ -15,9 +15,11 @@ This guide explains how to use beads with protected branches on platforms like G
 
 ## Overview
 
-**Problem:** GitHub and other platforms let you protect branches (like `main`) to require pull requests for all changes. This prevents beads from auto-committing issue updates directly to `main`.
+**Note:** This document describes a workflow that has been **removed**. Beads now stores data in Dolt under `refs/dolt/data`, separate from standard Git refs. Beads does not commit to any Git branch, so protected branch workflows are not affected.
 
-**Solution:** Beads can commit to a separate branch (like `beads-sync`) using git worktrees, while keeping your main working directory untouched. Periodically merge the metadata branch back to `main` via a pull request.
+**Previous problem:** GitHub and other platforms let you protect branches (like `main`) to require pull requests for all changes. Previously, beads committed issue data to Git branches, which conflicted with branch protection.
+
+**Current solution:** Beads uses Dolt-native sync (`bd dolt push` / `bd dolt pull`). No Git branch commits are needed. The information below is retained for historical reference and for users migrating from older versions.
 
 **Benefits:**
 - ✅ Works with any git platform's branch protection
@@ -33,10 +35,10 @@ This guide explains how to use beads with protected branches on platforms like G
 
 ```bash
 cd your-project
-bd init --branch beads-sync
+bd init
 ```
 
-This creates a `.beads/` directory and configures beads to commit to `beads-sync` instead of `main`.
+This creates a `.beads/` directory with a Dolt database. Sync is handled via `bd dolt push` / `bd dolt pull`.
 
 **Important:** After initialization, you'll see some untracked files that should be committed to your protected branch:
 
@@ -50,38 +52,36 @@ git commit -m "Initialize beads issue tracker"
 git push origin main  # Or create a PR if required
 ```
 
-**Files created by `bd init --branch`:**
+**Files created by `bd init`:**
 
 Files that should be committed to your protected branch (main):
 - `.beads/.gitignore` - Tells git what to ignore in .beads/ directory
-- `.gitattributes` - Configures merge driver for intelligent JSONL conflict resolution
+- `.gitattributes` - Configures merge driver for beads data
 
 Files that are automatically gitignored (do NOT commit):
-- `.beads/beads.db` - SQLite database (local only, regenerated from JSONL)
-- `.beads/daemon.lock`, `daemon.log`, `daemon.pid` - Runtime files
-- `.beads/beads.left.jsonl`, `beads.right.jsonl` - Temporary merge artifacts
+- `.beads/dolt/` - Dolt database directory (local only)
+- `.beads/dolt/sql-server.pid`, `sql-server.log` - Dolt server runtime files
 
 The sync branch (beads-sync) will contain:
-- `.beads/issues.jsonl` - Issue data in JSONL format (committed automatically by daemon)
 - `.beads/metadata.json` - Metadata about the beads installation
 - `.beads/config.yaml` - Configuration template (optional)
 
-**2. Start the daemon with auto-commit:**
+**2. Start the Dolt server:**
 
 ```bash
-bd daemon start --auto-commit
+dolt sql-server
 ```
 
-The daemon will automatically commit issue changes to the `beads-sync` branch.
+With git hooks installed (`bd hooks install`), issue changes are automatically committed to the `beads-sync` branch.
 
 **3. When ready, merge to main:**
 
 ```bash
 # Check what's changed
-bd sync --status
+bd dolt show
 
-# Merge to main (creates a pull request or direct merge)
-bd sync --merge
+# Merge to main
+git merge beads-sync
 ```
 
 That's it! The complete workflow is described below.
@@ -100,10 +100,9 @@ your-project/
 │   └── beads-worktrees/
 │       └── beads-sync/  # Worktree (only .beads/ checked out)
 │           └── .beads/
-│               └── issues.jsonl
+│               └── dolt/
 ├── .beads/                  # Your main copy
-│   ├── beads.db
-│   ├── issues.jsonl
+│   ├── dolt/
 │   └── .gitignore
 ├── .gitattributes           # Merge driver config (in main branch)
 └── src/                     # Your code (untouched)
@@ -116,13 +115,12 @@ Main branch (protected):
 - `.gitattributes` - Merge driver configuration
 
 Sync branch (beads-sync):
-- `.beads/issues.jsonl` - Issue data (committed by daemon)
 - `.beads/metadata.json` - Repository metadata
 - `.beads/config.yaml` - Configuration template
 
 Not tracked (gitignored):
-- `.beads/beads.db` - SQLite database (local only)
-- `.beads/daemon.*` - Runtime files
+- `.beads/dolt/` - Dolt database directory (local only)
+- `.beads/dolt/sql-server.*` - Dolt server runtime files
 
 **Key points:**
 - The worktree is in `.git/beads-worktrees/` (hidden from your workspace)
@@ -135,11 +133,10 @@ Not tracked (gitignored):
 
 When you update an issue:
 
-1. Issue is updated in `.beads/beads.db` (SQLite database)
-2. Daemon exports to `.beads/issues.jsonl` (JSONL file)
-3. JSONL is copied to worktree (`.git/beads-worktrees/beads-sync/.beads/`)
-4. Daemon commits the change in the worktree to `beads-sync` branch
-5. Main branch stays untouched (no commits on `main`)
+1. Issue is updated in the Dolt database (`.beads/dolt/`)
+2. Dolt automatically commits the change to its version history
+3. Changes are synced to remotes via `bd dolt push`
+4. Main branch stays untouched (no commits on `main`)
 
 ## Setup
 
@@ -147,13 +144,11 @@ When you update an issue:
 
 ```bash
 cd your-project
-bd init --branch beads-sync
+bd init
 ```
 
 This will:
-- Create `.beads/` directory with database
-- Set `sync.branch` config to `beads-sync`
-- Import any existing issues from git (if present)
+- Create `.beads/` directory with Dolt database
 - Prompt to install git hooks (recommended: say yes)
 
 ### Option 2: Migrate Existing Project
@@ -164,28 +159,20 @@ If you already have beads set up and want to switch to a separate branch:
 # Set the sync branch
 bd config set sync.branch beads-sync
 
-# Start the daemon (it will create the worktree automatically)
-bd daemon start --auto-commit
+# Start the Dolt server and install git hooks
+bd dolt start
+bd hooks install
 ```
 
-### Daemon Configuration
+### Sync Configuration
 
-For automatic commits to the sync branch:
+For automatic commits to the sync branch, install git hooks:
 
 ```bash
-# Start daemon with auto-commit
-bd daemon start --auto-commit
-
-# Or with auto-commit and auto-push
-bd daemon start --auto-commit --auto-push
+bd hooks install
 ```
 
-**Daemon modes:**
-- `--auto-commit`: Commits to sync branch after each change
-- `--auto-push`: Also pushes to remote after each commit
-- Default interval: 5 seconds (check for changes every 5s)
-
-**Recommended:** Use `--auto-commit` but not `--auto-push` if you want to review changes before pushing. Use `--auto-push` if you want fully hands-free sync.
+Git hooks help maintain sync consistency. Use `bd dolt push` for manual sync when needed.
 
 ### Environment Variables
 
@@ -193,7 +180,6 @@ You can also configure the sync branch via environment variable:
 
 ```bash
 export BEADS_SYNC_BRANCH=beads-sync
-bd daemon start --auto-commit
 ```
 
 This is useful for CI/CD or temporary overrides.
@@ -209,13 +195,13 @@ AI agents work exactly the same way as before:
 bd create "Implement user authentication" -t feature -p 1
 
 # Update issues
-bd update bd-a1b2 --status in_progress
+bd update bd-a1b2 --claim
 
 # Close issues
 bd close bd-a1b2 "Completed authentication"
 ```
 
-All changes are automatically committed to the `beads-sync` branch by the daemon. No changes are needed to agent workflows!
+All changes are automatically committed to the `beads-sync` branch via git hooks. No changes are needed to agent workflows!
 
 ### For Humans
 
@@ -223,25 +209,25 @@ All changes are automatically committed to the `beads-sync` branch by the daemon
 
 ```bash
 # See what's changed on the sync branch
-bd sync --status
+bd dolt show
 ```
 
-This shows the diff between `beads-sync` and `main` (or your current branch).
+This shows the current Dolt configuration and connection status.
 
-**Manual commit (if not using daemon):**
+**Manual commit:**
 
 ```bash
-bd sync --flush-only  # Export to JSONL and commit to sync branch
+bd dolt commit  # Commit pending changes
 ```
 
 **Pull changes from remote:**
 
 ```bash
 # Pull updates from other collaborators
-bd sync --no-push
+bd dolt pull
 ```
 
-This pulls changes from the remote sync branch and imports them to your local database.
+This pulls changes from the remote and imports them to your local database.
 
 ## Merging Changes
 
@@ -260,7 +246,7 @@ git push origin beads-sync
 # 3. After PR is merged, update your local main
 git checkout main
 git pull
-bd import  # Import the merged changes
+bd dolt pull  # Pull latest changes
 ```
 
 ### Option 2: Direct Merge (If Allowed)
@@ -268,17 +254,9 @@ bd import  # Import the merged changes
 If you have push access to `main`:
 
 ```bash
-# Check what will be merged
-bd sync --merge --dry-run
-
-# Merge sync branch to main
-bd sync --merge
-
-# This will:
-# - Switch to main branch
-# - Merge beads-sync with --no-ff (creates merge commit)
-# - Push to remote
-# - Import merged changes to database
+# Sync via Dolt (no git branch merge needed)
+bd dolt push
+bd dolt pull
 ```
 
 **Safety checks:**
@@ -292,49 +270,24 @@ bd sync --merge
 If you encounter conflicts during merge:
 
 ```bash
-# bd sync --merge will detect conflicts and show:
-Error: Merge conflicts detected
-Conflicting files:
-  .beads/issues.jsonl
+# git merge may detect conflicts and show:
+Auto-merging .beads/...
+CONFLICT (content): Merge conflict in .beads/...
 
 To resolve:
-1. Fix conflicts in .beads/issues.jsonl
-2. git add .beads/issues.jsonl
-3. git commit
-4. bd import  # Reimport to sync database
+1. Use bd vc conflicts to view conflicts
+2. Resolve conflicts
+3. Commit the resolution
 ```
 
-**Resolving JSONL conflicts:**
+**Resolving merge conflicts:**
 
-JSONL files are append-only and line-based, so conflicts are rare. When they occur:
-
-1. Open `.beads/issues.jsonl` and look for conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
-2. Both versions are usually valid - keep both lines
-3. Remove the conflict markers
-4. Save and commit
-
-Example conflict resolution:
-
-```jsonl
-<<<<<<< HEAD
-{"id":"bd-a1b2","title":"Feature A","status":"closed","updated_at":"2025-11-02T10:00:00Z"}
-=======
-{"id":"bd-a1b2","title":"Feature A","status":"in_progress","updated_at":"2025-11-02T09:00:00Z"}
->>>>>>> beads-sync
-```
-
-**Resolution:** Keep the line with the newer `updated_at`:
-
-```jsonl
-{"id":"bd-a1b2","title":"Feature A","status":"closed","updated_at":"2025-11-02T10:00:00Z"}
-```
-
-Then:
+Dolt handles merge conflicts natively with cell-level merge. When concurrent changes affect the same issue field, Dolt detects the conflict and allows resolution:
 
 ```bash
-git add .beads/issues.jsonl
-git commit -m "Resolve issues.jsonl merge conflict"
-bd import  # Import to database (will use latest timestamp)
+# After a Dolt pull with conflicts
+bd vc conflicts     # View conflicts
+bd vc resolve       # Resolve conflicts
 ```
 
 ## Troubleshooting
@@ -347,7 +300,7 @@ This happens if you created the sync branch independently. Merge with `--allow-u
 git merge beads-sync --allow-unrelated-histories --no-ff
 ```
 
-Or use `bd sync --merge` which handles this automatically.
+Or merge manually with `git merge beads-sync --allow-unrelated-histories --no-ff`.
 
 ### "worktree already exists"
 
@@ -360,20 +313,18 @@ rm -rf .git/beads-worktrees/beads-sync
 # Prune stale worktree entries
 git worktree prune
 
-# Restart daemon (it will recreate the worktree)
-bd daemon stop && bd daemon start
+# Restart Dolt server (it will recreate the worktree)
+bd dolt stop && bd dolt start
 ```
 
 ### "branch 'beads-sync' not found"
 
-The sync branch doesn't exist yet. The daemon will create it on the first commit. If you want to create it manually:
+The sync branch doesn't exist yet. It will be created on the first commit. Create it manually:
 
 ```bash
 git checkout -b beads-sync
 git checkout main  # Switch back
 ```
-
-Or just let the daemon create it automatically.
 
 ### "Cannot push to protected branch"
 
@@ -383,23 +334,23 @@ If the sync branch itself is protected:
 2. **Option 2:** Use `--auto-commit` without `--auto-push`, and push manually when ready
 3. **Option 3:** Use a different branch name that's not protected
 
-### Daemon won't start
+### Dolt server won't start
 
-Check daemon status and logs:
+Check server status and logs:
 
 ```bash
 # Check status
-bd daemon status
+bd dolt status
 
 # View logs
-tail -f ~/.beads/daemon.log
+tail -f .beads/dolt/sql-server.log
 
-# Restart daemon
-bd daemon stop && bd daemon start
+# Restart server
+bd dolt stop && bd dolt start
 ```
 
 Common issues:
-- Port already in use: Another daemon is running
+- Port already in use: Another Dolt server is running
 - Permission denied: Check `.beads/` directory permissions
 - Git errors: Ensure git is installed and repository is initialized
 
@@ -412,10 +363,10 @@ Ensure all clones are configured the same way:
 bd config get sync.branch  # Should be the same (e.g., beads-sync)
 
 # Pull latest changes
-bd sync --no-push
+bd dolt pull
 
-# Check daemon is running
-bd daemon status
+# Check Dolt server is running
+bd dolt status
 ```
 
 ## FAQ
@@ -429,9 +380,8 @@ No! This is a pure git solution that works on any platform. Just protect your `m
 Yes! Use any branch name except `main` or `master` (git worktrees cannot checkout the same branch in multiple locations):
 
 ```bash
-bd init --branch my-custom-branch
-# or
-bd config set sync.branch my-custom-branch
+bd dolt remote add origin <remote-url>
+bd dolt push
 ```
 
 ### Can I change the branch name later?
@@ -440,7 +390,7 @@ Yes:
 
 ```bash
 bd config set sync.branch new-branch-name
-bd daemon stop && bd daemon start
+bd dolt stop && bd dolt start
 ```
 
 The old worktree will remain (no harm), and a new worktree will be created for the new branch.
@@ -451,7 +401,7 @@ Unset the sync branch config:
 
 ```bash
 bd config set sync.branch ""
-bd daemon stop && bd daemon start
+bd dolt stop && bd dolt start
 ```
 
 Beads will go back to committing directly to your current branch.
@@ -479,11 +429,11 @@ There's no "right" answer - choose what fits your team.
 
 ### Can I review changes before merging?
 
-Yes! Use `bd sync --status` to see what's changed:
+Yes! Use `bd dolt show` to check current status, or use git to compare branches:
 
 ```bash
-bd sync --status
-# Shows diff between beads-sync and main
+git log main..beads-sync --oneline
+# Shows commits on beads-sync not yet in main
 ```
 
 Or create a pull request and review on GitHub/GitLab.
@@ -497,11 +447,11 @@ Worktrees are very lightweight:
 
 ### Can I delete the worktree?
 
-Yes, but the daemon will recreate it. If you want to clean up permanently:
+Yes, but it may be recreated on next sync. If you want to clean up permanently:
 
 ```bash
-# Stop daemon
-bd daemon stop
+# Stop Dolt server
+bd dolt stop
 
 # Remove worktree
 git worktree remove .git/beads-worktrees/beads-sync
@@ -510,13 +460,12 @@ git worktree remove .git/beads-worktrees/beads-sync
 bd config set sync.branch ""
 ```
 
-### Does this work with `bd sync`?
+### Does this work with `bd dolt push`?
 
-Yes! `bd sync` works normally and includes special commands for the merge workflow:
+Yes! `bd dolt push` works normally. Related commands for the merge workflow:
 
-- `bd sync --status` - Show diff between branches
-- `bd sync --merge` - Merge sync branch to main
-- `bd sync --merge --dry-run` - Preview merge
+- `bd dolt show` - Show current Dolt configuration and connection status
+- `git merge beads-sync` - Merge sync branch to main
 
 ### Can AI agents merge automatically?
 
@@ -526,8 +475,7 @@ However, if you want fully automated sync:
 
 ```bash
 # WARNING: This bypasses branch protection!
-bd daemon start --auto-commit --auto-push
-bd sync --merge  # Run periodically (e.g., via cron)
+git merge beads-sync  # Run periodically (e.g., via cron)
 ```
 
 ### What if I forget to merge for a long time?
@@ -535,7 +483,9 @@ bd sync --merge  # Run periodically (e.g., via cron)
 No problem! The sync branch accumulates all changes. When you eventually merge:
 
 ```bash
-bd sync --merge
+git checkout main
+git merge beads-sync --no-ff
+git push
 ```
 
 All accumulated changes will be merged at once. Git history will show the full timeline.
@@ -562,17 +512,17 @@ jobs:
 
       - name: Install bd
         run: |
-          curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 
       - name: Pull changes
         run: |
           git fetch origin beads-sync
-          bd sync --no-push
+          bd dolt pull
 
       - name: Merge to main (if changes)
         run: |
-          if bd sync --status | grep -q 'ahead'; then
-            bd sync --merge
+          if git log main..beads-sync --oneline | grep -q '.'; then
+            git merge beads-sync --no-ff -m "Merge beads-sync metadata"
             git push origin main
           fi
 ```
@@ -652,7 +602,7 @@ git fetch upstream
 # Merge upstream beads-sync to yours
 git checkout beads-sync
 git merge upstream/beads-sync
-bd import  # Import merged changes
+bd dolt pull  # Pull merged changes
 ```
 
 ### Custom Worktree Location
@@ -670,9 +620,9 @@ If you have an existing beads setup committing to `main`:
    bd config set sync.branch beads-sync
    ```
 
-2. **Restart daemon:**
+2. **Restart Dolt server:**
    ```bash
-   bd daemon stop && bd daemon start
+   bd dolt stop && bd dolt start
    ```
 
 3. **Verify:**
@@ -691,13 +641,13 @@ If you want to stop using a sync branch:
    bd config set sync.branch ""
    ```
 
-2. **Restart daemon:**
+2. **Restart Dolt server:**
    ```bash
-   bd daemon stop && bd daemon start
+   bd dolt stop && bd dolt start
    ```
 
 Future commits will go to your current branch (e.g., `main`).
 
 ---
 
-**Need help?** Open an issue at https://github.com/steveyegge/beads/issues
+**Need help?** Open an issue at https://github.com/gastownhall/beads/issues

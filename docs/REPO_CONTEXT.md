@@ -68,7 +68,7 @@ CWD is inside the repository containing `.beads/`:
 └── README.md
 
 $ cd /project/src
-$ bd sync
+$ bd dolt push
 # GitCmd() runs in /project (correct)
 ```
 
@@ -79,7 +79,7 @@ User is in one repository but managing beads in another:
 ```
 $ cd /repo-a          # Has uncommitted changes
 $ export BEADS_DIR=/repo-b/.beads
-$ bd sync
+$ bd dolt push
 # GitCmd() runs in /repo-b (correct, not /repo-a)
 ```
 
@@ -100,7 +100,7 @@ User is in a worktree but `.beads/` lives in main repository:
 └── src/
 
 $ cd /project/.worktrees/feature-branch
-$ bd sync
+$ bd dolt push
 # GitCmd() runs in /project (main repo, where .beads lives)
 ```
 
@@ -111,7 +111,7 @@ Both worktree and BEADS_DIR can be active simultaneously:
 ```
 $ cd /repo-a/.worktrees/branch-x
 $ export BEADS_DIR=/repo-b/.beads
-$ bd sync
+$ bd dolt push
 # GitCmd() runs in /repo-b (BEADS_DIR takes precedence)
 ```
 
@@ -154,26 +154,26 @@ system directories:
 Temporary directories (e.g., `/var/folders` on macOS) are explicitly allowed
 for test environments.
 
-## Daemon Handling
+## Server Mode Handling
 
-### CLI vs Daemon Context
+### CLI vs Server Context
 
 For CLI commands, `GetRepoContext()` caches the result via `sync.Once` because:
 - CWD doesn't change during command execution
 - BEADS_DIR doesn't change during command execution
 - Repeated filesystem access would be wasteful
 
-For the daemon (long-running process), this caching is inappropriate:
+For the Dolt server (long-running process), this caching is inappropriate:
 - User may create new worktrees
 - BEADS_DIR may change via direnv
 - Multiple workspaces may be active simultaneously
 
 ### Workspace-Specific API
 
-The daemon uses `GetRepoContextForWorkspace()` for fresh resolution:
+The server uses `GetRepoContextForWorkspace()` for fresh resolution:
 
 ```go
-// For daemon: fresh resolution per-operation (no caching)
+// For server mode: fresh resolution per-operation (no caching)
 rc, err := beads.GetRepoContextForWorkspace(workspacePath)
 
 // Validation hook for detecting stale contexts
@@ -246,7 +246,6 @@ func TestSomething(t *testing.T) {
 - [WORKTREES.md](WORKTREES.md) - Git worktree integration
 - [ROUTING.md](ROUTING.md) - Multi-repository routing
 - [CONFIG.md](CONFIG.md) - BEADS_DIR and environment variables
-- [DAEMON.md](DAEMON.md) - Daemon architecture and workspace handling
 
 ## Implementation Notes
 

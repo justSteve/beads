@@ -9,8 +9,9 @@ import (
 
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
-	"github.com/steveyegge/beads/internal/syncbranch"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/ui"
+	"golang.org/x/term"
 )
 
 // previewFixes shows what would be fixed without applying changes
@@ -77,8 +78,17 @@ func applyFixes(result doctorResult) {
 		return
 	}
 
-	// Ask for confirmation (skip if --yes flag is set)
+	// Ask for confirmation (skip if --yes flag is set or stdin is non-interactive)
 	if !doctorYes {
+		// Detect non-interactive stdin (e.g., piped input in CI/automation)
+		isInteractive := term.IsTerminal(int(os.Stdin.Fd()))
+		if !isInteractive {
+			// In non-interactive mode without --yes, skip with helpful message
+			fmt.Fprintf(os.Stderr, "\n%s Running in non-interactive mode\n", ui.RenderWarn("⚠"))
+			fmt.Fprintf(os.Stderr, "  To auto-fix issues without prompting, use: %s\n\n", ui.RenderAccent("bd doctor --fix --yes"))
+			return
+		}
+
 		fmt.Printf("\nThis will attempt to fix %d issue(s). Continue? (Y/n): ", len(fixableIssues))
 		reader := bufio.NewReader(os.Stdin)
 		response, err := reader.ReadString('\n')
@@ -101,6 +111,14 @@ func applyFixes(result doctorResult) {
 
 // applyFixesInteractive prompts for each fix individually
 func applyFixesInteractive(path string, issues []doctorCheck) {
+	// Detect non-interactive stdin before attempting to prompt
+	isInteractive := term.IsTerminal(int(os.Stdin.Fd()))
+	if !isInteractive {
+		fmt.Fprintf(os.Stderr, "\n%s Interactive mode requires a terminal\n", ui.RenderWarn("⚠"))
+		fmt.Fprintf(os.Stderr, "  Use 'bd doctor --fix --yes' for non-interactive mode\n\n")
+		return
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	applyAll := false
 	var approvedFixes []doctorCheck
@@ -138,6 +156,10 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 		response, err := reader.ReadString('\n')
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+			if len(approvedFixes) > 0 {
+				fmt.Printf("\nApplying %d previously approved fix(es) before exit...\n", len(approvedFixes))
+				applyFixList(path, approvedFixes)
+			}
 			return
 		}
 
@@ -181,18 +203,21 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 func applyFixList(path string, fixes []doctorCheck) {
 	// Apply fixes in a dependency-aware order.
 	// Rough dependency chain:
-	// permissions/daemon cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
+	// gitignore (fast, security-critical) → permissions/lock cleanup → config sanity → DB integrity/migrations.
 	order := []string{
+		"Gitignore",
+		"Project Gitignore",
+		"Metadata Config",
+		"Lock Files",
+		"Circuit Breaker",
 		"Permissions",
-		"Daemon Health",
 		"Database Config",
-		"JSONL Config",
+		"Config Values",
 		"Database Integrity",
 		"Database",
+		"Fresh Clone",
 		"Schema Compatibility",
-		"JSONL Integrity",
-		"DB-JSONL Sync",
-		"Sync Divergence",
+		"Project Identity",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -224,60 +249,50 @@ func applyFixList(path string, fixes []doctorCheck) {
 
 		var err error
 		switch check.Name {
+		case "Metadata Config":
+			err = fix.FixMissingMetadataJSON(path)
 		case "Gitignore":
-			err = doctor.FixGitignore()
+			err = doctor.FixGitignore(path)
+		case "Project Gitignore":
+			err = doctor.FixProjectGitignore(path)
 		case "Redirect Tracking":
-			err = doctor.FixRedirectTracking()
+			err = doctor.FixRedirectTracking(path)
 		case "Last-Touched Tracking":
-			err = doctor.FixLastTouchedTracking()
+			err = doctor.FixLastTouchedTracking(path)
+		case "Tracked Runtime Files":
+			err = doctor.FixTrackedRuntimeFiles(path)
 		case "Git Hooks":
 			err = fix.GitHooks(path)
-		case "Daemon Health":
-			err = fix.Daemon(path)
-		case "DB-JSONL Sync":
-			err = fix.DBJSONLSync(path)
 		case "Sync Divergence":
-			err = fix.SyncDivergence(path)
+			fmt.Printf("  ⚠ Sync divergence fix removed (Dolt-native sync)\n")
+			continue
 		case "Permissions":
 			err = fix.Permissions(path)
 		case "Database":
-			err = fix.DatabaseVersion(path)
+			err = fix.DatabaseVersionWithBdVersion(path, Version)
+			// Also repair any other missing metadata fields (bd_version, repo_id, clone_id)
+			if mErr := fix.FixMissingMetadata(path, Version); mErr != nil && err == nil {
+				err = mErr
+			}
 		case "Database Integrity":
-			// Corruption detected - try recovery from JSONL
-			// Pass force and source flags for enhanced recovery
-			err = fix.DatabaseCorruptionRecoveryWithOptions(path, doctorForce, doctorSource)
+			// Corruption detected - backup and reinitialize
+			err = fix.DatabaseIntegrity(path)
 		case "Schema Compatibility":
 			err = fix.SchemaCompatibility(path)
 		case "Repo Fingerprint":
-			err = fix.RepoFingerprint(path)
-		case "Git Merge Driver":
-			err = fix.MergeDriver(path)
-		case "Sync Branch Config":
-			// No auto-fix: sync-branch should be added to config.yaml (version controlled)
-			fmt.Printf("  ⚠ Add 'sync-branch: beads-sync' to .beads/config.yaml\n")
-			continue
-		case "Sync Branch Gitignore":
-			err = doctor.FixSyncBranchGitignore()
+			err = fix.RepoFingerprint(path, doctorYes)
+			// Also repair any other missing metadata fields (bd_version, repo_id, clone_id)
+			if mErr := fix.FixMissingMetadata(path, Version); mErr != nil && err == nil {
+				err = mErr
+			}
 		case "Database Config":
 			err = fix.DatabaseConfig(path)
 		case "JSONL Config":
-			err = fix.LegacyJSONLConfig(path)
-		case "JSONL Integrity":
-			err = fix.JSONLIntegrity(path)
-		case "Deletions Manifest":
-			err = fix.MigrateTombstones(path)
+			fmt.Printf("  ⚠ JSONL config migration removed (Dolt-native sync)\n")
+			continue
 		case "Untracked Files":
-			err = fix.UntrackedJSONL(path)
-		case "Sync Branch Health":
-			// Get sync branch from config
-			syncBranch := syncbranch.GetFromYAML()
-			if syncBranch == "" {
-				fmt.Printf("  ⚠ No sync branch configured in config.yaml\n")
-				continue
-			}
-			err = fix.SyncBranchHealth(path, syncBranch)
-		case "Merge Artifacts":
-			err = fix.MergeArtifacts(path)
+			fmt.Printf("  ⚠ Untracked JSONL fix removed (Dolt-native storage)\n")
+			continue
 		case "Orphaned Dependencies":
 			err = fix.OrphanedDependencies(path, doctorVerbose)
 		case "Child-Parent Dependencies":
@@ -297,14 +312,11 @@ func applyFixList(path string, fixes []doctorCheck) {
 			continue
 		case "Git Conflicts":
 			// No auto-fix: git conflicts require manual resolution
-			fmt.Printf("  ⚠ Resolve conflicts manually: git checkout --ours or --theirs .beads/issues.jsonl\n")
+			fmt.Printf("  ⚠ Resolve conflicts manually\n")
 			continue
 		case "Stale Closed Issues":
 			// consolidate cleanup into doctor --fix
 			err = fix.StaleClosedIssues(path)
-		case "Expired Tombstones":
-			// consolidate cleanup into doctor --fix
-			err = fix.ExpiredTombstones(path)
 		case "Compaction Candidates":
 			// No auto-fix: compaction requires agent review
 			fmt.Printf("  ⚠ Run 'bd compact --analyze' to review candidates\n")
@@ -317,6 +329,42 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = doctor.FixStaleMQFiles(path)
 		case "Patrol Pollution":
 			err = fix.PatrolPollution(path)
+		case "Lock Files":
+			err = fix.StaleLockFiles(path)
+		case "Circuit Breaker":
+			dolt.CleanStaleCircuitBreakerFiles()
+			fmt.Printf("  %s Cleared stale circuit breaker files\n", ui.RenderPass("✓"))
+		case "Fresh Clone":
+			err = fix.FreshCloneImport(path, Version)
+		case "Pending Migrations":
+			err = fixPendingMigrations(path)
+		case "Config Values":
+			err = fix.ConfigValues(path)
+		case "Classic Artifacts":
+			err = fix.ClassicArtifacts(path)
+		case "Btrfs NoCOW (dolt)":
+			// Applies FS_NOCOW_FL to .beads/ and any existing dolt data
+			// subdirs. Prints the returned message (which includes the
+			// "relocate existing files" warning) so the user sees why the
+			// fix is incomplete on its own.
+			var msg string
+			msg, err = doctor.FixBtrfsNoCOW(path)
+			if err == nil && msg != "" {
+				fmt.Print(msg)
+				if !strings.HasSuffix(msg, "\n") {
+					fmt.Println()
+				}
+			}
+		case "Project Identity":
+			err = fix.FixProjectIdentity(path)
+		case "Remote Consistency":
+			err = fix.RemoteConsistency(path)
+		case "Dolt Schema":
+			// GH#2160: Pre-#2142 migrations may have wrong database configured.
+			// Probe the server and backfill dolt_database in metadata.json.
+			err = fix.FixMissingDoltDatabase(path)
+		case "Dolt Format":
+			err = fix.DoltFormat(path)
 		default:
 			fmt.Printf("  ⚠ No automatic fix available for %s\n", check.Name)
 			fmt.Printf("  Manual fix: %s\n", check.Fix)
@@ -338,4 +386,42 @@ func applyFixList(path string, fixes []doctorCheck) {
 	if errorCount > 0 {
 		fmt.Println("\nSome fixes failed. Please review the errors above and apply manual fixes as needed.")
 	}
+}
+
+func fixPendingMigrations(path string) error {
+	pending := doctor.DetectPendingMigrations(path)
+	if len(pending) == 0 {
+		return nil
+	}
+
+	for _, migration := range pending {
+		switch migration.Name {
+		case "hooks":
+			plan, err := doctor.PlanHookMigration(path)
+			if err != nil {
+				return fmt.Errorf("building hook migration plan: %w", err)
+			}
+
+			execPlan := buildHookMigrationExecutionPlan(plan)
+			if len(execPlan.BlockingErrors) > 0 {
+				return fmt.Errorf("hook migration is blocked:\n- %s", strings.Join(execPlan.BlockingErrors, "\n- "))
+			}
+
+			summary, err := applyHookMigrationExecution(execPlan)
+			if err != nil {
+				return fmt.Errorf("applying hook migration: %w", err)
+			}
+
+			fmt.Printf(
+				"  Hook migration applied: %d hook(s) written, %d artifact(s) retired, %d artifact(s) skipped\n",
+				summary.WrittenHookCount,
+				summary.RetiredCount,
+				summary.SkippedCount,
+			)
+		default:
+			return fmt.Errorf("no automatic fix available for pending migration %q", migration.Name)
+		}
+	}
+
+	return nil
 }

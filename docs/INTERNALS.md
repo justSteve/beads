@@ -12,7 +12,7 @@ The original auto-flush implementation suffered from a critical race condition w
 
 - **Concurrent access points:**
   - Auto-flush timer goroutine (5s debounce)
-  - Daemon sync goroutine
+  - Server sync goroutine
   - Concurrent CLI commands
   - Git hook execution
   - PersistentPostRun cleanup
@@ -62,12 +62,12 @@ The race condition was eliminated by replacing timer-based shared state with an 
                                      │
                                      v
                     ┌────────────────────────────────────┐
-                    │      flushToJSONLWithState()       │
+                    │        flushWithState()            │
                     │                                    │
                     │  - Validates store is active       │
-                    │  - Checks JSONL integrity          │
-                    │  - Performs incremental/full export│
-                    │  - Updates export hashes           │
+                    │  - Checks data integrity           │
+                    │  - Performs Dolt commit             │
+                    │  - Updates sync state              │
                     └────────────────────────────────────┘
 ```
 
@@ -151,37 +151,24 @@ The FlushManager is designed to work correctly when commands run multiple times 
 
 ## Related Subsystems
 
-### Daemon Mode
+### Server Mode
 
-When running with daemon mode (`--no-daemon=false`), the CLI delegates to an RPC server. The FlushManager is NOT used in daemon mode - the daemon process has its own flush coordination.
+When running with Dolt server mode (orchestrator), the CLI communicates with the Dolt SQL server for database operations. The FlushManager is NOT used in server mode — the server process has its own flush coordination.
 
-The `daemonClient != nil` check in `PersistentPostRun` ensures FlushManager shutdown only occurs in direct mode.
+The server mode check in `PersistentPostRun` ensures FlushManager shutdown only occurs in embedded mode (standalone users).
 
 ### Auto-Import
 
-Auto-import runs in `PersistentPreRun` before FlushManager is used. It may call `markDirtyAndScheduleFlush()` or `markDirtyAndScheduleFullExport()` if JSONL changes are detected.
+Auto-import runs in `PersistentPreRun` before FlushManager is used. It may call `markDirtyAndScheduleFlush()` or `markDirtyAndScheduleFullExport()` if remote changes are detected.
 
 Hash-based comparison (not mtime) prevents git pull false positives (issue bd-84).
 
-### JSONL Integrity
+### Data Integrity
 
-`flushToJSONLWithState()` validates JSONL file hash before flush:
-- Compares stored hash with actual file hash
-- If mismatch detected, clears export_hashes and forces full re-export (issue bd-160)
-- Prevents staleness when JSONL is modified outside bd
-
-### Export Modes
-
-**Incremental export (default):**
-- Exports only dirty issues (tracked in `dirty_issues` table)
-- Merges with existing JSONL file
-- Faster for small changesets
-
-**Full export (after ID changes):**
-- Exports all issues from database
-- Rebuilds JSONL from scratch
-- Required after operations like `rename-prefix` that change issue IDs
-- Triggered by `markDirtyAndScheduleFullExport()`
+`flushWithState()` validates database state before flush:
+- Compares stored hash with actual database state
+- If mismatch detected, forces full resync (issue bd-160)
+- Prevents staleness when database is modified outside bd
 
 ## Performance Characteristics
 
@@ -319,15 +306,14 @@ Comprehensive test coverage in `blocked_cache_test.go`:
 - Transitive blocking via parent-child
 - Related dependencies (should NOT affect cache)
 
-Run tests: `go test -v ./internal/storage/sqlite -run TestCache`
+Run tests: `go test -v ./internal/storage/dolt -run TestCache`
 
 ### Implementation Files
 
-- `internal/storage/sqlite/blocked_cache.go` - Cache rebuild and invalidation
-- `internal/storage/sqlite/ready.go` - Uses cache in GetReadyWork queries
-- `internal/storage/sqlite/dependencies.go` - Invalidates on dep changes
-- `internal/storage/sqlite/queries.go` - Invalidates on status changes
-- `internal/storage/sqlite/migrations/015_blocked_issues_cache.go` - Schema and initial population
+- `internal/storage/dolt/blocked_cache.go` - Cache rebuild and invalidation
+- `internal/storage/dolt/ready.go` - Uses cache in GetReadyWork queries
+- `internal/storage/dolt/dependencies.go` - Invalidates on dep changes
+- `internal/storage/dolt/queries.go` - Invalidates on status changes
 
 ### Future Optimizations
 
@@ -343,8 +329,8 @@ However, current performance is excellent for realistic workloads.
 Potential enhancements for multi-agent scenarios:
 
 1. **Flush coordination across agents:**
-   - Shared lock file to prevent concurrent JSONL writes
-   - Detection of external JSONL modifications during flush
+   - Shared lock file to prevent concurrent writes
+   - Detection of external modifications during flush
 
 2. **Adaptive debounce window:**
    - Shorter debounce during interactive sessions

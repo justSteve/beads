@@ -1,11 +1,11 @@
+//go:build cgo
+
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -69,6 +69,42 @@ func TestDoctorWithBeadsDir(t *testing.T) {
 	}
 }
 
+func TestDoctorWithBeadsDir_DoesNotPolluteCallerBeadsDir(t *testing.T) {
+	// Simulate a caller context that has its own valid .beads directory.
+	callerDir := t.TempDir()
+	callerBeadsDir := filepath.Join(callerDir, ".beads")
+	if err := os.Mkdir(callerBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(callerBeadsDir, "beads.db"), []byte{}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", callerBeadsDir)
+
+	// Doctor target path should be isolated from caller's BEADS_DIR.
+	targetDir := t.TempDir()
+	targetBeadsDir := filepath.Join(targetDir, ".beads")
+	if err := os.Mkdir(targetBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = runDiagnostics(targetDir)
+
+	// Regression: runDiagnostics() must not create metadata in caller's .beads.
+	if _, err := os.Stat(filepath.Join(callerBeadsDir, "metadata.json")); err == nil {
+		t.Fatalf("runDiagnostics unexpectedly created %s", filepath.Join(callerBeadsDir, "metadata.json"))
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("failed to stat caller metadata.json: %v", err)
+	}
+
+	// It also must not write local version tracking in caller scope.
+	if _, err := os.Stat(filepath.Join(callerBeadsDir, localVersionFile)); err == nil {
+		t.Fatalf("runDiagnostics unexpectedly created %s", filepath.Join(callerBeadsDir, localVersionFile))
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("failed to stat caller %s: %v", localVersionFile, err)
+	}
+}
+
 func TestDoctorJSONOutput(t *testing.T) {
 	// Create temporary directory
 	tmpDir := t.TempDir()
@@ -103,250 +139,43 @@ func TestDoctorJSONOutput(t *testing.T) {
 	}
 }
 
-// Note: isHashID is tested in migrate_hash_ids_test.go
-
-func TestDetectHashBasedIDs(t *testing.T) {
-	tests := []struct {
-		name      string
-		sampleIDs []string
-		hasTable  bool
-		expected  bool
-	}{
-		{
-			name:      "hash IDs with letters",
-			sampleIDs: []string{"bd-a3f8e9", "bd-b2c4d6"},
-			hasTable:  false,
-			expected:  true,
-		},
-		{
-			name:      "hash IDs with mixed alphanumeric",
-			sampleIDs: []string{"bd-0134cc5a", "bd-abc123"},
-			hasTable:  false,
-			expected:  true,
-		},
-		{
-			name:      "hash IDs all numeric with variable length",
-			sampleIDs: []string{"bd-0088", "bd-0134cc5a", "bd-02a4"},
-			hasTable:  false,
-			expected:  true, // Variable length indicates hash IDs
-		},
-		{
-			name:      "hash IDs with leading zeros",
-			sampleIDs: []string{"bd-0088", "bd-02a4", "bd-05a1"},
-			hasTable:  false,
-			expected:  true, // Leading zeros indicate hash IDs
-		},
-		{
-			name:      "hash IDs all numeric non-sequential",
-			sampleIDs: []string{"bd-0088", "bd-2312", "bd-0458"},
-			hasTable:  false,
-			expected:  true, // Non-sequential pattern
-		},
-		{
-			name:      "sequential IDs",
-			sampleIDs: []string{"bd-1", "bd-2", "bd-3", "bd-4"},
-			hasTable:  false,
-			expected:  false, // Sequential pattern
-		},
-		{
-			name:      "sequential IDs with gaps",
-			sampleIDs: []string{"bd-1", "bd-5", "bd-10", "bd-15"},
-			hasTable:  false,
-			expected:  false, // Still sequential pattern (small gaps allowed)
-		},
-		{
-			name:      "database with child_counters table",
-			sampleIDs: []string{"bd-1", "bd-2"},
-			hasTable:  true,
-			expected:  true, // child_counters table indicates hash IDs
-		},
-		{
-			name:      "hash IDs with hierarchical children",
-			sampleIDs: []string{"bd-a3f8e9.1", "bd-a3f8e9.2", "bd-b2c4d6"},
-			hasTable:  false,
-			expected:  true, // Base IDs have letters
-		},
-		{
-			name:      "edge case: single ID with letters",
-			sampleIDs: []string{"bd-abc"},
-			hasTable:  false,
-			expected:  true,
-		},
-		{
-			name:      "edge case: single sequential ID",
-			sampleIDs: []string{"bd-1"},
-			hasTable:  false,
-			expected:  false,
-		},
+func TestRunDiagnostics_JSONSkipsNetworkUpdateChecks(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"sqlite"}`), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create temporary database
-			tmpDir := t.TempDir()
-			dbPath := filepath.Join(tmpDir, "test.db")
+	prevJSON := jsonOutput
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = prevJSON })
 
-			// Open database and create schema
-			db, err := sql.Open("sqlite3", dbPath)
-			if err != nil {
-				t.Fatalf("Failed to open database: %v", err)
-			}
-			defer db.Close()
+	result := runDiagnostics(tmpDir)
 
-			// Create issues table
-			_, err = db.Exec(`
-				CREATE TABLE IF NOT EXISTS issues (
-					id TEXT PRIMARY KEY,
-					title TEXT,
-					created_at TIMESTAMP
-				)
-			`)
-			if err != nil {
-				t.Fatalf("Failed to create issues table: %v", err)
-			}
-
-			// Create child_counters table if test requires it
-			if tt.hasTable {
-				_, err = db.Exec(`
-					CREATE TABLE IF NOT EXISTS child_counters (
-						parent_id TEXT PRIMARY KEY,
-						last_child INTEGER NOT NULL DEFAULT 0
-					)
-				`)
-				if err != nil {
-					t.Fatalf("Failed to create child_counters table: %v", err)
-				}
-			}
-
-			// Insert sample issues
-			for _, id := range tt.sampleIDs {
-				_, err = db.Exec("INSERT INTO issues (id, title, created_at) VALUES (?, ?, datetime('now'))",
-					id, "Test issue")
-				if err != nil {
-					t.Fatalf("Failed to insert issue %s: %v", id, err)
-				}
-			}
-
-			// Test detection
-			result := doctor.DetectHashBasedIDs(db, tt.sampleIDs)
-			if result != tt.expected {
-				t.Errorf("detectHashBasedIDs() = %v, want %v", result, tt.expected)
-			}
-		})
+	var versionMessage string
+	for _, check := range result.Checks {
+		if check.Name == "CLI Version" {
+			versionMessage = check.Message
+			break
+		}
+	}
+	if versionMessage == "" {
+		t.Fatal("CLI Version check not found")
+	}
+	if !strings.Contains(versionMessage, "skipped in non-interactive mode") {
+		t.Fatalf("CLI Version message = %q, want non-interactive skip notice", versionMessage)
 	}
 }
 
+func TestDetectHashBasedIDs(t *testing.T) {
+	t.Skip("Dolt schema always includes child_counters table, so DetectHashBasedIDs always returns true at heuristic 1; ID-pattern heuristics (2/3) cannot be tested in isolation with Dolt")
+}
+
 func TestCheckIDFormat(t *testing.T) {
-	tests := []struct {
-		name           string
-		issueIDs       []string
-		createTable    bool // create child_counters table
-		expectedStatus string
-	}{
-		{
-			name:           "hash IDs with letters",
-			issueIDs:       []string{"bd-a3f8e9", "bd-b2c4d6", "bd-xyz123"},
-			createTable:    false,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "hash IDs all numeric with leading zeros",
-			issueIDs:       []string{"bd-0088", "bd-02a4", "bd-05a1", "bd-0458"},
-			createTable:    false,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "hash IDs with child_counters table",
-			issueIDs:       []string{"bd-123", "bd-456"},
-			createTable:    true,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "sequential IDs",
-			issueIDs:       []string{"bd-1", "bd-2", "bd-3", "bd-4"},
-			createTable:    false,
-			expectedStatus: doctor.StatusWarning,
-		},
-		{
-			name:           "mixed: mostly hash IDs",
-			issueIDs:       []string{"bd-0088", "bd-0134cc5a", "bd-02a4"},
-			createTable:    false,
-			expectedStatus: doctor.StatusOK, // Variable length = hash IDs
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create temporary workspace
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create database
-			dbPath := filepath.Join(beadsDir, "beads.db")
-			db, err := sql.Open("sqlite3", dbPath)
-			if err != nil {
-				t.Fatalf("Failed to open database: %v", err)
-			}
-			defer db.Close()
-
-			// Create schema
-			_, err = db.Exec(`
-				CREATE TABLE IF NOT EXISTS issues (
-					id TEXT PRIMARY KEY,
-					title TEXT NOT NULL,
-					created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-				)
-			`)
-			if err != nil {
-				t.Fatalf("Failed to create issues table: %v", err)
-			}
-
-			if tt.createTable {
-				_, err = db.Exec(`
-					CREATE TABLE IF NOT EXISTS child_counters (
-						parent_id TEXT PRIMARY KEY,
-						last_child INTEGER NOT NULL DEFAULT 0
-					)
-				`)
-				if err != nil {
-					t.Fatalf("Failed to create child_counters table: %v", err)
-				}
-			}
-
-			// Insert test issues
-			for i, id := range tt.issueIDs {
-				_, err = db.Exec(
-					"INSERT INTO issues (id, title, created_at) VALUES (?, ?, datetime('now', ?||' seconds'))",
-					id, "Test issue "+id, fmt.Sprintf("+%d", i))
-				if err != nil {
-					t.Fatalf("Failed to insert issue %s: %v", id, err)
-				}
-			}
-			db.Close()
-
-			// Run check
-			check := doctor.CheckIDFormat(tmpDir)
-
-			if check.Status != tt.expectedStatus {
-				t.Errorf("Expected status %s, got %s (message: %s)", tt.expectedStatus, check.Status, check.Message)
-			}
-
-			if tt.expectedStatus == doctor.StatusOK && check.Status == doctor.StatusOK {
-				if !strings.Contains(check.Message, "hash-based") {
-					t.Errorf("Expected hash-based message, got: %s", check.Message)
-				}
-			}
-
-			if tt.expectedStatus == doctor.StatusWarning && check.Status == doctor.StatusWarning {
-				if check.Fix == "" {
-					t.Error("Expected fix message for sequential IDs")
-				}
-			}
-		})
-	}
+	t.Skip("SQLite-specific: creates SQLite database directly; Dolt backend uses different schema and always has child_counters")
 }
 
 func TestCheckInstallation(t *testing.T) {
@@ -374,21 +203,19 @@ func TestCheckInstallation(t *testing.T) {
 }
 
 func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
-	// Create temporary directory with .beads but no database
+	// Dolt backend doesn't have a "JSONL-only" mode; it reports fresh clone
+	// when no dolt/ directory exists but JSONL is present.
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.Mkdir(beadsDir, 0750); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create empty issues.jsonl to simulate --no-db mode
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
 	if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create config.yaml with no-db: true to indicate intentional JSONL-only mode
-	// Without this, doctor treats it as a fresh clone needing 'bd init' (bd-4ew)
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte("no-db: true\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -396,14 +223,12 @@ func TestCheckDatabaseVersionJSONLMode(t *testing.T) {
 
 	check := doctor.CheckDatabaseVersion(tmpDir, Version)
 
-	if check.Status != doctor.StatusOK {
-		t.Errorf("Expected ok status for JSONL mode, got %s", check.Status)
+	// Post-JSONL removal: no dolt dir → error (no more JSONL-only mode)
+	if check.Status != doctor.StatusError {
+		t.Errorf("Expected error status for missing dolt database, got %s", check.Status)
 	}
-	if check.Message != "JSONL-only mode" {
-		t.Errorf("Expected JSONL-only mode message, got %s", check.Message)
-	}
-	if check.Detail == "" {
-		t.Error("Expected detail field to be set for JSONL mode")
+	if !strings.Contains(check.Message, "No dolt database found") {
+		t.Errorf("Expected 'No dolt database found' message, got %s", check.Message)
 	}
 }
 
@@ -424,11 +249,12 @@ func TestCheckDatabaseVersionFreshClone(t *testing.T) {
 
 	check := doctor.CheckDatabaseVersion(tmpDir, Version)
 
-	if check.Status != doctor.StatusWarning {
-		t.Errorf("Expected warning status for fresh clone, got %s", check.Status)
+	// Post-JSONL removal: no dolt dir → error (JSONL presence is irrelevant)
+	if check.Status != doctor.StatusError {
+		t.Errorf("Expected error status for missing dolt database, got %s", check.Status)
 	}
-	if check.Message != "Fresh clone detected (no database)" {
-		t.Errorf("Expected fresh clone message, got %s", check.Message)
+	if !strings.Contains(check.Message, "No dolt database found") {
+		t.Errorf("Expected 'No dolt database found' message, got %s", check.Message)
 	}
 	if check.Fix == "" {
 		t.Error("Expected fix field to recommend 'bd init'")
@@ -459,74 +285,6 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
-func TestCheckMultipleDatabases(t *testing.T) {
-	tests := []struct {
-		name           string
-		dbFiles        []string
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name:           "no databases",
-			dbFiles:        []string{},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "single database",
-			dbFiles:        []string{"beads.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "multiple databases",
-			dbFiles:        []string{"beads.db", "old.db"},
-			expectedStatus: doctor.StatusWarning,
-			expectWarning:  true,
-		},
-		{
-			name:           "backup files ignored",
-			dbFiles:        []string{"beads.db", "beads.backup.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name:           "vc.db ignored",
-			dbFiles:        []string{"beads.db", "vc.db"},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			// Create test database files
-			for _, dbFile := range tc.dbFiles {
-				path := filepath.Join(beadsDir, dbFile)
-				if err := os.WriteFile(path, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckMultipleDatabases(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-
-			if tc.expectWarning && check.Fix == "" {
-				t.Error("Expected fix message for warning status")
-			}
-		})
-	}
-}
-
 func TestCheckPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -541,103 +299,6 @@ func TestCheckPermissions(t *testing.T) {
 	}
 }
 
-func TestCheckDatabaseJSONLSync(t *testing.T) {
-	tests := []struct {
-		name           string
-		hasDB          bool
-		hasJSONL       bool
-		expectedStatus string
-	}{
-		{
-			name:           "no database",
-			hasDB:          false,
-			hasJSONL:       true,
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "no JSONL",
-			hasDB:          true,
-			hasJSONL:       false,
-			expectedStatus: doctor.StatusOK,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			beadsDir := filepath.Join(tmpDir, ".beads")
-			if err := os.Mkdir(beadsDir, 0750); err != nil {
-				t.Fatal(err)
-			}
-
-			if tc.hasDB {
-				dbPath := filepath.Join(beadsDir, "beads.db")
-				// Skip database creation tests due to SQLite driver registration in tests
-				// The real doctor command works fine with actual databases
-				if tc.hasJSONL {
-					t.Skip("Database creation in tests requires complex driver setup")
-				}
-				// For no-JSONL case, just create an empty file
-				if err := os.WriteFile(dbPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			if tc.hasJSONL {
-				jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-				if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			check := doctor.CheckDatabaseJSONLSync(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
-			}
-		})
-	}
-}
-
-func TestCountJSONLIssuesWithMalformedLines(t *testing.T) {
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.Mkdir(beadsDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create JSONL file with mixed valid and invalid JSON
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	jsonlContent := `{"id":"test-001","title":"Valid 1"}
-invalid json line here
-{"id":"test-002","title":"Valid 2"}
-{"broken": incomplete
-{"id":"test-003","title":"Valid 3"}
-`
-	if err := os.WriteFile(jsonlPath, []byte(jsonlContent), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	count, prefixes, err := doctor.CountJSONLIssues(jsonlPath)
-
-	// Should count valid issues (3)
-	if count != 3 {
-		t.Errorf("Expected 3 issues, got %d", count)
-	}
-
-	// Should have 1 error for malformed lines
-	if err == nil {
-		t.Error("Expected error for malformed lines, got nil")
-	}
-	if !strings.Contains(err.Error(), "skipped") {
-		t.Errorf("Expected error about skipped lines, got: %v", err)
-	}
-
-	// Should have extracted prefix
-	if prefixes["test"] != 3 {
-		t.Errorf("Expected 3 'test' prefixes, got %d", prefixes["test"])
-	}
-}
 func TestCheckGitHooks(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -689,11 +350,13 @@ func TestCheckGitHooks(t *testing.T) {
 
 			runInDir(t, tmpDir, func() {
 				if tc.hasGitDir {
-					// Initialize a real git repository in the test directory
-					cmd := exec.Command("git", "init")
-					cmd.Dir = tmpDir
-					if err := cmd.Run(); err != nil {
-						t.Skipf("Skipping test: git init failed: %v", err)
+					// Copy cached git template (bd-ktng optimization)
+					initGitTemplate()
+					if gitTemplateErr != nil {
+						t.Fatalf("git template init failed: %v", gitTemplateErr)
+					}
+					if err := copyGitDir(gitTemplateDir, tmpDir); err != nil {
+						t.Fatalf("failed to copy git template: %v", err)
 					}
 
 					gitDir, err := git.GetGitDir()
@@ -714,7 +377,7 @@ func TestCheckGitHooks(t *testing.T) {
 					}
 				}
 
-				check := doctor.CheckGitHooks()
+				check := doctor.CheckGitHooks(Version)
 
 				if check.Status != tc.expectedStatus {
 					t.Errorf("Expected status %s, got %s", tc.expectedStatus, check.Status)
@@ -911,8 +574,28 @@ func TestGetClaudePluginVersion(t *testing.T) {
 
 func TestCheckMetadataVersionTracking(t *testing.T) {
 	// GH#662: Tests updated to use .local_version file instead of metadata.json:LastBdVersion
+	// Compute versions relative to current Version so the test doesn't break
+	// when Version is bumped (GH#2957).
+	parts := doctor.ParseVersionParts(Version)
+
+	// "slightly old" = same major, a few minor versions behind (< 10 threshold).
+	// Only valid when minor >= 2, otherwise there's no room for a "slightly old" version.
+	canTestSlightlyOld := parts[1] >= 2
+	slightlyOld := fmt.Sprintf("%d.%d.0", parts[0], parts[1]-2)
+
+	// "very old" = either 15+ minor versions behind or a prior major version.
+	var veryOld string
+	if parts[1] >= 15 {
+		veryOld = fmt.Sprintf("%d.%d.0", parts[0], parts[1]-15)
+	} else if parts[0] >= 1 {
+		veryOld = fmt.Sprintf("%d.0.0", parts[0]-1)
+	} else {
+		veryOld = "0.0.1"
+	}
+
 	tests := []struct {
 		name           string
+		skip           bool
 		setupVersion   func(beadsDir string) error
 		expectedStatus string
 		expectWarning  bool
@@ -927,9 +610,9 @@ func TestCheckMetadataVersionTracking(t *testing.T) {
 		},
 		{
 			name: "slightly outdated version",
+			skip: !canTestSlightlyOld,
 			setupVersion: func(beadsDir string) error {
-				// Use a version that's less than 10 minor versions behind current
-				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte("0.43.0\n"), 0644)
+				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte(slightlyOld+"\n"), 0644)
 			},
 			expectedStatus: doctor.StatusOK,
 			expectWarning:  false,
@@ -937,8 +620,7 @@ func TestCheckMetadataVersionTracking(t *testing.T) {
 		{
 			name: "very old version",
 			setupVersion: func(beadsDir string) error {
-				// Use a version that's 10+ minor versions behind current (triggers warning)
-				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte("0.29.0\n"), 0644)
+				return os.WriteFile(filepath.Join(beadsDir, ".local_version"), []byte(veryOld+"\n"), 0644)
 			},
 			expectedStatus: doctor.StatusWarning,
 			expectWarning:  true,
@@ -972,6 +654,10 @@ func TestCheckMetadataVersionTracking(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip {
+				t.Skipf("no valid %q version for Version=%s", tc.name, Version)
+			}
+
 			tmpDir := t.TempDir()
 			beadsDir := filepath.Join(tmpDir, ".beads")
 			if err := os.Mkdir(beadsDir, 0750); err != nil {
@@ -1047,78 +733,6 @@ func TestParseVersionParts(t *testing.T) {
 	}
 }
 
-func TestCheckSyncBranchConfig(t *testing.T) {
-	tests := []struct {
-		name           string
-		setupFunc      func(t *testing.T, tmpDir string)
-		expectedStatus string
-		expectWarning  bool
-	}{
-		{
-			name: "no beads directory",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				// No .beads directory
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name: "not a git repo",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				beadsDir := filepath.Join(tmpDir, ".beads")
-				if err := os.Mkdir(beadsDir, 0750); err != nil {
-					t.Fatal(err)
-				}
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		{
-			name: "sync.branch configured via env var",
-			setupFunc: func(t *testing.T, tmpDir string) {
-				// Initialize git repo
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
-
-				// Create .beads directory
-				beadsDir := filepath.Join(tmpDir, ".beads")
-				if err := os.Mkdir(beadsDir, 0750); err != nil {
-					t.Fatal(err)
-				}
-
-				// Set env var (simulates config.yaml or BEADS_SYNC_BRANCH)
-				t.Setenv("BEADS_SYNC_BRANCH", "beads-sync")
-			},
-			expectedStatus: doctor.StatusOK,
-			expectWarning:  false,
-		},
-		// Note: Tests for "not configured" scenarios are difficult because viper
-		// reads config.yaml at startup from the test's working directory.
-		// The env var tests above verify the core functionality.
-		// For full integration testing, use actual fresh clones.
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			tc.setupFunc(t, tmpDir)
-
-			result := doctor.CheckSyncBranchConfig(tmpDir)
-
-			if result.Status != tc.expectedStatus {
-				t.Errorf("Expected status %q, got %q", tc.expectedStatus, result.Status)
-			}
-
-			if tc.expectWarning && result.Fix == "" {
-				t.Error("Expected Fix field to be set for warning status")
-			}
-		})
-	}
-}
-
 // TestInteractiveFlagParsing verifies the --interactive flag is registered (bd-3xl)
 func TestInteractiveFlagParsing(t *testing.T) {
 	// Verify the flag exists and has the right short form
@@ -1160,9 +774,9 @@ func TestExportDiagnostics(t *testing.T) {
 		OverallOK:  true,
 		Timestamp:  "2025-01-01T00:00:00Z",
 		Platform: map[string]string{
-			"os_arch":        "darwin/arm64",
-			"go_version":     "go1.21.0",
-			"sqlite_version": "3.42.0",
+			"os_arch":    "darwin/arm64",
+			"go_version": "go1.21.0",
+			"backend":    "dolt",
 		},
 		Checks: []doctorCheck{
 			{
@@ -1228,179 +842,6 @@ func TestExportDiagnosticsInvalidPath(t *testing.T) {
 	err := exportDiagnostics(result, "/nonexistent/directory/diagnostics.json")
 	if err == nil {
 		t.Error("Expected error for invalid path, got nil")
-	}
-}
-
-// TestCheckSyncBranchHookCompatibility tests the sync-branch hook compatibility check (issue #532)
-// Note: We use BEADS_SYNC_BRANCH env var to control sync-branch detection because the config
-// package reads from the actual beads repo's config.yaml. Only test cases with syncBranchEnv
-// set to a non-empty value are reliable.
-func TestCheckSyncBranchHookCompatibility(t *testing.T) {
-	tests := []struct {
-		name           string
-		syncBranchEnv  string // BEADS_SYNC_BRANCH env var (must be non-empty to override config.yaml)
-		hasGitDir      bool
-		hookVersion    string // Empty means no hook, "custom" means non-bd hook
-		expectedStatus string
-	}{
-		{
-			name:           "sync-branch configured, no git repo",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      false,
-			hookVersion:    "",
-			expectedStatus: doctor.StatusOK, // N/A case
-		},
-		{
-			name:           "sync-branch configured, no pre-push hook",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "",
-			expectedStatus: doctor.StatusOK, // Covered by other check
-		},
-		{
-			name:           "sync-branch configured, custom hook",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "custom",
-			expectedStatus: doctor.StatusWarning,
-		},
-		{
-			name:           "sync-branch configured, old hook (0.24.2)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.24.2",
-			expectedStatus: doctor.StatusError,
-		},
-		{
-			name:           "sync-branch configured, old hook (0.28.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.28.0",
-			expectedStatus: doctor.StatusError,
-		},
-		{
-			name:           "sync-branch configured, compatible hook (0.29.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.29.0",
-			expectedStatus: doctor.StatusOK,
-		},
-		{
-			name:           "sync-branch configured, newer hook (0.30.0)",
-			syncBranchEnv:  "beads-sync",
-			hasGitDir:      true,
-			hookVersion:    "0.30.0",
-			expectedStatus: doctor.StatusOK,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-
-			// Always set environment variable to control sync-branch detection
-			// This overrides any config.yaml value in the actual beads repo
-			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
-
-			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
-
-				// Create pre-push hook if specified
-				if tc.hookVersion != "" {
-					hooksDir := filepath.Join(tmpDir, ".git", "hooks")
-					hookPath := filepath.Join(hooksDir, "pre-push")
-					var hookContent string
-					if tc.hookVersion == "custom" {
-						hookContent = "#!/bin/sh\n# Custom hook\nexit 0\n"
-					} else {
-						hookContent = fmt.Sprintf("#!/bin/sh\n# bd-hooks-version: %s\nexit 0\n", tc.hookVersion)
-					}
-					if err := os.WriteFile(hookPath, []byte(hookContent), 0755); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-
-			check := doctor.CheckSyncBranchHookCompatibility(tmpDir)
-
-			if check.Status != tc.expectedStatus {
-				t.Errorf("Expected status %s, got %s (message: %s)", tc.expectedStatus, check.Status, check.Message)
-			}
-
-			// Error case should have a fix message
-			if tc.expectedStatus == doctor.StatusError && check.Fix == "" {
-				t.Error("Expected fix message for error status")
-			}
-		})
-	}
-}
-
-// TestCheckSyncBranchHookQuick tests the quick sync-branch hook check (issue #532)
-// Note: We use BEADS_SYNC_BRANCH env var to control sync-branch detection.
-func TestCheckSyncBranchHookQuick(t *testing.T) {
-	tests := []struct {
-		name          string
-		syncBranchEnv string
-		hasGitDir     bool
-		hookVersion   string
-		expectIssue   bool
-	}{
-		{
-			name:          "old hook with sync-branch",
-			syncBranchEnv: "beads-sync",
-			hasGitDir:     true,
-			hookVersion:   "0.24.0",
-			expectIssue:   true,
-		},
-		{
-			name:          "compatible hook with sync-branch",
-			syncBranchEnv: "beads-sync",
-			hasGitDir:     true,
-			hookVersion:   "0.29.0",
-			expectIssue:   false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-
-			// Always set environment variable to control sync-branch detection
-			// This overrides any config.yaml value in the actual beads repo
-			t.Setenv("BEADS_SYNC_BRANCH", tc.syncBranchEnv)
-
-			if tc.hasGitDir {
-				// Initialize a real git repo (git rev-parse needs this)
-				cmd := exec.Command("git", "init")
-				cmd.Dir = tmpDir
-				if err := cmd.Run(); err != nil {
-					t.Fatal(err)
-				}
-
-				if tc.hookVersion != "" {
-					hooksDir := filepath.Join(tmpDir, ".git", "hooks")
-					hookPath := filepath.Join(hooksDir, "pre-push")
-					hookContent := fmt.Sprintf("#!/bin/sh\n# bd-hooks-version: %s\nexit 0\n", tc.hookVersion)
-					if err := os.WriteFile(hookPath, []byte(hookContent), 0755); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-
-			issue := doctor.CheckSyncBranchHookQuick(tmpDir)
-
-			if tc.expectIssue && issue == "" {
-				t.Error("Expected issue to be reported, got empty string")
-			}
-			if !tc.expectIssue && issue != "" {
-				t.Errorf("Expected no issue, got: %s", issue)
-			}
-		})
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // envSnapshot saves and clears BD_/BEADS_ environment variables.
@@ -42,7 +41,7 @@ func TestInitialize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	if v == nil {
 		t.Fatal("viper instance is nil after Initialize()")
 	}
@@ -58,22 +57,17 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	tests := []struct {
 		key      string
 		expected interface{}
 		getter   func(string) interface{}
 	}{
 		{"json", false, func(k string) interface{} { return GetBool(k) }},
-		{"no-daemon", false, func(k string) interface{} { return GetBool(k) }},
-		{"no-auto-flush", false, func(k string) interface{} { return GetBool(k) }},
-		{"no-auto-import", false, func(k string) interface{} { return GetBool(k) }},
 		{"db", "", func(k string) interface{} { return GetString(k) }},
 		{"actor", "", func(k string) interface{} { return GetString(k) }},
-		{"flush-debounce", 30 * time.Second, func(k string) interface{} { return GetDuration(k) }},
-		{"auto-start-daemon", true, func(k string) interface{} { return GetBool(k) }},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.key, func(t *testing.T) {
 			got := tt.getter(tt.key)
@@ -94,26 +88,23 @@ func TestEnvironmentBinding(t *testing.T) {
 		getter   func(string) interface{}
 	}{
 		{"BD_JSON", "json", "true", true, func(k string) interface{} { return GetBool(k) }},
-		{"BD_NO_DAEMON", "no-daemon", "true", true, func(k string) interface{} { return GetBool(k) }},
 		{"BD_ACTOR", "actor", "testuser", "testuser", func(k string) interface{} { return GetString(k) }},
 		{"BD_DB", "db", "/tmp/test.db", "/tmp/test.db", func(k string) interface{} { return GetString(k) }},
-		{"BEADS_FLUSH_DEBOUNCE", "flush-debounce", "10s", 10 * time.Second, func(k string) interface{} { return GetDuration(k) }},
-		{"BEADS_AUTO_START_DAEMON", "auto-start-daemon", "false", false, func(k string) interface{} { return GetBool(k) }},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.envVar, func(t *testing.T) {
 			// Set environment variable
 			oldValue := os.Getenv(tt.envVar)
 			_ = os.Setenv(tt.envVar, tt.value)
 			defer os.Setenv(tt.envVar, oldValue)
-			
+
 			// Re-initialize viper to pick up env var
 			err := Initialize()
 			if err != nil {
 				t.Fatalf("Initialize() returned error: %v", err)
 			}
-			
+
 			got := tt.getter(tt.key)
 			if got != tt.expected {
 				t.Errorf("GetXXX(%q) with %s=%s = %v, want %v", tt.key, tt.envVar, tt.value, got, tt.expected)
@@ -129,19 +120,17 @@ func TestConfigFile(t *testing.T) {
 
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
-	
+
 	// Create a config file
 	configContent := `
 json: true
-no-daemon: true
 actor: configuser
-flush-debounce: 15s
 `
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
 	}
-	
+
 	// Create .beads directory
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0750); err != nil {
@@ -163,41 +152,172 @@ flush-debounce: 15s
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	// Test that config file values are loaded
 	if got := GetBool("json"); got != true {
 		t.Errorf("GetBool(json) = %v, want true", got)
 	}
-	
-	if got := GetBool("no-daemon"); got != true {
-		t.Errorf("GetBool(no-daemon) = %v, want true", got)
-	}
-	
+
 	if got := GetString("actor"); got != "configuser" {
 		t.Errorf("GetString(actor) = %q, want \"configuser\"", got)
 	}
-	
-	if got := GetDuration("flush-debounce"); got != 15*time.Second {
-		t.Errorf("GetDuration(flush-debounce) = %v, want 15s", got)
+}
+
+func TestInitialize_IgnoresModuleRootConfigWhenRequested(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	configDir := filepath.Join(tmpDir, "xdg-config")
+	repoDir := filepath.Join(tmpDir, "repo")
+	beadsDir := filepath.Join(repoDir, ".beads")
+
+	for _, dir := range []string{homeDir, configDir, beadsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("failed to create %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/test\n\ngo 1.24.0\n"), 0o644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("json: true\nactor: repo-user\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config.yaml: %v", err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	t.Chdir(repoDir)
+
+	ResetForTesting()
+	defer ResetForTesting()
+
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false when repo config is ignored", got)
+	}
+	if got := GetString("actor"); got != "" {
+		t.Fatalf("GetString(actor) = %q, want empty default when repo config is ignored", got)
+	}
+	if got := ConfigFileUsed(); got != "" {
+		t.Fatalf("ConfigFileUsed() = %q, want empty when repo config is ignored", got)
+	}
+}
+
+func TestLocalConfigOverride(t *testing.T) {
+	// Isolate from environment variables
+	restore := envSnapshot(t)
+	defer restore()
+
+	// Create a temporary directory for config files
+	tmpDir := t.TempDir()
+
+	// Create .beads directory
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads directory: %v", err)
+	}
+
+	// Create main config file with some settings
+	configContent := `
+json: false
+actor: project-user
+`
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	// Create local config file that overrides some settings
+	localConfigContent := `
+actor: local-user
+`
+	localConfigPath := filepath.Join(beadsDir, "config.local.yaml")
+	if err := os.WriteFile(localConfigPath, []byte(localConfigContent), 0600); err != nil {
+		t.Fatalf("failed to write local config file: %v", err)
+	}
+
+	// Change to tmp directory so config file is discovered
+	t.Chdir(tmpDir)
+
+	// Initialize viper
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	// Test that local config values override project config values
+	if got := GetString("actor"); got != "local-user" {
+		t.Errorf("GetString(actor) = %q, want \"local-user\" (local override)", got)
+	}
+
+	// Test that non-overridden values from project config are preserved
+	if got := GetBool("json"); got != false {
+		t.Errorf("GetBool(json) = %v, want false (from project config)", got)
+	}
+}
+
+func TestLocalConfigMissing(t *testing.T) {
+	// Isolate from environment variables
+	restore := envSnapshot(t)
+	defer restore()
+
+	// Create a temporary directory for config file (no local config)
+	tmpDir := t.TempDir()
+
+	// Create .beads directory
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads directory: %v", err)
+	}
+
+	// Create only main config file
+	configContent := `
+json: true
+actor: project-user
+`
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	// Change to tmp directory so config file is discovered
+	t.Chdir(tmpDir)
+
+	// Initialize viper - should not error even without local config
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize() returned error: %v", err)
+	}
+
+	// Test that project config values are loaded
+	if got := GetBool("json"); got != true {
+		t.Errorf("GetBool(json) = %v, want true", got)
+	}
+
+	if got := GetString("actor"); got != "project-user" {
+		t.Errorf("GetString(actor) = %q, want \"project-user\"", got)
 	}
 }
 
 func TestConfigPrecedence(t *testing.T) {
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
-	
+
 	// Create a config file with json: false
 	configContent := `json: false`
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0750); err != nil {
 		t.Fatalf("failed to create .beads directory: %v", err)
 	}
-	
+
 	configPath := filepath.Join(beadsDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
 		t.Fatalf("failed to write config file: %v", err)
 	}
-	
+
 	// Change to tmp directory
 	t.Chdir(tmpDir)
 
@@ -207,20 +327,20 @@ func TestConfigPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	if got := GetBool("json"); got != false {
 		t.Errorf("GetBool(json) from config file = %v, want false", got)
 	}
-	
+
 	// Test 2: Environment variable overrides config file
 	_ = os.Setenv("BD_JSON", "true")
 	defer func() { _ = os.Unsetenv("BD_JSON") }()
-	
+
 	err = Initialize()
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	if got := GetBool("json"); got != true {
 		t.Errorf("GetBool(json) with env var = %v, want true (env should override config)", got)
 	}
@@ -231,18 +351,18 @@ func TestSetAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
-	
+
 	// Test Set and Get
 	Set("test-key", "test-value")
 	if got := GetString("test-key"); got != "test-value" {
 		t.Errorf("GetString(test-key) = %q, want \"test-value\"", got)
 	}
-	
+
 	Set("test-bool", true)
 	if got := GetBool("test-bool"); got != true {
 		t.Errorf("GetBool(test-bool) = %v, want true", got)
 	}
-	
+
 	Set("test-int", 42)
 	if got := GetInt("test-int"); got != 42 {
 		t.Errorf("GetInt(test-int) = %d, want 42", got)
@@ -505,8 +625,8 @@ func TestGetExternalProjects(t *testing.T) {
 
 	// Test with Set
 	Set("external_projects", map[string]string{
-		"beads":   "../beads",
-		"gastown": "/absolute/path/to/gastown",
+		"beads":         "../beads",
+		"other-project": "/absolute/path/to/other-project",
 	})
 
 	got = GetExternalProjects()
@@ -516,8 +636,8 @@ func TestGetExternalProjects(t *testing.T) {
 	if got["beads"] != "../beads" {
 		t.Errorf("GetExternalProjects()[beads] = %q, want \"../beads\"", got["beads"])
 	}
-	if got["gastown"] != "/absolute/path/to/gastown" {
-		t.Errorf("GetExternalProjects()[gastown] = %q, want \"/absolute/path/to/gastown\"", got["gastown"])
+	if got["other-project"] != "/absolute/path/to/other-project" {
+		t.Errorf("GetExternalProjects()[other-project] = %q, want \"/absolute/path/to/other-project\"", got["other-project"])
 	}
 }
 
@@ -529,7 +649,7 @@ func TestGetExternalProjectsFromConfig(t *testing.T) {
 	configContent := `
 external_projects:
   beads: ../beads
-  gastown: /path/to/gastown
+  other-project: /path/to/other-project
   other: ./relative/path
 `
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -559,8 +679,8 @@ external_projects:
 	if got["beads"] != "../beads" {
 		t.Errorf("GetExternalProjects()[beads] = %q, want \"../beads\"", got["beads"])
 	}
-	if got["gastown"] != "/path/to/gastown" {
-		t.Errorf("GetExternalProjects()[gastown] = %q, want \"/path/to/gastown\"", got["gastown"])
+	if got["other-project"] != "/path/to/other-project" {
+		t.Errorf("GetExternalProjects()[other-project] = %q, want \"/path/to/other-project\"", got["other-project"])
 	}
 	if got["other"] != "./relative/path" {
 		t.Errorf("GetExternalProjects()[other] = %q, want \"./relative/path\"", got["other"])
@@ -1028,51 +1148,6 @@ validation:
 	}
 }
 
-// Tests for sync mode configuration (hq-ew1mbr.3)
-
-func TestSyncModeConstants(t *testing.T) {
-	// Verify sync mode constants have expected string values
-	if SyncModeGitPortable != "git-portable" {
-		t.Errorf("SyncModeGitPortable = %q, want \"git-portable\"", SyncModeGitPortable)
-	}
-	if SyncModeRealtime != "realtime" {
-		t.Errorf("SyncModeRealtime = %q, want \"realtime\"", SyncModeRealtime)
-	}
-	if SyncModeDoltNative != "dolt-native" {
-		t.Errorf("SyncModeDoltNative = %q, want \"dolt-native\"", SyncModeDoltNative)
-	}
-	if SyncModeBeltAndSuspenders != "belt-and-suspenders" {
-		t.Errorf("SyncModeBeltAndSuspenders = %q, want \"belt-and-suspenders\"", SyncModeBeltAndSuspenders)
-	}
-}
-
-func TestSyncTriggerConstants(t *testing.T) {
-	if SyncTriggerPush != "push" {
-		t.Errorf("SyncTriggerPush = %q, want \"push\"", SyncTriggerPush)
-	}
-	if SyncTriggerChange != "change" {
-		t.Errorf("SyncTriggerChange = %q, want \"change\"", SyncTriggerChange)
-	}
-	if SyncTriggerPull != "pull" {
-		t.Errorf("SyncTriggerPull = %q, want \"pull\"", SyncTriggerPull)
-	}
-}
-
-func TestConflictStrategyConstants(t *testing.T) {
-	if ConflictStrategyNewest != "newest" {
-		t.Errorf("ConflictStrategyNewest = %q, want \"newest\"", ConflictStrategyNewest)
-	}
-	if ConflictStrategyOurs != "ours" {
-		t.Errorf("ConflictStrategyOurs = %q, want \"ours\"", ConflictStrategyOurs)
-	}
-	if ConflictStrategyTheirs != "theirs" {
-		t.Errorf("ConflictStrategyTheirs = %q, want \"theirs\"", ConflictStrategyTheirs)
-	}
-	if ConflictStrategyManual != "manual" {
-		t.Errorf("ConflictStrategyManual = %q, want \"manual\"", ConflictStrategyManual)
-	}
-}
-
 func TestSovereigntyConstants(t *testing.T) {
 	if SovereigntyT1 != "T1" {
 		t.Errorf("SovereigntyT1 = %q, want \"T1\"", SovereigntyT1)
@@ -1085,56 +1160,6 @@ func TestSovereigntyConstants(t *testing.T) {
 	}
 	if SovereigntyT4 != "T4" {
 		t.Errorf("SovereigntyT4 = %q, want \"T4\"", SovereigntyT4)
-	}
-}
-
-func TestSyncConfigDefaults(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Test sync mode default
-	if got := GetSyncMode(); got != SyncModeGitPortable {
-		t.Errorf("GetSyncMode() = %q, want %q", got, SyncModeGitPortable)
-	}
-
-	// Test sync config defaults
-	cfg := GetSyncConfig()
-	if cfg.Mode != SyncModeGitPortable {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", cfg.Mode, SyncModeGitPortable)
-	}
-	if cfg.ExportOn != SyncTriggerPush {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", cfg.ExportOn, SyncTriggerPush)
-	}
-	if cfg.ImportOn != SyncTriggerPull {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", cfg.ImportOn, SyncTriggerPull)
-	}
-}
-
-func TestConflictConfigDefaults(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Test conflict strategy default
-	if got := GetConflictStrategy(); got != ConflictStrategyNewest {
-		t.Errorf("GetConflictStrategy() = %q, want %q", got, ConflictStrategyNewest)
-	}
-
-	// Test conflict config
-	cfg := GetConflictConfig()
-	if cfg.Strategy != ConflictStrategyNewest {
-		t.Errorf("GetConflictConfig().Strategy = %q, want %q", cfg.Strategy, ConflictStrategyNewest)
 	}
 }
 
@@ -1157,89 +1182,18 @@ func TestFederationConfigDefaults(t *testing.T) {
 	if cfg.Sovereignty != SovereigntyNone {
 		t.Errorf("GetFederationConfig().Sovereignty = %q, want %q (no restriction)", cfg.Sovereignty, SovereigntyNone)
 	}
-}
-
-func TestIsSyncModeValid(t *testing.T) {
-	tests := []struct {
-		mode  string
-		valid bool
-	}{
-		{string(SyncModeGitPortable), true},
-		{string(SyncModeRealtime), true},
-		{string(SyncModeDoltNative), true},
-		{string(SyncModeBeltAndSuspenders), true},
-		{"invalid-mode", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.mode, func(t *testing.T) {
-			if got := IsSyncModeValid(tt.mode); got != tt.valid {
-				t.Errorf("IsSyncModeValid(%q) = %v, want %v", tt.mode, got, tt.valid)
-			}
-		})
+	// Default exclude_types should contain "wisp"
+	if len(cfg.ExcludeTypes) != 1 || cfg.ExcludeTypes[0] != "wisp" {
+		t.Errorf("GetFederationConfig().ExcludeTypes = %v, want [\"wisp\"]", cfg.ExcludeTypes)
 	}
 }
 
-func TestIsConflictStrategyValid(t *testing.T) {
-	tests := []struct {
-		strategy string
-		valid    bool
-	}{
-		{string(ConflictStrategyNewest), true},
-		{string(ConflictStrategyOurs), true},
-		{string(ConflictStrategyTheirs), true},
-		{string(ConflictStrategyManual), true},
-		{"invalid-strategy", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.strategy, func(t *testing.T) {
-			if got := IsConflictStrategyValid(tt.strategy); got != tt.valid {
-				t.Errorf("IsConflictStrategyValid(%q) = %v, want %v", tt.strategy, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestIsSovereigntyValid(t *testing.T) {
-	tests := []struct {
-		sovereignty string
-		valid       bool
-	}{
-		{string(SovereigntyT1), true},
-		{string(SovereigntyT2), true},
-		{string(SovereigntyT3), true},
-		{string(SovereigntyT4), true},
-		{"", true}, // Empty is valid (means no restriction)
-		{"T5", false},
-		{"invalid", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.sovereignty, func(t *testing.T) {
-			if got := IsSovereigntyValid(tt.sovereignty); got != tt.valid {
-				t.Errorf("IsSovereigntyValid(%q) = %v, want %v", tt.sovereignty, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestSyncConfigFromFile(t *testing.T) {
+func TestFederationConfigFromFile(t *testing.T) {
 	// Create a temporary directory for config file
 	tmpDir := t.TempDir()
 
-	// Create a config file with sync settings
+	// Create a config file with federation settings
 	configContent := `
-sync:
-  mode: realtime
-  export_on: change
-  import_on: change
-
-conflict:
-  strategy: ours
-
 federation:
   remote: dolthub://myorg/beads
   sovereignty: T2
@@ -1262,24 +1216,6 @@ federation:
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	// Test sync config
-	syncCfg := GetSyncConfig()
-	if syncCfg.Mode != SyncModeRealtime {
-		t.Errorf("GetSyncConfig().Mode = %q, want %q", syncCfg.Mode, SyncModeRealtime)
-	}
-	if syncCfg.ExportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ExportOn = %q, want %q", syncCfg.ExportOn, SyncTriggerChange)
-	}
-	if syncCfg.ImportOn != SyncTriggerChange {
-		t.Errorf("GetSyncConfig().ImportOn = %q, want %q", syncCfg.ImportOn, SyncTriggerChange)
-	}
-
-	// Test conflict config
-	conflictCfg := GetConflictConfig()
-	if conflictCfg.Strategy != ConflictStrategyOurs {
-		t.Errorf("GetConflictConfig().Strategy = %q, want %q", conflictCfg.Strategy, ConflictStrategyOurs)
-	}
-
 	// Test federation config
 	fedCfg := GetFederationConfig()
 	if fedCfg.Remote != "dolthub://myorg/beads" {
@@ -1290,139 +1226,26 @@ federation:
 	}
 }
 
-func TestShouldExportOnChange(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
+func TestFederationExcludeTypesOptOut(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	configContent := `
+federation:
+  exclude_types: []
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Chdir(tmpDir)
 	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
+		t.Fatalf("Initialize: %v", err)
 	}
-
-	// Default should be false (export on push, not change)
-	if ShouldExportOnChange() {
-		t.Error("ShouldExportOnChange() = true, want false (default)")
-	}
-
-	// Set to change
-	Set("sync.export_on", SyncTriggerChange)
-	if !ShouldExportOnChange() {
-		t.Error("ShouldExportOnChange() = false after setting to change, want true")
-	}
-}
-
-func TestShouldImportOnChange(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Default should be false (import on pull, not change)
-	if ShouldImportOnChange() {
-		t.Error("ShouldImportOnChange() = true, want false (default)")
-	}
-
-	// Set to change
-	Set("sync.import_on", SyncTriggerChange)
-	if !ShouldImportOnChange() {
-		t.Error("ShouldImportOnChange() = false after setting to change, want true")
-	}
-}
-
-func TestNeedsDoltRemote(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	tests := []struct {
-		mode        SyncMode
-		needsRemote bool
-	}{
-		{SyncModeGitPortable, false},
-		{SyncModeRealtime, false},
-		{SyncModeDoltNative, true},
-		{SyncModeBeltAndSuspenders, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.mode), func(t *testing.T) {
-			if err := Initialize(); err != nil {
-				t.Fatalf("Initialize() returned error: %v", err)
-			}
-			Set("sync.mode", string(tt.mode))
-
-			if got := NeedsDoltRemote(); got != tt.needsRemote {
-				t.Errorf("NeedsDoltRemote() with mode=%s = %v, want %v", tt.mode, got, tt.needsRemote)
-			}
-		})
-	}
-}
-
-func TestNeedsJSONL(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	tests := []struct {
-		mode       SyncMode
-		needsJSONL bool
-	}{
-		{SyncModeGitPortable, true},
-		{SyncModeRealtime, true},
-		{SyncModeDoltNative, false},
-		{SyncModeBeltAndSuspenders, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.mode), func(t *testing.T) {
-			if err := Initialize(); err != nil {
-				t.Fatalf("Initialize() returned error: %v", err)
-			}
-			Set("sync.mode", string(tt.mode))
-
-			if got := NeedsJSONL(); got != tt.needsJSONL {
-				t.Errorf("NeedsJSONL() with mode=%s = %v, want %v", tt.mode, got, tt.needsJSONL)
-			}
-		})
-	}
-}
-
-func TestGetSyncModeInvalid(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Set invalid mode - should fall back to git-portable
-	Set("sync.mode", "invalid-mode")
-	if got := GetSyncMode(); got != SyncModeGitPortable {
-		t.Errorf("GetSyncMode() with invalid mode = %q, want %q (fallback)", got, SyncModeGitPortable)
-	}
-}
-
-func TestGetConflictStrategyInvalid(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	// Set invalid strategy - should fall back to newest
-	Set("conflict.strategy", "invalid-strategy")
-	if got := GetConflictStrategy(); got != ConflictStrategyNewest {
-		t.Errorf("GetConflictStrategy() with invalid strategy = %q, want %q (fallback)", got, ConflictStrategyNewest)
+	cfg := GetFederationConfig()
+	if len(cfg.ExcludeTypes) != 0 {
+		t.Errorf("ExcludeTypes = %v, want empty (opt-out)", cfg.ExcludeTypes)
 	}
 }
 
@@ -1544,256 +1367,236 @@ func TestGetCustomTypesFromYAML_NilViper(t *testing.T) {
 	}
 }
 
-func TestGetFieldStrategies(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	ResetForTesting()
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
+// TestGetStringFromDir verifies that GetStringFromDir reads config.yaml from
+// the given beadsDir without using or modifying global viper state.
+func TestGetStringFromDir(t *testing.T) {
+	writeConfig := func(t *testing.T, dir, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0o600); err != nil {
+			t.Fatalf("writeConfig: %v", err)
+		}
 	}
 
-	t.Run("empty_by_default", func(t *testing.T) {
-		result := GetFieldStrategies()
-		if len(result) != 0 {
-			t.Errorf("GetFieldStrategies() with no config = %v, want empty map", result)
+	t.Run("simple string value", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "dolt:\n  auto-start: \"false\"\n")
+		if got := GetStringFromDir(dir, "dolt.auto-start"); got != "false" {
+			t.Errorf("got %q, want %q", got, "false")
 		}
 	})
 
-	t.Run("valid_strategies", func(t *testing.T) {
-		ResetForTesting()
-		if err := Initialize(); err != nil {
-			t.Fatalf("Initialize() returned error: %v", err)
-		}
-
-		// Set per-field strategies
-		Set("conflict.fields", map[string]string{
-			"compaction_level":   "max",
-			"labels":             "union",
-			"estimated_minutes":  "manual",
-			"status":             "newest",
-		})
-
-		result := GetFieldStrategies()
-
-		if result["compaction_level"] != FieldStrategyMax {
-			t.Errorf("Expected compaction_level=max, got %s", result["compaction_level"])
-		}
-		if result["labels"] != FieldStrategyUnion {
-			t.Errorf("Expected labels=union, got %s", result["labels"])
-		}
-		if result["estimated_minutes"] != FieldStrategyManual {
-			t.Errorf("Expected estimated_minutes=manual, got %s", result["estimated_minutes"])
-		}
-		if result["status"] != FieldStrategyNewest {
-			t.Errorf("Expected status=newest, got %s", result["status"])
+	t.Run("nested key with multiple dots", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "a:\n  b:\n    c: value\n")
+		if got := GetStringFromDir(dir, "a.b.c"); got != "value" {
+			t.Errorf("got %q, want %q", got, "value")
 		}
 	})
 
-	t.Run("invalid_strategy_skipped", func(t *testing.T) {
-		ResetForTesting()
-		if err := Initialize(); err != nil {
-			t.Fatalf("Initialize() returned error: %v", err)
-		}
-
-		// Set a mix of valid and invalid strategies
-		Set("conflict.fields", map[string]string{
-			"compaction_level": "max",
-			"invalid_field":    "invalid-strategy",
-		})
-
-		result := GetFieldStrategies()
-
-		// Valid one should be present
-		if result["compaction_level"] != FieldStrategyMax {
-			t.Errorf("Expected compaction_level=max, got %s", result["compaction_level"])
-		}
-		// Invalid one should be skipped
-		if _, exists := result["invalid_field"]; exists {
-			t.Errorf("Expected invalid_field to be skipped, but it was included: %s", result["invalid_field"])
-		}
-	})
-}
-
-func TestGetFieldStrategy(t *testing.T) {
-	// Isolate from environment variables
-	restore := envSnapshot(t)
-	defer restore()
-
-	// Initialize config
-	ResetForTesting()
-	if err := Initialize(); err != nil {
-		t.Fatalf("Initialize() returned error: %v", err)
-	}
-
-	t.Run("returns_default_for_unconfigured_field", func(t *testing.T) {
-		result := GetFieldStrategy("unconfigured_field")
-		if result != FieldStrategyNewest {
-			t.Errorf("GetFieldStrategy(unconfigured_field) = %s, want newest (default)", result)
+	t.Run("non-existent file returns empty string", func(t *testing.T) {
+		dir := t.TempDir()
+		if got := GetStringFromDir(dir, "dolt.auto-start"); got != "" {
+			t.Errorf("got %q, want %q", got, "")
 		}
 	})
 
-	t.Run("returns_configured_strategy", func(t *testing.T) {
-		ResetForTesting()
-		if err := Initialize(); err != nil {
-			t.Fatalf("Initialize() returned error: %v", err)
+	t.Run("non-existent key returns empty string", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "dolt:\n  shared-server: true\n")
+		if got := GetStringFromDir(dir, "dolt.auto-start"); got != "" {
+			t.Errorf("got %q, want %q", got, "")
 		}
+	})
 
-		Set("conflict.fields", map[string]string{
-			"compaction_level": "max",
-		})
+	t.Run("YAML boolean coerced to string", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "dolt:\n  auto-start: false\n") // unquoted YAML bool
+		got := GetStringFromDir(dir, "dolt.auto-start")
+		if got != "false" {
+			t.Errorf("got %q, want %q", got, "false")
+		}
+	})
 
-		result := GetFieldStrategy("compaction_level")
-		if result != FieldStrategyMax {
-			t.Errorf("GetFieldStrategy(compaction_level) = %s, want max", result)
+	t.Run("YAML integer coerced to string", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "server:\n  port: 3307\n")
+		if got := GetStringFromDir(dir, "server.port"); got != "3307" {
+			t.Errorf("got %q, want %q", got, "3307")
+		}
+	})
+
+	t.Run("malformed YAML returns empty string", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "dolt: [\nbad yaml\n")
+		if got := GetStringFromDir(dir, "dolt.auto-start"); got != "" {
+			t.Errorf("got %q, want %q", got, "")
+		}
+	})
+
+	t.Run("top-level key (no dot)", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "actor: alice\n")
+		if got := GetStringFromDir(dir, "actor"); got != "alice" {
+			t.Errorf("got %q, want %q", got, "alice")
 		}
 	})
 }
 
-func TestGetConflictConfigWithFields(t *testing.T) {
-	// Isolate from environment variables
+// TestXDGConfigPath_Loaded verifies that ~/.config/bd/config.yaml is loaded
+// when it exists, even if os.UserConfigDir() returns a different path (macOS).
+func TestXDGConfigPath_Loaded(t *testing.T) {
 	restore := envSnapshot(t)
 	defer restore()
 
-	// Initialize config
+	// Clear env vars that could interfere with config defaults
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome) // Windows
+
+	// Create ~/.config/bd/config.yaml with a distinctive value
+	xdgConfigDir := filepath.Join(tmpHome, ".config", "bd")
+	if err := os.MkdirAll(xdgConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create xdg config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(xdgConfigDir, "config.yaml"),
+		[]byte("actor: xdg-test-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write xdg config: %v", err)
+	}
+
+	// Set XDG_CONFIG_HOME to a DIFFERENT directory so os.UserConfigDir()
+	// won't return ~/.config (simulates macOS behavior).
+	altConfigDir := filepath.Join(tmpHome, "Library", "Application Support")
+	if err := os.MkdirAll(altConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create alt config dir: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", altConfigDir)
+
+	// CWD should be somewhere with no .beads/
+	t.Chdir(tmpHome)
+
 	ResetForTesting()
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	Set("conflict.strategy", "ours")
-	Set("conflict.fields", map[string]string{
-		"compaction_level": "max",
-		"labels":           "union",
-	})
-
-	result := GetConflictConfig()
-
-	if result.Strategy != ConflictStrategyOurs {
-		t.Errorf("GetConflictConfig().Strategy = %s, want ours", result.Strategy)
-	}
-	if result.Fields["compaction_level"] != FieldStrategyMax {
-		t.Errorf("GetConflictConfig().Fields[compaction_level] = %s, want max", result.Fields["compaction_level"])
-	}
-	if result.Fields["labels"] != FieldStrategyUnion {
-		t.Errorf("GetConflictConfig().Fields[labels] = %s, want union", result.Fields["labels"])
+	if got := GetString("actor"); got != "xdg-test-user" {
+		t.Errorf("GetString(actor) = %q, want %q (from ~/.config/bd/config.yaml)", got, "xdg-test-user")
 	}
 }
 
-func TestGetAgentRoles(t *testing.T) {
-	// Isolate from environment variables
+// TestXDGConfigPath_Dedup verifies that when os.UserConfigDir() already returns
+// ~/.config, the path is not added twice.
+func TestXDGConfigPath_Dedup(t *testing.T) {
 	restore := envSnapshot(t)
 	defer restore()
 
-	// Create a temporary directory with a .beads/config.yaml
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create .beads directory: %v", err)
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+
+	// Make XDG_CONFIG_HOME point to ~/.config so os.UserConfigDir() returns it
+	dotConfig := filepath.Join(tmpHome, ".config")
+	t.Setenv("XDG_CONFIG_HOME", dotConfig)
+
+	// Create the config file
+	xdgConfigDir := filepath.Join(dotConfig, "bd")
+	if err := os.MkdirAll(xdgConfigDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(xdgConfigDir, "config.yaml"),
+		[]byte("actor: dedup-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
 	}
 
-	// Write a config file with agent_roles
-	configContent := `
-agent_roles:
-  town_level: "mayor,deacon"
-  rig_level: "witness,refinery"
-  named: "crew,polecat"
-`
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("failed to write config file: %v", err)
-	}
+	t.Chdir(tmpHome)
 
-	// Change to tmp directory so config is found
-	t.Chdir(tmpDir)
-
-	// Reset and initialize viper
 	ResetForTesting()
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	t.Run("town_level_roles", func(t *testing.T) {
-		got := GetTownLevelRoles()
-		expected := []string{"mayor", "deacon"}
-		if len(got) != len(expected) {
-			t.Errorf("GetTownLevelRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetTownLevelRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
-
-	t.Run("rig_level_roles", func(t *testing.T) {
-		got := GetRigLevelRoles()
-		expected := []string{"witness", "refinery"}
-		if len(got) != len(expected) {
-			t.Errorf("GetRigLevelRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetRigLevelRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
-
-	t.Run("named_roles", func(t *testing.T) {
-		got := GetNamedRoles()
-		expected := []string{"crew", "polecat"}
-		if len(got) != len(expected) {
-			t.Errorf("GetNamedRoles() returned %d roles, want %d", len(got), len(expected))
-		}
-		for i, role := range expected {
-			if i >= len(got) || got[i] != role {
-				t.Errorf("GetNamedRoles()[%d] = %q, want %q", i, got[i], role)
-			}
-		}
-	})
+	// The config should load exactly once (no error from duplicate merge)
+	if got := GetString("actor"); got != "dedup-user" {
+		t.Errorf("GetString(actor) = %q, want %q", got, "dedup-user")
+	}
 }
 
-func TestGetAgentRoles_NotSet(t *testing.T) {
-	// Isolate from environment variables
+// TestXDGConfigPath_Missing verifies that when ~/.config/bd/config.yaml does
+// not exist, no error occurs.
+func TestXDGConfigPath_Missing(t *testing.T) {
 	restore := envSnapshot(t)
 	defer restore()
 
-	// Create a temporary directory with a .beads/config.yaml WITHOUT agent_roles
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("failed to create .beads directory: %v", err)
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("USERPROFILE", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, "xdg-config"))
+
+	t.Chdir(tmpHome)
+
+	ResetForTesting()
+	err := Initialize()
+	if err != nil {
+		t.Fatalf("Initialize() returned error when ~/.config/bd/config.yaml missing: %v", err)
 	}
 
-	// Write a config file without agent_roles
-	configContent := `
-sync:
-  mode: git-portable
-`
-	configPath := filepath.Join(beadsDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
-		t.Fatalf("failed to write config file: %v", err)
+	// Should still have defaults
+	if got := GetString("actor"); got != "" {
+		t.Errorf("GetString(actor) = %q, want empty (default)", got)
+	}
+}
+
+func TestInitialize_ExternalBEADSDirDoesNotMergeCallerProjectConfig(t *testing.T) {
+	restore := envSnapshot(t)
+	defer restore()
+
+	callerRepo := filepath.Join(t.TempDir(), "caller")
+	callerBeadsDir := filepath.Join(callerRepo, ".beads")
+	if err := os.MkdirAll(callerBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create caller .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(callerBeadsDir, "config.yaml"), []byte("readonly: true\njson: true\n"), 0o600); err != nil {
+		t.Fatalf("failed to write caller config: %v", err)
 	}
 
-	// Change to tmp directory so config is found
-	t.Chdir(tmpDir)
+	targetBeadsDir := filepath.Join(t.TempDir(), "target", ".beads")
+	if err := os.MkdirAll(targetBeadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create target .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeadsDir, "config.yaml"), []byte("actor: target-user\n"), 0o600); err != nil {
+		t.Fatalf("failed to write target config: %v", err)
+	}
 
-	// Reset and initialize viper
+	t.Chdir(callerRepo)
+	t.Setenv("BEADS_DIR", targetBeadsDir)
+
 	ResetForTesting()
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize() returned error: %v", err)
 	}
 
-	// All role functions should return nil when not configured
-	if got := GetTownLevelRoles(); got != nil {
-		t.Errorf("GetTownLevelRoles() = %v, want nil when not set", got)
+	if got := GetString("actor"); got != "target-user" {
+		t.Fatalf("GetString(actor) = %q, want %q", got, "target-user")
 	}
-	if got := GetRigLevelRoles(); got != nil {
-		t.Errorf("GetRigLevelRoles() = %v, want nil when not set", got)
+	if got := GetBool("readonly"); got {
+		t.Fatalf("GetBool(readonly) = %v, want false", got)
 	}
-	if got := GetNamedRoles(); got != nil {
-		t.Errorf("GetNamedRoles() = %v, want nil when not set", got)
+	if got := GetBool("json"); got {
+		t.Fatalf("GetBool(json) = %v, want false", got)
 	}
 }

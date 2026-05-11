@@ -2,19 +2,19 @@
 
 ## Project Overview
 
-**beads** (command: `bd`) is a Git-backed issue tracker designed for AI-supervised coding workflows. We dogfood our own tool for all task tracking.
+**beads** (command: `bd`) is a Dolt-powered issue tracker designed for AI-supervised coding workflows. Git integration is optional. We dogfood our own tool for all task tracking.
 
 **Key Features:**
 - Dependency-aware issue tracking
-- Auto-sync with Git via JSONL
+- Auto-sync via Dolt-native replication
 - AI-optimized CLI with JSON output
-- Built-in daemon for background operations
+- Dolt server mode for background operations
 - MCP server integration for Claude and other AI assistants
 
 ## Tech Stack
 
 - **Language**: Go 1.21+
-- **Storage**: SQLite (internal/storage/sqlite/)
+- **Storage**: Dolt (version-controlled SQL database)
 - **CLI Framework**: Cobra
 - **Testing**: Go standard testing + table-driven tests
 - **CI/CD**: GitHub Actions
@@ -24,7 +24,7 @@
 
 ### Testing
 - Always write tests for new features
-- Use `BEADS_DB=/tmp/test.db` to avoid polluting production database
+- Use `t.TempDir() in Go tests` to avoid polluting production database
 - Run `go test -short ./...` before committing
 - Never create test issues in production DB (use temporary DB)
 
@@ -35,9 +35,13 @@
 - Update docs when changing behavior
 
 ### Git Workflow
-- Always commit `.beads/issues.jsonl` with code changes
-- Run `bd sync` at end of work sessions
-- Install git hooks: `bd hooks install` (ensures DB ↔ JSONL consistency)
+- Install git hooks: `bd hooks install`
+- Use `bd dolt push` / `bd dolt pull` for remote sync
+- Before implementing related work, opening a PR, or merging/closing a PR, run:
+  `scripts/pr-preflight.sh --search "<topic>" --repo gastownhall/beads` or
+  `scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads`
+- External contributor PRs have priority: build on them when possible, preserve
+  tests and attribution, and never close or replace them silently.
 
 ## Issue Tracking with bd
 
@@ -52,25 +56,26 @@ bd stale --days 30 --json          # Forgotten issues
 
 # Create and manage (ALWAYS include --description)
 bd create "Title" --description="Detailed context" -t bug|feature|task -p 0-4 --json
-bd update <id> --status in_progress --json
+bd update <id> --claim --json
 bd close <id> --reason "Done" --json
 
 # Search
 bd list --status open --priority 1 --json
 bd show <id> --json
 
-# Sync (CRITICAL at end of session!)
-bd sync  # Force immediate export/commit/push
+# Sync (if remote configured)
+bd dolt push                   # Push to Dolt remote
+bd dolt pull                   # Pull from Dolt remote
 ```
 
 ### Workflow
 
 1. **Check ready work**: `bd ready --json`
-2. **Claim task**: `bd update <id> --status in_progress`
+2. **Claim task**: `bd update <id> --claim`
 3. **Work on it**: Implement, test, document
 4. **Discover new work?** `bd create "Found bug" --description="What was found and why" -p 1 --deps discovered-from:<parent-id> --json`
 5. **Complete**: `bd close <id> --reason "Done" --json`
-6. **Sync**: `bd sync` (flushes changes to git immediately)
+6. **Sync**: `bd dolt push` (push to Dolt remote if configured)
 
 **IMPORTANT**: Always include `--description` when creating issues. Issues without descriptions lack context for future work.
 
@@ -90,14 +95,13 @@ beads/
 ├── internal/
 │   ├── types/           # Core data types
 │   └── storage/         # Storage layer
-│       └── sqlite/      # SQLite implementation
+│       └── dolt/        # Dolt implementation
 ├── integrations/
 │   └── beads-mcp/       # MCP server (Python)
 ├── examples/            # Integration examples
 ├── docs/                # Documentation
 └── .beads/
-    ├── beads.db         # SQLite database (DO NOT COMMIT)
-    └── issues.jsonl     # Git-synced issue storage
+    └── dolt/            # Dolt database (source of truth)
 ```
 
 ## Available Resources
@@ -123,11 +127,11 @@ Use the beads MCP server for native function calls instead of shell commands:
 
 - ✅ Use bd for ALL task tracking
 - ✅ Always use `--json` flag for programmatic use
-- ✅ Run `bd sync` at end of sessions
-- ✅ Test with `BEADS_DB=/tmp/test.db`
+- ✅ Use `bd dolt push` / `bd dolt pull` for remote sync
+- ✅ Test with `t.TempDir() in Go tests`
 - ❌ Do NOT create markdown TODO lists
 - ❌ Do NOT create test issues in production DB
-- ❌ Do NOT commit `.beads/beads.db` (JSONL only)
+- ❌ Do NOT manually modify `.beads/dolt/`
 
 ## Session Workflow
 
