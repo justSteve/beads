@@ -1126,25 +1126,20 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			if schemaErr != nil {
 				return backoff.Permanent(schemaErr)
 			}
-			// Recreate dolt_ignore'd tables after migrations. Migrations
-			// create them on first init; this rebuilds them when the
-			// working set was reset (clone, branch switch, server restart)
-			// and schema_migrations records make MigrateUp a no-op.
-			if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
-				return backoff.Permanent(err)
-			}
 			return nil
 		}, backoff.WithContext(schemaBO, ctx)); err != nil {
 			return nil, fmt.Errorf("failed to initialize schema: %w", err)
 		}
 	}
 
-	// Project identity verification: detect cross-project data leakage (GH#2372).
-	// If the local metadata.json has a project_id and the database has one too,
-	// they must match. A mismatch means this client is connected to the wrong
-	// project's Dolt server — refuse to proceed.
 	if !cfg.CreateIfMissing {
-		if verifyErr := store.verifyProjectIdentity(ctx, cfg.BeadsDir); verifyErr != nil {
+		var verifyErr error
+		if cfg.Database == doltserver.GlobalDatabaseName {
+			verifyErr = store.verifyGlobalProjectIdentity(ctx, cfg.BeadsDir)
+		} else {
+			verifyErr = store.verifyProjectIdentity(ctx, cfg.BeadsDir)
+		}
+		if verifyErr != nil {
 			_ = db.Close()
 			return nil, verifyErr
 		}
@@ -1212,6 +1207,35 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 				"To diagnose: bd dolt status\n"+
 				"Do NOT run 'bd init' — your data likely exists, just on a different server.",
 			localID, dbID)
+	}
+	return nil
+}
+
+func (s *DoltStore) verifyGlobalProjectIdentity(ctx context.Context, beadsDir string) error {
+	if beadsDir == "" {
+		return nil
+	}
+
+	metaCfg, err := configfile.Load(beadsDir)
+	if err != nil || metaCfg == nil {
+		return nil
+	}
+	expectedID := metaCfg.GlobalProjectID
+	if expectedID == "" {
+		return nil
+	}
+
+	dbID, err := s.GetMetadata(ctx, "_project_id")
+	if err != nil || dbID == "" {
+		return nil
+	}
+
+	if expectedID != dbID {
+		return fmt.Errorf(
+			"GLOBAL PROJECT IDENTITY MISMATCH — refusing to connect\n\n"+
+				"  Expected global project ID (metadata.json): %s\n"+
+				"  Database project ID:                        %s\n\n"+
+				expectedID, dbID)
 	}
 	return nil
 }
@@ -1460,9 +1484,9 @@ func databaseExistsOnServer(ctx context.Context, db *sql.DB, name string) (bool,
 	return false, rows.Err()
 }
 
-// initSchemaOnDB applies pending schema migrations on a generated branch,
-// merges them into main, and then backfills legacy config-driven tables.
-// schema.MigrateOnBranch tracks applied versions in schema_migrations.
+// initSchemaOnDB applies pending schema migrations. schema.MigrateUp tracks
+// applied versions in schema_migrations and backfills legacy config-driven
+// tables.
 func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -1470,15 +1494,8 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 	}
 	defer conn.Close()
 
-	if _, err := schema.MigrateOnBranch(ctx, conn, "main"); err != nil {
+	if _, err := schema.MigrateUp(ctx, conn); err != nil {
 		return fmt.Errorf("schema migration: %w", err)
-	}
-
-	// Backfill custom_statuses and custom_types from legacy config rows.
-	// Migration 0024 creates the empty tables; this populates them on legacy
-	// DBs that have status.custom / types.custom set via `bd config set`.
-	if err := schema.EnsureBackfilledCustomStatusesCustomTypes(ctx, conn); err != nil {
-		return fmt.Errorf("backfill custom tables: %w", err)
 	}
 
 	return nil
@@ -2311,20 +2328,12 @@ func (s *DoltStore) Branch(ctx context.Context, name string) (retErr error) {
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
-	// Pin a single connection so DOLT_BRANCH and EnsureIgnoredTables run on
-	// the same session. Using s.db (pool) could dispatch them to different
-	// connections where the branch context differs.
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection for branch: %w", err)
 	}
 	defer conn.Close()
-	if err := versioncontrolops.CreateBranch(ctx, conn, name); err != nil {
-		return err
-	}
-	// dolt_ignore'd tables (wisps, wisp_*) don't carry over to new branches —
-	// ensure they exist on the newly created branch.
-	return schema.EnsureIgnoredTables(ctx, conn)
+	return versioncontrolops.CreateBranch(ctx, conn, name)
 }
 
 // Checkout switches to the specified branch
@@ -2336,9 +2345,6 @@ func (s *DoltStore) Checkout(ctx context.Context, branch string) (retErr error) 
 		)...),
 	)
 	defer func() { endSpan(span, retErr) }()
-	// Pin a single connection so DOLT_CHECKOUT and EnsureIgnoredTables run on
-	// the same session. DOLT_CHECKOUT is session-scoped — using s.db (pool)
-	// could dispatch EnsureIgnoredTables to a connection still on the old branch.
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire connection for checkout: %w", err)
@@ -2348,9 +2354,7 @@ func (s *DoltStore) Checkout(ctx context.Context, branch string) (retErr error) 
 		return err
 	}
 	s.branch = branch
-	// dolt_ignore'd tables (wisps, wisp_*) may not exist on the target branch —
-	// ensure they exist after checkout.
-	return schema.EnsureIgnoredTables(ctx, conn)
+	return nil
 }
 
 // Merge merges the specified branch into the current branch.
@@ -2429,15 +2433,3 @@ type DoltStatus = storage.Status
 
 // StatusEntry is an alias for storage.StatusEntry.
 type StatusEntry = storage.StatusEntry
-
-// RebuildStatusViews regenerates the ready_issues and blocked_issues views.
-// Views are now table-backed (static SQL), so no custom status parameter needed.
-func (s *DoltStore) RebuildStatusViews(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, BuildReadyIssuesView()); err != nil {
-		return fmt.Errorf("failed to rebuild ready_issues view: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, BuildBlockedIssuesView()); err != nil {
-		return fmt.Errorf("failed to rebuild blocked_issues view: %w", err)
-	}
-	return nil
-}
