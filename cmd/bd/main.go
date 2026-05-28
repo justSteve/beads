@@ -154,6 +154,19 @@ func loadBeadsEnvFile(beadsDir string) {
 	_ = gotenv.Load(envFile)
 }
 
+func logConfigDiscovery(beadsDir, reason string) {
+	metadataPath := filepath.Join(beadsDir, configfile.ConfigFileName)
+	configYAMLPath := filepath.Join(beadsDir, "config.yaml")
+	_, metadataErr := os.Stat(metadataPath)
+	_, yamlErr := os.Stat(configYAMLPath)
+	debug.Logf("Debug: %s at %s -> metadata=%v (%v), config.yaml=%v (%v)\n",
+		reason, beadsDir, metadataErr == nil, metadataErr, yamlErr == nil, yamlErr)
+}
+
+func shouldLogDefaultDoltDatabase(cfg *configfile.Config) bool {
+	return cfg != nil && cfg.DoltDatabase == "" && os.Getenv("BEADS_DOLT_SERVER_DATABASE") == ""
+}
+
 // loadBeadsSelectionEnvFile loads only the selector keys needed for early
 // workspace/database discovery. Unlike loadBeadsEnvFile, this intentionally
 // limits itself to BEADS_DIR / BEADS_DB / BD_DB so caller credentials and
@@ -838,6 +851,14 @@ var rootCmd = &cobra.Command{
 			preserveRedirectSourceDatabase(beads.GetRedirectInfo().LocalDir)
 		}
 
+		if dbPath == "" {
+			if bd := beads.FindBeadsDir(); bd != "" {
+				if cfg, _ := configfile.Load(bd); cfg != nil && cfg.IsDoltProxiedServerMode() {
+					dbPath = bd
+				}
+			}
+		}
+
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
@@ -953,6 +974,9 @@ var rootCmd = &cobra.Command{
 			// Always set database name (needed for bootstrap to find
 			// prefix-based databases like "beads_hq"; see #1669)
 			doltCfg.Database = cfg.GetDoltDatabase()
+			if shouldLogDefaultDoltDatabase(cfg) {
+				logConfigDiscovery(beadsDir, fmt.Sprintf("metadata loaded without dolt_database; using default database name %q", configfile.DefaultDoltDatabase))
+			}
 
 			doltCfg.ServerHost = cfg.GetDoltServerHost()
 			// Use doltserver.DefaultConfig for port resolution (env > port file >
@@ -965,6 +989,7 @@ var rootCmd = &cobra.Command{
 			doltCfg.ServerPassword = cfg.GetDoltServerPasswordForPort(doltCfg.ServerPort)
 			doltCfg.ServerTLS = cfg.GetDoltServerTLS()
 		} else if cfgErr == nil {
+			logConfigDiscovery(beadsDir, "config discovery")
 			// Load returned (nil, nil) — no config file found.
 			// Fall back to the canonical default database name; matches the
 			// behavior of newDoltStoreFromConfig / newReadOnlyStoreFromConfig
@@ -1053,8 +1078,8 @@ var rootCmd = &cobra.Command{
 		// Skip auto-import when the user is explicitly running "bd import" —
 		// the import command handles JSONL files itself and auto-importing
 		// first would interfere (double-import / upsert confusion).
-		if store != nil && !useReadOnly && !globalFlag && cmd.Name() != "import" {
-			maybeAutoImportJSONL(rootCtx, store, beadsDir, doltCfg.ServerMode)
+		if shouldRunAutoImportJSONL(cmd, store, useReadOnly, globalFlag, doltCfg.ServerMode) {
+			maybeAutoImportJSONL(rootCtx, store, beadsDir)
 		}
 
 		// Validate workspace identity for write commands (GH#2438, GH#2372)
@@ -1206,6 +1231,13 @@ func shouldRunPostCommandAutoExport(cmd *cobra.Command) bool {
 		return true
 	}
 	return !isReadOnlyCommand(cmd.Name())
+}
+
+func shouldRunAutoImportJSONL(cmd *cobra.Command, s storage.DoltStorage, useReadOnly, globalFlag, serverMode bool) bool {
+	if cmd == nil || s == nil || useReadOnly || globalFlag || serverMode {
+		return false
+	}
+	return cmd.Name() != "import"
 }
 
 func commandAllowsEmptyAutoExport(cmd *cobra.Command) bool {
