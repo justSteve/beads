@@ -52,7 +52,12 @@
       "Bash(sleep *)",
       "Bash(timeout *)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "Skill(tap-in)",
+      "Skill(handoff)",
+      "Skill(checkpoint)",
+      "Bash(column *)",
+      "Write(.claude/state/**)"
     ],
     "deny": [
       "Read(.env)",
