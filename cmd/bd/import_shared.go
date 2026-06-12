@@ -30,6 +30,12 @@ type ImportOptions struct {
 	// auto-import upgrade-recovery fallback (GH#3955); explicit `bd import`
 	// leaves this false and keeps UPSERT semantics.
 	ConflictSkip bool
+	// AllowStale imports rows even when their updated_at is older than the
+	// local issue's, overwriting newer local state. Required for the
+	// restore-an-older-snapshot recovery workflow, which the default stale
+	// guard otherwise silently no-ops per row (bd-6dnrw.9). Only settable
+	// via explicit `bd import --allow-stale`; auto-import paths never set it.
+	AllowStale bool
 }
 
 // ImportResult describes what an import operation did.
@@ -57,21 +63,36 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 		return &ImportResult{Skipped: len(issues)}, nil
 	}
 
-	filtered, staleSkippedIDs, err := filterStaleImportIssues(ctx, store, issues)
-	if err != nil {
-		return nil, err
-	}
-	issues = filtered
-	if len(issues) == 0 {
-		return &ImportResult{Skipped: len(staleSkippedIDs), StaleSkippedIDs: staleSkippedIDs}, nil
+	// The stale guard has two halves (bd-pkim8). This pre-filter reports the
+	// rows that are already known stale (StaleSkippedIDs) and keeps their
+	// labels/comments/dependencies out of the batch entirely. It is a separate
+	// read, though, so a local update that commits between it and the batch
+	// write would slip through — RejectStaleUpserts below closes that race by
+	// re-checking updated_at inside the upsert itself.
+	var staleSkippedIDs []string
+	if !opts.AllowStale {
+		filtered, skipped, err := filterStaleImportIssues(ctx, store, issues)
+		if err != nil {
+			return nil, err
+		}
+		issues = filtered
+		staleSkippedIDs = skipped
+		if len(issues) == 0 {
+			return &ImportResult{Skipped: len(staleSkippedIDs), StaleSkippedIDs: staleSkippedIDs}, nil
+		}
 	}
 
 	var skippedDependencies []string
 	skippedDependencySet := make(map[string]struct{})
-	err = store.CreateIssuesWithFullOptions(ctx, issues, getActorWithGit(), storage.BatchCreateOptions{
+	// In-txn half of the stale guard: rows the conditional upsert rejected
+	// (local update committed between the pre-filter read and the batch
+	// write). The transaction may retry, so dedup by ID.
+	staleRejectedSet := make(map[string]struct{})
+	err := store.CreateIssuesWithFullOptions(ctx, issues, getActorWithGit(), storage.BatchCreateOptions{
 		OrphanHandling:                 storage.OrphanAllow,
 		SkipPrefixValidation:           opts.SkipPrefixValidation,
 		ConflictSkip:                   opts.ConflictSkip,
+		RejectStaleUpserts:             !opts.AllowStale,
 		SkipDependencyValidationErrors: true,
 		OnSkippedDependency: func(issueID, dependsOnID, reason string) {
 			skipped := fmt.Sprintf("%s -> %s: %s", issueID, dependsOnID, reason)
@@ -81,6 +102,9 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 			skippedDependencySet[skipped] = struct{}{}
 			skippedDependencies = append(skippedDependencies, skipped)
 		},
+		OnStaleRejected: func(issueID string) {
+			staleRejectedSet[issueID] = struct{}{}
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -88,10 +112,14 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 
 	importedIDs := make([]string, 0, len(issues))
 	for _, issue := range issues {
+		if _, rejected := staleRejectedSet[issue.ID]; rejected {
+			staleSkippedIDs = append(staleSkippedIDs, issue.ID)
+			continue
+		}
 		importedIDs = append(importedIDs, issue.ID)
 	}
 	return &ImportResult{
-		Created:             len(issues),
+		Created:             len(importedIDs),
 		Skipped:             len(staleSkippedIDs),
 		ImportedIDs:         importedIDs,
 		StaleSkippedIDs:     staleSkippedIDs,

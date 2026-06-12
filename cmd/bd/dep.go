@@ -371,6 +371,28 @@ type bulkDepInput struct {
 	DependsOnID string `json:"depends_on_id"`
 }
 
+// newCycleThroughEdges runs a whole-graph cycle check inside the bulk-add
+// transaction and returns a rendered cycle path when a cycle actually
+// traverses one of the edges being added, or "" when none does. Endpoint
+// membership is not enough: an issue sitting in a pre-existing committed
+// cycle must not block unrelated bulk wiring that merely touches it
+// (bd-578h9.9). Non-blocking edge types cannot form blocking cycles and are
+// excluded. A failed check returns an error — the bulk add must roll back
+// rather than commit unverified edges (bd-6dnrw.8).
+func newCycleThroughEdges(ctx context.Context, tx storage.Transaction, edges []bulkDepEdge) (string, error) {
+	pairs := make([][2]string, 0, len(edges))
+	for _, edge := range edges {
+		if edge.Type != types.DepBlocks && edge.Type != types.DepConditionalBlocks {
+			continue
+		}
+		pairs = append(pairs, [2]string{edge.IssueID, edge.DependsOnID})
+	}
+	if len(pairs) == 0 {
+		return "", nil
+	}
+	return tx.CycleThroughEdges(ctx, pairs)
+}
+
 type bulkDepEdge struct {
 	Line        int
 	IssueID     string
@@ -421,6 +443,21 @@ func addBulkDependencies(cmd *cobra.Command, file string, defaultType string) {
 			}
 			if err := tx.AddDependencyWithOptions(rootCtx, dep, actor, storage.DependencyAddOptions{SkipCycleCheck: noCycleCheck}); err != nil {
 				return fmt.Errorf("line %d: %w", edge.Line, err)
+			}
+		}
+		if noCycleCheck {
+			// --no-cycle-check skips the per-edge recursive check for bulk
+			// speed, not graph integrity: one whole-graph check still gates
+			// the commit so cycles introduced by these edges roll back
+			// instead of landing and poisoning ready-work (bd-6dnrw.8).
+			// Cycles that predate this bulk add (not touching any added
+			// edge) don't block it.
+			cyclePath, cycleErr := newCycleThroughEdges(rootCtx, tx, resolved)
+			if cycleErr != nil {
+				return fmt.Errorf("final cycle check failed (no edges added): %w", cycleErr)
+			}
+			if cyclePath != "" {
+				return fmt.Errorf("dependency cycle would be created: %s (no edges added; run 'bd dep cycles' for analysis)", cyclePath)
 			}
 		}
 		return nil
@@ -1419,13 +1456,13 @@ func ParseExternalRef(ref string) (project, capability string) {
 func init() {
 	// dep command shorthand flag
 	depCmd.Flags().StringP("blocks", "b", "", "Issue ID that this issue blocks (shorthand for: bd dep add <blocked> <blocker>)")
-	depCmd.Flags().Bool("no-cycle-check", false, "Skip cycle detection after adding (use for bulk wiring — run 'bd dep cycles' to verify afterwards)")
+	depCmd.Flags().Bool("no-cycle-check", false, "Skip per-edge cycle checks for speed (bulk wiring); bulk --file adds still run one final whole-graph check before commit")
 
 	depAddCmd.Flags().StringP("type", "t", "blocks", "Dependency type (blocks|tracks|related|parent-child|discovered-from|until|caused-by|validates|relates-to|supersedes)")
 	depAddCmd.Flags().String("blocked-by", "", "Issue ID that blocks the first issue (alternative to positional arg)")
 	depAddCmd.Flags().String("depends-on", "", "Issue ID that the first issue depends on (alias for --blocked-by)")
 	depAddCmd.Flags().String("file", "", "Read dependency edges from JSONL file, or '-' for stdin")
-	depAddCmd.Flags().Bool("no-cycle-check", false, "Skip cycle detection after adding (use for bulk wiring — run 'bd dep cycles' to verify afterwards)")
+	depAddCmd.Flags().Bool("no-cycle-check", false, "Skip per-edge cycle checks for speed (bulk wiring); bulk --file adds still run one final whole-graph check before commit")
 
 	depTreeCmd.Flags().Bool("show-all-paths", false, "Show all paths to nodes (no deduplication for diamond dependencies)")
 	depTreeCmd.Flags().IntP("max-depth", "d", 50, "Maximum tree depth to display (safety limit)")

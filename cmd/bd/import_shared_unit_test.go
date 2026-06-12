@@ -11,11 +11,19 @@ import (
 
 type fakeImportIssueLookupStore struct {
 	storage.DoltStorage
-	issues []*types.Issue
+	issues     []*types.Issue
+	created    []*types.Issue
+	createOpts []storage.BatchCreateOptions
 }
 
 func (f *fakeImportIssueLookupStore) GetIssuesByIDs(_ context.Context, _ []string) ([]*types.Issue, error) {
 	return f.issues, nil
+}
+
+func (f *fakeImportIssueLookupStore) CreateIssuesWithFullOptions(_ context.Context, issues []*types.Issue, _ string, opts storage.BatchCreateOptions) error {
+	f.created = append(f.created, issues...)
+	f.createOpts = append(f.createOpts, opts)
+	return nil
 }
 
 func TestFilterStaleImportIssuesSkipsOlderIncomingRecords(t *testing.T) {
@@ -77,5 +85,57 @@ func TestImportIssuesCoreReportsStaleSkippedIDs(t *testing.T) {
 	}
 	if len(result.StaleSkippedIDs) != 1 || result.StaleSkippedIDs[0] != "bd-stale" {
 		t.Fatalf("StaleSkippedIDs = %#v, want [bd-stale]", result.StaleSkippedIDs)
+	}
+}
+
+// bd-6dnrw.9: --allow-stale must bypass the stale guard so deliberately
+// restoring an older snapshot actually writes rows instead of silently
+// no-oping per row.
+func TestImportIssuesCoreAllowStaleImportsOlderRows(t *testing.T) {
+	base := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	store := &fakeImportIssueLookupStore{issues: []*types.Issue{
+		{ID: "bd-stale", UpdatedAt: base.Add(time.Hour)},
+	}}
+
+	result, err := importIssuesCore(context.Background(), "", store, []*types.Issue{
+		{ID: "bd-stale", Title: "stale snapshot", UpdatedAt: base},
+	}, ImportOptions{AllowStale: true})
+	if err != nil {
+		t.Fatalf("importIssuesCore: %v", err)
+	}
+	if result.Created != 1 {
+		t.Fatalf("Created = %d, want 1", result.Created)
+	}
+	if result.Skipped != 0 || len(result.StaleSkippedIDs) != 0 {
+		t.Fatalf("Skipped = %d, StaleSkippedIDs = %#v, want none", result.Skipped, result.StaleSkippedIDs)
+	}
+	if len(store.created) != 1 || store.created[0].ID != "bd-stale" {
+		t.Fatalf("store.created = %#v, want the stale row written", store.created)
+	}
+}
+
+// bd-pkim8: the pre-filter alone is racy (read-then-upsert), so importIssuesCore
+// must also arm the transactional guard inside the batch write — except under
+// --allow-stale, where overwriting newer local rows is the requested behavior.
+func TestImportIssuesCoreArmsTransactionalStaleGuard(t *testing.T) {
+	base := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	issue := func() []*types.Issue {
+		return []*types.Issue{{ID: "bd-race", Title: "snapshot", UpdatedAt: base}}
+	}
+
+	store := &fakeImportIssueLookupStore{}
+	if _, err := importIssuesCore(context.Background(), "", store, issue(), ImportOptions{}); err != nil {
+		t.Fatalf("importIssuesCore: %v", err)
+	}
+	if len(store.createOpts) != 1 || !store.createOpts[0].RejectStaleUpserts {
+		t.Fatalf("createOpts = %#v, want RejectStaleUpserts armed by default", store.createOpts)
+	}
+
+	store = &fakeImportIssueLookupStore{}
+	if _, err := importIssuesCore(context.Background(), "", store, issue(), ImportOptions{AllowStale: true}); err != nil {
+		t.Fatalf("importIssuesCore (allow-stale): %v", err)
+	}
+	if len(store.createOpts) != 1 || store.createOpts[0].RejectStaleUpserts {
+		t.Fatalf("createOpts = %#v, want RejectStaleUpserts disarmed under --allow-stale", store.createOpts)
 	}
 }
