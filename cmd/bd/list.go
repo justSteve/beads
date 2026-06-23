@@ -662,7 +662,7 @@ var listCmd = &cobra.Command{
 }
 
 func init() {
-	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Comma-separated for multiple: --status open,in_progress")
+	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Comma-separated for multiple: --status open,in_progress. Note: repeating -s/--status silently overwrites the previous value — always use the comma-separated form for multi-status filters.")
 	listCmd.Flags().String("state", "", "Alias for --status")
 	_ = listCmd.Flags().MarkHidden("state")
 	registerPriorityFlag(listCmd, "")
@@ -723,8 +723,8 @@ func init() {
 	// Gate filtering: exclude gate issues by default (bd-7zka.2)
 	listCmd.Flags().Bool("include-gates", false, "Include gate issues in output (normally hidden)")
 
-	// Infra type filtering: exclude agent/rig/role/message by default
-	listCmd.Flags().Bool("include-infra", false, "Include infrastructure beads (agent/rig/role/message) in output")
+	// Infra type filtering: exclude agent/role/message by default
+	listCmd.Flags().Bool("include-infra", false, "Include infrastructure beads (agent/role/message) in output")
 
 	// Explicit type exclusion
 	listCmd.Flags().StringSlice("exclude-type", nil, "Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)")
