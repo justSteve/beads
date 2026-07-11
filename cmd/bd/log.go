@@ -90,11 +90,16 @@ func init() {
 	rootCmd.AddCommand(logCmd)
 }
 
+func fatalLogError(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	os.Exit(1)
+}
+
 func runLog(cmd *cobra.Command, args []string) {
 	// Find project root
 	projectRoot, err := findProjectRoot()
 	if err != nil {
-		FatalError("Not in a beads project (no .beads directory found)")
+		fatalLogError("Not in a beads project (no .beads directory found)")
 	}
 
 	logPath := filepath.Join(projectRoot, ".beads", "events.log")
@@ -114,20 +119,20 @@ func runLog(cmd *cobra.Command, args []string) {
 	if logSince != "" {
 		sinceTime, err = time.Parse(time.RFC3339, logSince)
 		if err != nil {
-			FatalError("Invalid --since format: %v (use RFC3339, e.g., 2024-12-11T15:00:00Z)", err)
+			fatalLogError("Invalid --since format: %v (use RFC3339, e.g., 2024-12-11T15:00:00Z)", err)
 		}
 	}
 	if logUntil != "" {
 		untilTime, err = time.Parse(time.RFC3339, logUntil)
 		if err != nil {
-			FatalError("Invalid --until format: %v (use RFC3339, e.g., 2024-12-11T15:00:00Z)", err)
+			fatalLogError("Invalid --until format: %v (use RFC3339, e.g., 2024-12-11T15:00:00Z)", err)
 		}
 	}
 
 	// Read and filter events
 	events, err := readEvents(logPath, sinceTime, untilTime)
 	if err != nil {
-		FatalError("Failed to read event log: %v", err)
+		fatalLogError("Failed to read event log: %v", err)
 	}
 
 	// Apply filters
@@ -310,7 +315,7 @@ func showSummary(events []Event) {
 func followLog(logPath string) {
 	file, err := os.Open(logPath)
 	if err != nil {
-		FatalError("Failed to open log file: %v", err)
+		fatalLogError("Failed to open log file: %v", err)
 	}
 	defer file.Close()
 
