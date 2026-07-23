@@ -12,6 +12,16 @@ bd prime                    # re-read PRIME.md for full context
 
 If no bead covers the work, create one with `bd create`. Minor housekeeping (typos, config tweaks) is exempt.
 
+## Read First — Upstream Sources
+
+Upstream keeps the authoritative workflow, build, storage, and UI rules in these
+files. Read them for mechanism; this file carries the enterprise layer on top.
+
+- **Workflow and safety**: [AGENTS.md](AGENTS.md)
+- **Detailed agent operations**: [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md)
+- **Architecture orientation**: [engdocs/CLAUDE.md](engdocs/CLAUDE.md)
+- **PR maintenance policy**: [PR_MAINTAINER_GUIDELINES.md](PR_MAINTAINER_GUIDELINES.md)
+
 ## Beads Issue Tracker
 
 This project uses **bd (beads)** for issue tracking. Run `bd prime` for full context.
