@@ -31,8 +31,11 @@ func parseIssueID(input string, prefix string) string {
 // Supports:
 // - Full IDs: "bd-a3f8e9" or "a3f8e9" → "bd-a3f8e9"
 // - Without hyphen: "bda3f8e9" or "wya3f8e9" → "bd-a3f8e9"
-// - Partial IDs: "a3f8" → "bd-a3f8e9" (if unique match)
+// - Partial IDs: "a3f8" → "bd-a3f8e9" (if it is a unique *prefix* of the hash)
 // - Hierarchical: "a3f8e9.1" → "bd-a3f8e9.1"
+//
+// Partial matching is PREFIX matching, not substring matching: "a3f8" resolves
+// "bd-a3f8e9", but "3f8e" and "8e9" do not. See hashMatchesPartial for why.
 //
 // Returns an error if:
 // - No issue found matching the ID
@@ -106,11 +109,18 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 		return issues[0].ID, nil
 	}
 
-	// If exact match failed, try substring search.
+	// If exact match failed, try partial (prefix) resolution.
 	// Use the hash part as a search query to leverage SQL-level filtering
 	// (id LIKE %hash%) instead of loading ALL issues into memory.
 	// On large databases (23k+ issues over MySQL wire protocol), loading all
 	// issues took 60+ seconds; with SQL filtering it's near-instant.
+	//
+	// NOTE: the SQL predicate is deliberately a substring LIKE. It is only a
+	// cheap *candidate narrowing* step and returns a superset; hashMatchesPartial
+	// below is the authoritative filter and rejects non-prefix candidates. The
+	// SQL is left as-is because SearchIssueIDs' query parameter is shared with
+	// `bd search`, whose substring-over-title semantics are intentional.
+	// filter.Limit is left unset, so the superset is never truncated.
 	hashPart := strings.TrimPrefix(normalizedID, prefixWithHyphen)
 	searchPart, ok := partialIDSearchPart(hashPart)
 	if !ok {
@@ -153,13 +163,13 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 			// Don't break - keep searching in case there's a full ID match
 		}
 
-		// Check if the issue hash contains the input hash as substring
-		if strings.Contains(issueHash, hashPart) {
+		// Check if the input hash is a prefix of the issue hash
+		if hashMatchesPartial(issueHash, hashPart) {
 			matches = append(matches, id)
 		}
 	}
 
-	// Prefer exact match over substring matches
+	// Prefer exact match over partial (prefix) matches
 	if exactMatch != "" {
 		return exactMatch, nil
 	}
@@ -185,7 +195,7 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 				if wHash == hashPart {
 					exactMatch = wID
 				}
-				if strings.Contains(wHash, hashPart) {
+				if hashMatchesPartial(wHash, hashPart) {
 					matches = append(matches, wID)
 				}
 			}
@@ -209,6 +219,34 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 	}
 
 	return matches[0], nil
+}
+
+// hashMatchesPartial reports whether hashPart is an acceptable partial form of
+// issueHash. Partial IDs are matched as a PREFIX of the hash.
+//
+// This was `strings.Contains` until [co-bfwpn]. Substring matching meant an
+// arbitrary fragment silently resolved to a full ID: with `co-fi9bx` in the
+// store, `bd show co-9bx` and even `bd show co-i9b` both resolved to it. On a
+// mutating verb — `bd close`, `bd update`, `bd delete`, all of which resolve
+// through this same function — a mistyped or front-truncated ID could act on a
+// bead the operator never named, with no warning.
+//
+// Prefix is the semantics the rest of the codebase already claims:
+//   - ResolvePartialID's own doc comment says "ambiguous prefix"
+//   - docs/core-concepts/hash-ids.md illustrates only prefixes
+//     ("bd show a1b2  # Finds bd-a1b2...")
+//   - `bd search --help` calls partial-ID matching a "fast prefix match"
+//   - no test ever covered the non-prefix substring case
+//
+// The one place substring was stated as intended is a CHANGELOG entry
+// ("Substring ID Matching", CHANGELOG.md), so this is a deliberate and
+// documented divergence from upstream gastownhall/beads, not a bug-for-bug fix.
+//
+// Ambiguity is handled by the caller, which errors and lists every candidate
+// rather than picking one. Narrowing to prefix also removes false ambiguities:
+// `co-9b` used to collide with `co-59b4` (substring) and now does not.
+func hashMatchesPartial(issueHash, hashPart string) bool {
+	return strings.HasPrefix(issueHash, hashPart)
 }
 
 func partialIDSearchPart(hashPart string) (string, bool) {
