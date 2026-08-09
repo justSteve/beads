@@ -9,14 +9,15 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 var (
-	sandboxDir      string
-	sandboxKeep     bool
-	sandboxWith     string
-	sandboxIssues   int
-	sandboxPrefix   string
+	sandboxDir    string
+	sandboxKeep   bool
+	sandboxWith   string
+	sandboxIssues int
+	sandboxPrefix string
 )
 
 var sandboxCmd = &cobra.Command{
@@ -64,11 +65,11 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("Creating sandbox at %s...\n\n", accentStyle.Render(dir))
+	fmt.Printf("Creating sandbox at %s...\n\n", ui.AccentStyle.Render(dir))
 
 	// Initialize git repo
 	if verbose {
-		fmt.Println(mutedStyle.Render("Initializing git repository..."))
+		fmt.Println(ui.MutedStyle.Render("Initializing git repository..."))
 	}
 	gitInit := exec.Command("git", "init")
 	gitInit.Dir = dir
@@ -78,7 +79,7 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 
 	// Initialize beads
 	if verbose {
-		fmt.Println(mutedStyle.Render("Initializing beads project..."))
+		fmt.Println(ui.MutedStyle.Render("Initializing beads project..."))
 	}
 	bdInit := exec.Command("bd", "init", "--prefix="+sandboxPrefix)
 	bdInit.Dir = dir
@@ -106,7 +107,7 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 	// Copy example scripts if requested
 	if sandboxWith != "" {
 		if err := copyExampleScripts(dir, sandboxWith); err != nil {
-			fmt.Printf("%s Failed to copy scripts: %v\n", warnStyle.Render("Warning:"), err)
+			fmt.Printf("%s Failed to copy scripts: %v\n", ui.WarnStyle.Render("Warning:"), err)
 		}
 	}
 
@@ -117,7 +118,7 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 
 	// Print summary
 	fmt.Println()
-	fmt.Printf("%s\n", passStyle.Render("Sandbox created successfully!"))
+	fmt.Printf("%s\n", ui.PassStyle.Render("Sandbox created successfully!"))
 	fmt.Println()
 
 	// Show stats
@@ -127,7 +128,7 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 	_ = bdStats.Run()
 
 	fmt.Println()
-	fmt.Println(boldStyle.Render("To use the sandbox:"))
+	fmt.Println(ui.BoldStyle.Render("To use the sandbox:"))
 	fmt.Printf("  cd %s\n", dir)
 	fmt.Println("  bd ready")
 	if sandboxWith != "" {
@@ -139,10 +140,10 @@ func runSandbox(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	if !sandboxKeep {
-		fmt.Println(mutedStyle.Render("Cleanup:"))
+		fmt.Println(ui.MutedStyle.Render("Cleanup:"))
 		fmt.Printf("  rm -rf %s\n", dir)
 		fmt.Println()
-		fmt.Println(warnStyle.Render("Note: Use --keep to preserve the sandbox"))
+		fmt.Println(ui.WarnStyle.Render("Note: Use --keep to preserve the sandbox"))
 	}
 
 	if jsonOutput {

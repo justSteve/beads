@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	publicops "github.com/steveyegge/beads/issueops"
 )
 
 // ClaimResult holds the result of a ClaimIssueInTx call.
@@ -120,17 +121,9 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 	}
 
 	if rowsAffected == 0 {
-		// Query current state inside the same transaction for consistency.
-		var currentAssignee sql.NullString
-		var currentStatus types.Status
-		err := tx.QueryRowContext(ctx, fmt.Sprintf(
-			`SELECT assignee, status FROM %s WHERE id = ?`, issueTable), id).Scan(&currentAssignee, &currentStatus)
+		assignee, currentStatus, err := readClaimStateInTx(ctx, tx, issueTable, id)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get current claim state: %w", err)
-		}
-		assignee := ""
-		if currentAssignee.Valid {
-			assignee = currentAssignee.String
 		}
 		// Idempotent: if already claimed in_progress by the same actor, treat as success.
 		// This supports agent retry workflows where claim may be called multiple
@@ -138,31 +131,48 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		if assignee == actor && currentStatus == types.StatusInProgress {
 			return &ClaimResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
 		}
+		// The refusal carries the state that lost the CAS, read just above in
+		// THIS transaction, so a caller learns who won without parsing the
+		// message. The typed wrapper carries the fields; the PROSE is composed
+		// here, because ClaimConflictError.Error() passes its wrapped refusal
+		// through byte-for-byte — a bare sentinel would reach the caller as
+		// "issue already claimed" with the holder dropped and
+		// beads.ParseClaimConflict unable to recover it. The fragments are the
+		// storage layer's exported ones, which is what keeps the parser and
+		// this producer in step. The sentinel stays matchable through both
+		// wraps, which errors.Is, ParseClaimConflict and the proxied batch
+		// exit code all key on.
+		refusal := fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
 		if assignee != "" && assignee != actor {
+			switch {
 			// A pool-assigned issue reaches here only when the CAS lost for a
 			// non-assignee reason (status changed underneath us): report the
-			// status rather than a misleading held-by-someone refusal.
-			if slices.Contains(pools, assignee) {
-				return nil, fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
-			}
-			if currentStatus == types.StatusOpen {
+			// status rather than a misleading held-by-someone refusal. Checked
+			// FIRST, so a pool alias never falls into the holder-steering copy.
+			case slices.Contains(pools, assignee):
+				// refusal already names the status.
+			case currentStatus == types.StatusOpen:
 				// Do not name a release command here — not `bd unclaim`, not
 				// `bd unclaim --force`. Refusal copy that names one gets
 				// pattern-matched by batch agents into an unclaim+claim
 				// steamroller of live claims (wy-yuclk). Point at the holder;
 				// bd reclaim is safe to name because it only recovers claims
-				// whose lease has already expired. Keep the %w wrap so this
-				// open-but-assigned refusal is still a classifiable claim
-				// conflict: the public IssueClaimer contract promises wrapped
-				// ErrAlreadyClaimed, and errors.Is / ParseClaimConflict (and the
-				// proxied batch exit code) key on it. This mirrors the
-				// domain-stack twin (domain.issueUseCaseImpl.claim, bd-at6rc),
-				// which already wraps the same message.
-				return nil, fmt.Errorf("%w: already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", storage.ErrAlreadyClaimed, assignee)
+				// whose lease has already expired.
+				//
+				// This copy deliberately omits the parseable " by <assignee>"
+				// tail, so ParseClaimConflict recovers the holder from the
+				// typed field rather than the prose (bd-at6rc).
+				refusal = fmt.Errorf("%w: already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", storage.ErrAlreadyClaimed, assignee)
+			default:
+				refusal = fmt.Errorf("%w%s%s", storage.ErrAlreadyClaimed, storage.ClaimedByFragment, assignee)
 			}
-			return nil, fmt.Errorf("%w%s%s", storage.ErrAlreadyClaimed, storage.ClaimedByFragment, assignee)
 		}
-		return nil, fmt.Errorf("%w%s%s", storage.ErrNotClaimable, storage.NotClaimableStatusFragment, currentStatus)
+		return nil, &publicops.ClaimConflictError{
+			IssueID:  id,
+			Assignee: assignee,
+			Status:   currentStatus,
+			Err:      refusal,
+		}
 	}
 
 	// Grant the lease: what makes the claim recoverable — a worker that dies
@@ -187,7 +197,30 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		return nil, fmt.Errorf("failed to record claim event: %w", err)
 	}
 
+	// A claim changes assignee and status, so it journals as an update. The
+	// idempotent re-claim path returns above without writing and journals
+	// nothing.
+	if err := RecordEventInTx(ctx, tx, EventUpdate, id); err != nil {
+		return nil, err
+	}
+
 	return &ClaimResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
+}
+
+// readClaimStateInTx reads one row's coordination columns inside tx — the
+// state a lost compare-and-set reports. Shared by the CAS itself and by the
+// public claim role, so the two cannot disagree about what "the state that
+// refused this claim" means.
+//
+//nolint:gosec // G201: issueTable comes from WispTableRouting (hardcoded constants)
+func readClaimStateInTx(ctx context.Context, tx DBTX, issueTable, id string) (string, types.Status, error) {
+	var assignee sql.NullString
+	var status types.Status
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT assignee, status FROM %s WHERE id = ?`, issueTable), id).Scan(&assignee, &status); err != nil {
+		return "", "", err
+	}
+	return assignee.String, status, nil
 }
 
 // ClaimReadyIssueInTx claims the first currently ready issue matching filter in
@@ -203,7 +236,30 @@ func ClaimReadyIssueInTx(
 	claimFilter.Status = types.StatusOpen
 	claimFilter.Unassigned = true
 	claimFilter.Assignee = nil
+	// Claim only ever delivers the one issue it successfully claims below —
+	// the breaker's job is to bound delivered payloads, and a claim's
+	// payload is always exactly one row regardless of how large the ready
+	// pool it scanned was. So a rig-wide BEADS_MAX_ROWS/--max-rows cap
+	// (sized for bulk list/ready reads) must not fire here, and the scan
+	// itself must stay unbounded (Limit=0): the loop below walks
+	// readyIssues in order and continues past any that are transiently
+	// unclaimable (already claimed by a racing agent, etc), so bounding
+	// the scan to Limit=MaxRows (e.g. BEADS_MAX_ROWS=1 → scan only the
+	// single top-of-queue row) would make claim spuriously return "nothing
+	// to claim" whenever that narrow window is unclaimable, even with
+	// plenty of other ready work available. Clear the cap fields so
+	// GetReadyWorkInTx never returns ErrTooManyRows either.
+	//
+	// This is parity with pre-PR main (which never bounded the claim scan)
+	// and correctness-first: an unbounded scan preserves claim's existing
+	// fairness/ordering guarantee across the whole ready set. A paged scan
+	// that stays bounded while still walking past unclaimable rows is a
+	// reasonable follow-up, but it's a genuine behavior change (not a
+	// MaxRows-cap fix) and is deliberately deferred rather than folded in
+	// here.
 	claimFilter.Limit = 0
+	claimFilter.MaxRows = 0
+	claimFilter.MaxRowsSource = ""
 
 	readyIssues, err := GetReadyWorkInTx(ctx, tx, claimFilter)
 	if err != nil {
@@ -237,13 +293,22 @@ func ClaimPoolAliasesInTx(ctx context.Context, tx DBTX) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseClaimPools(raw), nil
+}
+
+// ParseClaimPools parses a raw claim.pools config value (comma-separated,
+// whitespace-trimmed) into the pool alias list. Shared by the claim CAS
+// (ClaimPoolAliasesInTx, and its domain/db dual) and the cmd-layer reassign
+// fence (bd-98s5c), so the alias set can never drift between --claim and
+// -a/--assignee — the two verbs must agree on which holders are pools.
+func ParseClaimPools(raw string) []string {
 	var pools []string
 	for _, p := range strings.Split(raw, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			pools = append(pools, p)
 		}
 	}
-	return pools, nil
+	return pools
 }
 
 // ClaimableSourceStatusesInTx returns the set of statuses an issue may be

@@ -20,8 +20,13 @@ func TestNewRunner(t *testing.T) {
 	if runner.hooksDir != "/tmp/hooks" {
 		t.Errorf("hooksDir = %q, want %q", runner.hooksDir, "/tmp/hooks")
 	}
-	if runner.timeout != 10*time.Second {
-		t.Errorf("timeout = %v, want %v", runner.timeout, 10*time.Second)
+	// Deliberate fork divergence from upstream's 10s [co-jga]: the default was
+	// raised to 30s to accommodate convoy/wisp autoclose, which does not finish
+	// inside 10s here. Upstream's copy of this test expects 10s; if a future
+	// upstream merge reverts this line, check whether the local requirement
+	// still holds before matching upstream again.
+	if runner.timeout != 30*time.Second {
+		t.Errorf("timeout = %v, want %v", runner.timeout, 30*time.Second)
 	}
 }
 

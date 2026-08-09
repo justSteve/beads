@@ -3,13 +3,25 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// ErrAmbiguousID is the sentinel wrapped into the error ResolvePartialID
+// returns when a partial ID matches more than one issue. Callers use
+// errors.Is(err, ErrAmbiguousID) to distinguish "ambiguous" from
+// "not found" and surface the candidate list instead of a generic failure.
+var ErrAmbiguousID = errors.New("ambiguous issue ID")
+
+type PartialIDResolverStore interface {
+	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+	SearchIssueIDs(ctx context.Context, query string, filter types.IssueFilter) ([]string, error)
+	GetConfig(ctx context.Context, key string) (string, error)
+}
 
 // parseIssueID ensures an issue ID has the configured prefix.
 // If the input already has the prefix (e.g., "bd-a3f8e9"), returns it as-is.
@@ -40,7 +52,7 @@ func parseIssueID(input string, prefix string) string {
 // Returns an error if:
 // - No issue found matching the ID
 // - Multiple issues match (ambiguous prefix)
-func ResolvePartialID(ctx context.Context, store storage.Storage, input string) (string, error) {
+func ResolvePartialID(ctx context.Context, store PartialIDResolverStore, input string) (string, error) {
 	if store == nil {
 		return "", fmt.Errorf("cannot resolve issue ID %q: storage is nil", input)
 	}
@@ -161,10 +173,12 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 		if issueHash == hashPart {
 			exactMatch = id
 			// Don't break - keep searching in case there's a full ID match
-		}
-
-		// Check if the input hash is a prefix of the issue hash
-		if hashMatchesPartial(issueHash, hashPart) {
+		} else if strings.HasPrefix(issueHash, hashPart) {
+			// Leading-prefix abbreviation (documented UX, e.g. "a3f8" -> "a3f8e9...").
+			// HasPrefix rather than Contains: reject interior-substring matches
+			// like "kt8" inside "j0kt8" (GH#4234). Same defect we fixed locally
+			// under co-bfwpn; upstream's version is kept because it also handles
+			// the wisp-ID shape below.
 			matches = append(matches, id)
 		}
 	}
@@ -192,10 +206,14 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 				} else {
 					wHash = wID
 				}
-				if wHash == hashPart {
+				// Wisp IDs are shaped "<prefix>-wisp-<hash>", so wHash here is
+				// the composite "wisp-<hash>". Strip the literal "wisp-" infix
+				// before comparing so bare-hash lookups (e.g. "t3st") resolve
+				// against the isolated hash, not the full "wisp-t3st" string.
+				wispHash := strings.TrimPrefix(wHash, "wisp-")
+				if wHash == hashPart || wispHash == hashPart {
 					exactMatch = wID
-				}
-				if hashMatchesPartial(wHash, hashPart) {
+				} else if strings.HasPrefix(wispHash, hashPart) {
 					matches = append(matches, wID)
 				}
 			}
@@ -215,39 +233,29 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 	sort.Strings(matches)
 
 	if len(matches) > 1 {
-		return "", fmt.Errorf("ambiguous ID %q matches %d issues: %v\nUse more characters to disambiguate", input, len(matches), matches)
+		return "", fmt.Errorf("%w: %q matches %d issues: %v\nUse more characters to disambiguate", ErrAmbiguousID, input, len(matches), matches)
 	}
 
 	return matches[0], nil
 }
 
-// hashMatchesPartial reports whether hashPart is an acceptable partial form of
-// issueHash. Partial IDs are matched as a PREFIX of the hash.
-//
-// This was `strings.Contains` until [co-bfwpn]. Substring matching meant an
-// arbitrary fragment silently resolved to a full ID: with `co-fi9bx` in the
-// store, `bd show co-9bx` and even `bd show co-i9b` both resolved to it. On a
-// mutating verb — `bd close`, `bd update`, `bd delete`, all of which resolve
-// through this same function — a mistyped or front-truncated ID could act on a
+// Partial-ID matching used to be `strings.Contains`, which meant an arbitrary
+// hash fragment silently resolved to a full ID: with `co-fi9bx` in the store,
+// `bd show co-9bx` and even `bd show co-i9b` both resolved to it. Every
+// ID-taking verb — `bd close`, `bd update`, `bd delete` — resolves through
+// here, so on a mutating verb a mistyped or front-truncated ID could act on a
 // bead the operator never named, with no warning.
 //
-// Prefix is the semantics the rest of the codebase already claims:
-//   - ResolvePartialID's own doc comment says "ambiguous prefix"
-//   - docs/core-concepts/hash-ids.md illustrates only prefixes
-//     ("bd show a1b2  # Finds bd-a1b2...")
-//   - `bd search --help` calls partial-ID matching a "fast prefix match"
-//   - no test ever covered the non-prefix substring case
-//
-// The one place substring was stated as intended is a CHANGELOG entry
-// ("Substring ID Matching", CHANGELOG.md), so this is a deliberate and
-// documented divergence from upstream gastownhall/beads, not a bug-for-bug fix.
+// We fixed that locally under [co-bfwpn] with a `hashMatchesPartial` helper.
+// Upstream fixed the identical defect three days later in gastownhall/beads
+// PR #4939, inlining `strings.HasPrefix` at both call sites and additionally
+// stripping the `wisp-` infix so bare-hash lookups resolve against the isolated
+// hash. Upstream's version strictly supersedes ours, so on the 2026-08-09 merge
+// the local helper was dropped in its favour [co-gmlf3]. Prefix semantics are
+// no longer a divergence from upstream — both sides now agree.
 //
 // Ambiguity is handled by the caller, which errors and lists every candidate
-// rather than picking one. Narrowing to prefix also removes false ambiguities:
-// `co-9b` used to collide with `co-59b4` (substring) and now does not.
-func hashMatchesPartial(issueHash, hashPart string) bool {
-	return strings.HasPrefix(issueHash, hashPart)
-}
+// rather than picking one.
 
 func partialIDSearchPart(hashPart string) (string, bool) {
 	if !looksLikePartialIDHash(hashPart) {
@@ -277,7 +285,7 @@ func looksLikePartialIDHash(input string) bool {
 
 // ResolvePartialIDs resolves multiple potentially partial issue IDs.
 // Returns the resolved IDs and any errors encountered.
-func ResolvePartialIDs(ctx context.Context, store storage.Storage, inputs []string) ([]string, error) {
+func ResolvePartialIDs(ctx context.Context, store PartialIDResolverStore, inputs []string) ([]string, error) {
 	var resolved []string
 	for _, input := range inputs {
 		fullID, err := ResolvePartialID(ctx, store, input)

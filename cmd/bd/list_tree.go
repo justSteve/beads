@@ -111,13 +111,19 @@ func compareIssuesByPriority(a, b *types.Issue) int {
 	return utils.NaturalCompareIDs(a.ID, b.ID)
 }
 
-// printPrettyTree recursively prints the issue tree
-// Children are sorted by priority (P0 first) for intuitive reading
-func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string) {
+// printPrettyTree recursively prints the issue tree.
+// Children are ordered by dependency then priority when dr != nil (--deps), else
+// by priority (P0 first) for intuitive reading. When dr is set, each node's
+// dependency edges are annotated just beneath it.
+func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, prefix string, dr *depRender) {
 	children := childrenMap[parentID]
 
-	// Sort children by priority using same comparison as roots for consistency
-	slices.SortFunc(children, compareIssuesByPriority)
+	if dr != nil {
+		children = orderSiblingsByDeps(children, dr.allDeps)
+	} else {
+		// Sort children by priority using same comparison as roots for consistency
+		slices.SortFunc(children, compareIssuesByPriority)
+	}
 
 	for i, child := range children {
 		isLast := i == len(children)-1
@@ -131,18 +137,28 @@ func printPrettyTree(childrenMap map[string][]*types.Issue, parentID string, pre
 		if isLast {
 			extension = "    "
 		}
-		printPrettyTree(childrenMap, child.ID, prefix+extension)
+		dr.annotationsFor(child.ID, prefix+extension)
+		printPrettyTree(childrenMap, child.ID, prefix+extension, dr)
 	}
 }
 
 // displayPrettyList displays issues in pretty tree format (GH#654)
 // Uses buildIssueTree which only supports dotted ID hierarchy
 func displayPrettyList(issues []*types.Issue, showHeader bool) {
-	displayPrettyListWithDeps(issues, showHeader, nil)
+	displayPrettyListWithDeps(issues, showHeader, nil, false)
 }
 
-// displayPrettyListWithDeps displays issues in tree format using dependency data
-func displayPrettyListWithDeps(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency) {
+// displayPrettyListWithDeps displays issues in tree format using dependency data.
+func displayPrettyListWithDeps(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, truncated bool) {
+	displayPrettyListWithDepsMode(issues, showHeader, allDeps, "", truncated)
+}
+
+// displayPrettyListWithDepsMode displays issues in tree format. When depsMode is
+// "scheduling" or "all", the tree also annotates each node's dependency edges and
+// orders siblings by their scheduling dependencies (see orderSiblingsByDeps). An
+// empty depsMode is the plain parent-child tree. truncated means the page was cut
+// by --limit; the summary then says "Showing N" instead of "Total: N" (GH#5362).
+func displayPrettyListWithDepsMode(issues []*types.Issue, showHeader bool, allDeps map[string][]*types.Dependency, depsMode string, truncated bool) {
 	if showHeader {
 		// Clear screen and show header
 		fmt.Print("\033[2J\033[H")
@@ -159,12 +175,23 @@ func displayPrettyListWithDeps(issues []*types.Issue, showHeader bool, allDeps m
 
 	roots, childrenMap := buildIssueTreeWithDeps(issues, allDeps)
 
-	for _, issue := range roots {
-		fmt.Println(formatPrettyIssue(issue))
-		printPrettyTree(childrenMap, issue.ID, "")
+	var dr *depRender
+	if depsMode != "" {
+		inView := make(map[string]*types.Issue, len(issues))
+		for _, issue := range issues {
+			inView[issue.ID] = issue
+		}
+		dr = &depRender{mode: depsMode, allDeps: allDeps, inView: inView}
+		roots = orderSiblingsByDeps(roots, allDeps)
 	}
 
-	// Summary
+	for _, issue := range roots {
+		fmt.Println(formatPrettyIssue(issue))
+		dr.annotationsFor(issue.ID, "")
+		printPrettyTree(childrenMap, issue.ID, "", dr)
+	}
+
+	// Summary — counts describe the shown page; never label a truncated page "Total".
 	fmt.Println()
 	fmt.Println(strings.Repeat("-", 80))
 	openCount := 0
@@ -177,7 +204,15 @@ func displayPrettyListWithDeps(issues []*types.Issue, showHeader bool, allDeps m
 			inProgressCount++
 		}
 	}
-	fmt.Printf("Total: %d issues (%d open, %d in progress)\n", len(issues), openCount, inProgressCount)
+	if truncated {
+		fmt.Printf("Showing %d issues (%d open, %d in progress); more match (truncated by --limit). Use --limit 0 for all.\n",
+			len(issues), openCount, inProgressCount)
+	} else {
+		fmt.Printf("Total: %d issues (%d open, %d in progress)\n", len(issues), openCount, inProgressCount)
+	}
 	fmt.Println()
 	fmt.Println("Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred")
+	if dr != nil {
+		fmt.Printf("Deps:   %s = depends-on / relationship (points to target); siblings ordered so dependencies come first; ↗ = target outside current view\n", depGlyph)
+	}
 }

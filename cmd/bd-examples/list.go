@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 var listCategory string
@@ -92,11 +93,11 @@ func listTable(scripts []Script) error {
 		first = false
 
 		// Category header
-		fmt.Printf("%s %s\n", boldStyle.Render(string(cat)), mutedStyle.Render("- "+CategoryDescription(cat)))
+		fmt.Printf("%s %s\n", ui.BoldStyle.Render(string(cat)), ui.MutedStyle.Render("- "+CategoryDescription(cat)))
 
 		for _, s := range catScripts {
 			// Script line
-			fmt.Printf("  %s\n", accentStyle.Render(s.Path))
+			fmt.Printf("  %s\n", ui.AccentStyle.Render(s.Path))
 
 			// Description
 			fmt.Printf("    %s\n", s.Description)
@@ -113,22 +114,22 @@ func listTable(scripts []Script) error {
 			var modeStr string
 			switch s.DryRunMode {
 			case DryRunSafe:
-				modeStr = passStyle.Render("safe")
+				modeStr = ui.PassStyle.Render("safe")
 			case DryRunIntercept:
-				modeStr = warnStyle.Render("intercept")
+				modeStr = ui.WarnStyle.Render("intercept")
 			case DryRunNative:
-				modeStr = passStyle.Render("native --dry-run")
+				modeStr = ui.PassStyle.Render("native --dry-run")
 			case DryRunBlock:
-				modeStr = failStyle.Render("blocked")
+				modeStr = ui.FailStyle.Render("blocked")
 			}
 			details = append(details, fmt.Sprintf("Dry-run: %s", modeStr))
 
 			// Interactive
 			if s.Interactive {
-				details = append(details, warnStyle.Render("interactive"))
+				details = append(details, ui.WarnStyle.Render("interactive"))
 			}
 
-			fmt.Printf("    %s\n", mutedStyle.Render(strings.Join(details, " | ")))
+			fmt.Printf("    %s\n", ui.MutedStyle.Render(strings.Join(details, " | ")))
 		}
 	}
 

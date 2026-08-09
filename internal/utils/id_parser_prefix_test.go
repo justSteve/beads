@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -83,6 +84,11 @@ func newFakeIDStore() *fakeIDStore {
 			"co-59b4",
 			"co-bfwpn",
 			"co-3q1cu",
+			// Hierarchical child. Carries the prefix-vs-substring cases that
+			// TestHashMatchesPartial covered directly; that unit test went away
+			// with the hashMatchesPartial helper on the 2026-08-09 upstream merge
+			// [co-gmlf3], so its coverage moves here, end-to-end.
+			"co-3d0.1",
 		},
 	}
 }
@@ -138,6 +144,18 @@ func TestResolvePartialID_PrefixNotSubstring(t *testing.T) {
 			wantErr: "no issue found matching",
 		},
 
+		// --- hierarchical children follow the same prefix rule ---
+		{
+			name:  "hierarchical child by parent prefix resolves",
+			input: "co-3d0",
+			want:  "co-3d0.1",
+		},
+		{
+			name:    "hierarchical non-prefix fragment does not resolve",
+			input:   "co-d0.1",
+			wantErr: "no issue found matching",
+		},
+
 		// --- unrelated IDs still error cleanly ---
 		{
 			name:    "nonexistent id errors",
@@ -184,8 +202,12 @@ func TestResolvePartialID_AmbiguousPrefixListsCandidates(t *testing.T) {
 	}
 	msg := err.Error()
 
-	if !strings.Contains(msg, "ambiguous ID") {
-		t.Errorf("error %q does not report ambiguity", msg)
+	// Assert on the sentinel rather than the wording. This used to match the
+	// literal "ambiguous ID"; upstream introduced ErrAmbiguousID ("ambiguous
+	// issue ID") and the string assertion broke on the 2026-08-09 merge without
+	// any behaviour changing [co-gmlf3]. errors.Is cannot rot the same way.
+	if !errors.Is(err, ErrAmbiguousID) {
+		t.Errorf("error %q is not ErrAmbiguousID", msg)
 	}
 	for _, want := range []string{"co-9b4", "co-9bqqq"} {
 		if !strings.Contains(msg, want) {
@@ -264,26 +286,102 @@ func TestResolvePartialIDs_BatchRejectsSubstring(t *testing.T) {
 	}
 }
 
-func TestHashMatchesPartial(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Upstream tests for the unexported prefix normalizer, carried in from
+// gastownhall/beads. The same filename was added independently on both sides;
+// the two test sets are unrelated, so both are kept.
+// ---------------------------------------------------------------------------
+
+// TestParseIssueID covers the unexported prefix normalizer, so it lives in
+// package utils. It is split out from the store-backed resolution tests
+// because those import internal/storage/dolt, which reaches this package
+// again through internal/workapi — an import cycle for an in-package test.
+// The store-backed half is an external test package for that reason.
+
+func TestParseIssueID(t *testing.T) {
 	tests := []struct {
-		issueHash string
-		hashPart  string
-		want      bool
+		name     string
+		input    string
+		prefix   string
+		expected string
 	}{
-		{"fi9bx", "fi9bx", true}, // full
-		{"fi9bx", "fi", true},    // prefix
-		{"fi9bx", "f", true},     // single-char prefix
-		{"fi9bx", "9bx", false},  // trailing fragment
-		{"fi9bx", "i9b", false},  // middle fragment
-		{"fi9bx", "x", false},    // last char
-		{"fi9bx", "", true},      // empty is a prefix of everything
-		{"3d0.1", "3d0", true},   // hierarchical child by parent prefix
-		{"3d0.1", "d0.1", false}, // hierarchical, non-prefix
+		{
+			name:     "already has prefix",
+			input:    "bd-a3f8e9",
+			prefix:   "bd-",
+			expected: "bd-a3f8e9",
+		},
+		{
+			name:     "missing prefix",
+			input:    "a3f8e9",
+			prefix:   "bd-",
+			expected: "bd-a3f8e9",
+		},
+		{
+			name:     "hierarchical with prefix",
+			input:    "bd-a3f8e9.1.2",
+			prefix:   "bd-",
+			expected: "bd-a3f8e9.1.2",
+		},
+		{
+			name:     "hierarchical without prefix",
+			input:    "a3f8e9.1.2",
+			prefix:   "bd-",
+			expected: "bd-a3f8e9.1.2",
+		},
+		{
+			name:     "custom prefix with ID",
+			input:    "ticket-123",
+			prefix:   "ticket-",
+			expected: "ticket-123",
+		},
+		{
+			name:     "custom prefix without ID",
+			input:    "123",
+			prefix:   "ticket-",
+			expected: "ticket-123",
+		},
 	}
 
 	for _, tt := range tests {
-		if got := hashMatchesPartial(tt.issueHash, tt.hashPart); got != tt.want {
-			t.Errorf("hashMatchesPartial(%q, %q) = %v, want %v", tt.issueHash, tt.hashPart, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseIssueID(tt.input, tt.prefix)
+			if result != tt.expected {
+				t.Errorf("parseIssueID(%q, %q) = %q; want %q", tt.input, tt.prefix, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestLooksLikePrefixedID(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"aap-4ar", true},
+		{"bd-abc123", true},
+		{"hq-xyz", true},
+		{"cr-99", true},
+		{"myproj-task1", true},
+		{"a-b", true},        // minimal valid prefix
+		{"abc12345-x", true}, // 8-char prefix (max)
+
+		// Invalid cases
+		{"abc", false},         // no hyphen
+		{"", false},            // empty
+		{"-abc", false},        // hyphen at start
+		{"ABC-123", false},     // uppercase
+		{"abcdefghi-x", false}, // prefix too long (9 chars)
+		{"abc-", false},        // empty suffix
+		{"abc--def", false},    // suffix starts with hyphen
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := looksLikePrefixedID(tt.input)
+			if result != tt.expected {
+				t.Errorf("looksLikePrefixedID(%q) = %v; want %v", tt.input, result, tt.expected)
+			}
+		})
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -545,14 +544,12 @@ func TestGetClaudePluginVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			// Temporarily override home directory (bd-1bac: use platform-specific var)
-			homeEnv := "HOME"
-			if runtime.GOOS == "windows" {
-				homeEnv = "USERPROFILE"
-			}
-			origHome := os.Getenv(homeEnv)
-			os.Setenv(homeEnv, tmpHome)
-			defer os.Setenv(homeEnv, origHome)
+			// Temporarily override the home directory. GetClaudePluginVersion resolves it
+			// with os.UserHomeDir(), which reads USERPROFILE on Windows and HOME elsewhere,
+			// so both must be set for this to be portable (t.Setenv also restores them).
+			// Supersedes our bd-1bac platform-specific fix, which set only one of the two.
+			t.Setenv("HOME", tmpHome)
+			t.Setenv("USERPROFILE", tmpHome)
 
 			version, installed, err := doctor.GetClaudePluginVersion()
 

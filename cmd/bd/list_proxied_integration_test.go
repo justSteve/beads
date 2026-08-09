@@ -728,6 +728,46 @@ func TestProxiedServerList(t *testing.T) {
 		}
 	})
 
+	// The cap is HONORED on this route now. It used to be rejected outright,
+	// because the proxied repository path (internal/storage/domain/db) read no
+	// MaxRows at all and honoring it would have meant silence (be-x42v.4). The
+	// answer is the cap firing, with the same text and the same exit code the
+	// direct route prints.
+	t.Run("max_rows_flag_fires", func(t *testing.T) {
+		out := bdProxiedListFail(t, bd, p, "--max-rows", "1")
+		if strings.Contains(out, "not supported in proxied-server mode") {
+			t.Fatalf("--max-rows is refused under --proxied-server; the cap threads this route now: %s", out)
+		}
+		if !strings.Contains(out, "too many rows") || !strings.Contains(out, "--max-rows=1") {
+			t.Errorf("expected the cap to fire naming its source, got: %s", out)
+		}
+	})
+
+	t.Run("max_rows_env_fires", func(t *testing.T) {
+		fullArgs := []string{"list"}
+		stdout, stderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir,
+			[]string{"BEADS_MAX_ROWS=1"}, fullArgs...)
+		if err == nil {
+			t.Fatalf("expected BEADS_MAX_ROWS under proxied-server to trip the cap, but it succeeded:\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+		out := stdout + stderr
+		if strings.Contains(out, "not supported in proxied-server mode") {
+			t.Fatalf("BEADS_MAX_ROWS is refused under --proxied-server; the cap threads this route now: %s", out)
+		}
+		if !strings.Contains(out, "too many rows") || !strings.Contains(out, "BEADS_MAX_ROWS=1") {
+			t.Errorf("expected the cap to fire naming its source, got: %s", out)
+		}
+	})
+
+	t.Run("allow_max_rows_zero", func(t *testing.T) {
+		// --max-rows 0 explicitly disables the cap, so it must not trip the
+		// proxied-server rejection.
+		issues := bdProxiedListJSON(t, bd, p, "--max-rows", "0", "--all")
+		if len(issues) == 0 {
+			t.Error("--max-rows 0 --all under proxied-server unexpectedly returned no issues")
+		}
+	})
+
 	// --- O. Lightweight race: 4 workers × 5 (create + list) iterations ---
 
 	t.Run("concurrent_create_and_list", func(t *testing.T) {

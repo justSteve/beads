@@ -21,7 +21,7 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 	if err != nil {
 		return nil, err
 	}
-	out, err := runReadyCountsInTx(ctx, tx, IssuesFilterTables, filter.Limit, issuePreds, wispDepsExist, false)
+	out, err := runReadyCountsInTx(ctx, tx, IssuesFilterTables, filter.Limit, issuePreds, wispDepsExist, sqlbuild.CountsHydration{})
 	if err != nil {
 		return nil, err
 	}
@@ -31,25 +31,25 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return nil, fmt.Errorf("get ready work with counts: wisp probe: %w", probeErr)
 	}
 	if empty {
-		return out, nil
+		return finishReadyWorkWithCounts(out, filter)
 	}
 	if !wispDepsExist {
-		return out, nil
+		return finishReadyWorkWithCounts(out, filter)
 	}
 
 	wispPreds, err := buildReadyWorkPredicates(ctx, tx, filter, WispsFilterTables)
 	if err != nil {
 		return nil, err
 	}
-	wisps, err := runReadyCountsInTx(ctx, tx, WispsFilterTables, filter.Limit, wispPreds, true, false)
+	wisps, err := runReadyCountsInTx(ctx, tx, WispsFilterTables, filter.Limit, wispPreds, true, sqlbuild.CountsHydration{})
 	if err != nil {
 		if isTableNotExistError(err) {
-			return out, nil
+			return finishReadyWorkWithCounts(out, filter)
 		}
 		return nil, err
 	}
 	if len(wisps) == 0 {
-		return out, nil
+		return finishReadyWorkWithCounts(out, filter)
 	}
 
 	// Prefer the canonical wisp record when an ID exists in both tables (be-iabdi).
@@ -71,10 +71,38 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 	}
 	kept = append(kept, wisps...)
 	sortIssuesWithCountsByPolicy(kept, filter.SortPolicy)
-	if filter.Limit > 0 && len(kept) > filter.Limit {
-		kept = kept[:filter.Limit]
+	return finishReadyWorkWithCounts(kept, filter)
+}
+
+// finishReadyWorkWithCounts is the terminal hook every
+// GetReadyWorkWithCountsInTx exit path routes through: it applies the
+// caller-facing Limit trim and then enforces the defensive MaxRows cap
+// (be-x42v) on the delivered count — mirroring GetReadyWorkInTx's
+// non-counts path, where mergeReadyWisps already trims the merged
+// issues+wisps set to Limit before EnforceMaxRowsCap runs on it.
+//
+// Trim-before-cap matters specifically for the merged (issues+wisps) case:
+// each table's query is independently bounded by
+// EffectiveSearchLimit(filter.Limit, filter.MaxRows), so with
+// --include-ephemeral the merged pre-trim slice can hold up to ~2x that
+// per-table bound — e.g. Limit=2, MaxRows=3, two rows ready in each table
+// merges to 4, which trips MaxRows even though the actually-delivered page
+// (trimmed to Limit=2) is well within the cap. Checking the cap against the
+// delivered/post-trim count instead avoids that false positive.
+//
+// This does not weaken cap enforcement for the single-table (no wisps, or
+// wisps empty/unmerged) paths: EffectiveSearchLimit already bounds a lone
+// query's LIMIT to at most max(Limit, MaxRows+1), so a single source's
+// result never exceeds Limit when Limit>0 and the trim is a no-op there —
+// only the two-source merge can produce more rows than Limit pre-trim.
+func finishReadyWorkWithCounts(items []*types.IssueWithCounts, filter types.WorkFilter) ([]*types.IssueWithCounts, error) {
+	if filter.Limit > 0 && len(items) > filter.Limit {
+		items = items[:filter.Limit]
 	}
-	return kept, nil
+	if err := EnforceMaxRowsCap(len(items), filter.MaxRows, filter.MaxRowsSource); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 // runReadyCountsInTx renders the ready-work counts mega-query for one table
@@ -100,10 +128,15 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 // For limit <= 0 (unbounded) there is no page to push down, so it runs the
 // predicate-form mega-query unchanged.
 //
+// Both callers pass the ZERO hydration, so ready work is always fully
+// hydrated. types.WorkFilter carries neither opt-out — the projection that
+// builds it drops both — and issueops.ListRequest says so where a caller reads
+// it: SkipLabels and SkipCounts are not carried onto the ReadyFlag arm.
+//
 //nolint:gosec // G201: whereSQL/orderBySQL/limitSQL are hardcoded fragments; user input rides ? placeholders.
-func runReadyCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, limit int, preds *readyWorkPredicates, includeWispReverseDeps, skipLabels bool) ([]*types.IssueWithCounts, error) {
+func runReadyCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, limit int, preds *readyWorkPredicates, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
 	if limit <= 0 {
-		return runSearchQueryInTx(ctx, tx, tables, preds.whereSQL, preds.orderBySQL, preds.limitSQL, preds.args, includeWispReverseDeps, skipLabels)
+		return runSearchQueryInTx(ctx, tx, tables, preds.whereSQL, preds.orderBySQL, preds.limitSQL, preds.args, includeWispReverseDeps, hyd)
 	}
 
 	idQuery := fmt.Sprintf("SELECT id FROM %s %s %s %s", tables.Main, preds.whereSQL, preds.orderBySQL, preds.limitSQL)
@@ -123,7 +156,7 @@ func runReadyCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, li
 		if end > len(pageIDs) {
 			end = len(pageIDs)
 		}
-		countsSQL, idArgs := sqlbuild.SearchCountsSQL(tables, pageIDs[start:end], "", "", "", includeWispReverseDeps, skipLabels)
+		countsSQL, idArgs := sqlbuild.SearchCountsSQL(tables, pageIDs[start:end], "", "", "", includeWispReverseDeps, hyd)
 		rows, scanErr := scanCountsRowsInTx(ctx, tx, tables.Main, countsSQL, idArgs)
 		if scanErr != nil {
 			return nil, scanErr

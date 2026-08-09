@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 // Global flags
@@ -18,30 +18,20 @@ var (
 	examplesDir string
 )
 
-// Styles for output
-var (
-	passStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#86b300",
-		Dark:  "#c2d94c",
-	})
-	warnStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#f2ae49",
-		Dark:  "#ffb454",
-	})
-	failStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#f07171",
-		Dark:  "#f07178",
-	})
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#828c99",
-		Dark:  "#6c7680",
-	})
-	accentStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{
-		Light: "#399ee6",
-		Dark:  "#59c2ff",
-	})
-	boldStyle = lipgloss.NewStyle().Bold(true)
-)
+// Output styling comes from internal/ui rather than a local palette.
+//
+// This file used to declare its own six lipgloss styles with the same Ayu hex
+// values internal/ui already defines. The duplication went unnoticed until the
+// 2026-08-09 upstream merge [co-gmlf3], when upstream moved to
+// charm.land/lipgloss/v2 — which drops AdaptiveColor in favour of
+// lipgloss.LightDark — and this file was the only thing in the tree still
+// importing github.com/charmbracelet/lipgloss. That import is no longer in
+// go.mod, so the package stopped building.
+//
+// internal/ui is the right home for it anyway: its init() probes for a dark
+// background only when colour is actually enabled and honours NO_COLOR, neither
+// of which the local copy did. Use ui.PassStyle, ui.WarnStyle, ui.FailStyle,
+// ui.MutedStyle, ui.AccentStyle and ui.BoldStyle here.
 
 var rootCmd = &cobra.Command{
 	Use:   "bd-examples",
@@ -77,7 +67,7 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, failStyle.Render("Error: "+err.Error()))
+		fmt.Fprintln(os.Stderr, ui.FailStyle.Render("Error: "+err.Error()))
 		os.Exit(1)
 	}
 }

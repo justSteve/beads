@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 var checkCmd = &cobra.Command{
@@ -182,11 +183,11 @@ func checkJSON(target string, scripts []Script, results []CheckResult) error {
 }
 
 func checkTable(target string, scripts []Script, results []CheckResult) error {
-	fmt.Printf("Checking prerequisites for %s...\n\n", boldStyle.Render(target))
+	fmt.Printf("Checking prerequisites for %s...\n\n", ui.BoldStyle.Render(target))
 
 	// Show which scripts will be covered
 	if len(scripts) > 1 {
-		fmt.Println(mutedStyle.Render("Scripts:"))
+		fmt.Println(ui.MutedStyle.Render("Scripts:"))
 		for _, s := range scripts {
 			fmt.Printf("  %s\n", s.Path)
 		}
@@ -201,18 +202,18 @@ func checkTable(target string, scripts []Script, results []CheckResult) error {
 		var statusStr string
 		switch r.Status {
 		case "pass":
-			statusStr = passStyle.Render("PASS")
+			statusStr = ui.PassStyle.Render("PASS")
 		case "warn":
-			statusStr = warnStyle.Render("WARN")
+			statusStr = ui.WarnStyle.Render("WARN")
 			hasWarnings = true
 		case "fail":
-			statusStr = failStyle.Render("FAIL")
+			statusStr = ui.FailStyle.Render("FAIL")
 			hasFailures = true
 		}
 
 		fmt.Printf("  %-25s %s", r.Name, statusStr)
 		if r.Message != "" {
-			fmt.Printf("  %s", mutedStyle.Render(r.Message))
+			fmt.Printf("  %s", ui.MutedStyle.Render(r.Message))
 		}
 		fmt.Println()
 	}
@@ -221,12 +222,12 @@ func checkTable(target string, scripts []Script, results []CheckResult) error {
 
 	// Summary
 	if hasFailures {
-		fmt.Printf("Overall: %s\n", failStyle.Render("NOT READY"))
+		fmt.Printf("Overall: %s\n", ui.FailStyle.Render("NOT READY"))
 		return fmt.Errorf("prerequisites not met")
 	} else if hasWarnings {
-		fmt.Printf("Overall: %s\n", warnStyle.Render("READY (with warnings)"))
+		fmt.Printf("Overall: %s\n", ui.WarnStyle.Render("READY (with warnings)"))
 	} else {
-		fmt.Printf("Overall: %s\n", passStyle.Render("READY"))
+		fmt.Printf("Overall: %s\n", ui.PassStyle.Render("READY"))
 	}
 
 	return nil

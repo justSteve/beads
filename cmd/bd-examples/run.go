@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 var (
@@ -57,7 +58,7 @@ func runScript(cmd *cobra.Command, args []string) error {
 
 	// Check prerequisites first
 	if verbose {
-		fmt.Println(mutedStyle.Render("Checking prerequisites..."))
+		fmt.Println(ui.MutedStyle.Render("Checking prerequisites..."))
 	}
 	for _, prereq := range script.Prerequisites {
 		result := checkPrereq(prereq)
@@ -90,9 +91,9 @@ func runScript(cmd *cobra.Command, args []string) error {
 	// Determine execution mode
 	dryRun := !runExecute
 	if dryRun {
-		fmt.Printf("%s %s\n", warnStyle.Render("[DRY-RUN]"), accentStyle.Render(scriptPath))
+		fmt.Printf("%s %s\n", ui.WarnStyle.Render("[DRY-RUN]"), ui.AccentStyle.Render(scriptPath))
 	} else {
-		fmt.Printf("%s %s\n", passStyle.Render("[EXECUTE]"), accentStyle.Render(scriptPath))
+		fmt.Printf("%s %s\n", ui.PassStyle.Render("[EXECUTE]"), ui.AccentStyle.Render(scriptPath))
 	}
 
 	// Build command based on dry-run mode
@@ -182,7 +183,7 @@ func runScript(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("script failed: %v", err)
 	}
 
-	fmt.Printf("\n%s\n", passStyle.Render("Script completed successfully"))
+	fmt.Printf("\n%s\n", ui.PassStyle.Render("Script completed successfully"))
 	return nil
 }
 
@@ -190,16 +191,16 @@ func streamOutput(r io.Reader, prefix string, done chan<- bool) {
 	defer func() { done <- true }()
 
 	scanner := bufio.NewScanner(r)
-	prefixStyle := mutedStyle
+	prefixStyle := ui.MutedStyle
 	if prefix == "[STDERR]" {
-		prefixStyle = warnStyle
+		prefixStyle = ui.WarnStyle
 	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		timestamp := time.Now().Format("15:04:05")
 		fmt.Printf("%s %s %s\n",
-			mutedStyle.Render("["+timestamp+"]"),
+			ui.MutedStyle.Render("["+timestamp+"]"),
 			prefixStyle.Render(prefix),
 			line,
 		)

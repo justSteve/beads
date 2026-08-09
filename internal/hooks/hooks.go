@@ -5,6 +5,7 @@ package hooks
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -31,7 +32,18 @@ const maxConcurrentHooks = 4
 type Runner struct {
 	hooksDir string
 	timeout  time.Duration
-	sem      chan struct{}
+	// sem bounds how many hooks run at once [co-jga]. Without it a burst of
+	// events spawns an unbounded number of processes.
+	sem chan struct{}
+
+	// inFlight counts the hooks Run started and has not finished. A bd
+	// command is short: it fires its hooks after the commit and returns, and
+	// the process exit takes every goroutine with it — including one that has
+	// not reached exec yet. Wait is how a caller gives them their moment.
+	//
+	// Kept alongside sem rather than instead of it: the two solve different
+	// problems — sem bounds concurrency, inFlight bounds process lifetime.
+	inFlight sync.WaitGroup
 }
 
 // NewRunner creates a new hook runner.
@@ -70,12 +82,55 @@ func (r *Runner) Run(event string, issue *types.Issue) {
 		return // Not executable, skip
 	}
 
+	// Run asynchronously (ignore error as this is fire-and-forget).
+	// runHook is the same body RunSync runs, so the async path is under the
+	// same per-hook timeout and the same process-group kill on expiry.
+	//
+	// Both guards apply. Acquiring sem first bounds concurrency and can block
+	// the caller when maxConcurrentHooks are already running [co-jga]; the
+	// inFlight count is taken before the goroutine starts so Wait cannot miss a
+	// hook that has been admitted but has not yet reached exec.
 	r.sem <- struct{}{}
+	r.inFlight.Add(1)
 	go func() {
+		defer r.inFlight.Done()
 		defer func() { <-r.sem }()
-		_ = r.runHook(hookPath, event, issue)
+		_ = r.runHook(hookPath, event, issue) // Best effort: hook failures should not block the triggering operation
 	}()
 }
+
+// Wait blocks until every hook Run started has finished, or until timeout,
+// and reports whether they all finished.
+//
+// It exists because fire-and-forget is a promise about the MUTATION, not about
+// the hook: a committed write must never fail because a script did, but a
+// script that never ran at all is a hook that silently did not fire. A CLI
+// process fires its hooks after the commit and then returns from main, and the
+// exit takes the goroutines with it. Calling this at teardown gives them the
+// window; the timeout is what keeps the promise, since a hung script must delay
+// the command's exit by a bounded amount rather than forever.
+//
+// Callers should pass a budget no larger than the per-hook timeout: a hook that
+// outlives its own timeout is being killed anyway.
+func (r *Runner) Wait(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		r.inFlight.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// Timeout is the per-hook budget, which is also the largest budget Wait can
+// usefully be given.
+func (r *Runner) Timeout() time.Duration { return r.timeout }
 
 // RunSync executes a hook synchronously and returns any error.
 // Useful for testing or when you need to wait for the hook.
