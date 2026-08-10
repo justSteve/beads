@@ -96,8 +96,14 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 		return &serveRolesStore{
 			reader:       &serveStubReader{},
 			claimer:      &serveStubClaimer{},
+			batchCloser:  &serveStubBatchCloser{},
+			readyClaimer: &serveStubReadyClaimer{},
+			releaser:     &serveStubReleaser{},
 			lifecycle:    &serveStubLifecycle{},
 			dependencies: &serveStubDependencyEditor{},
+			batchApplier: &serveStubBatchApplier{},
+			metadataCAS:  &serveStubMetadataCAS{},
+			counter:      &serveStubCounter{},
 			inner:        inner,
 		}
 	}
@@ -136,10 +142,52 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 	if !storage.RoleFiresHooks(editorFromTheStore) {
 		t.Fatal("the store's own accessor no longer returns a hook-firing dependency editor; this test proves nothing")
 	}
+	// And for the batch applier, the FOURTH and widest role the decorator wraps:
+	// one call fires on_create, on_update and the close hooks, once per landed
+	// item plus once per distinct edge source. Without this precondition its case
+	// in the RoleFiresHooks switch is held only by a comment.
+	applierFromTheStore, err := chained.BatchApplier()
+	if err != nil {
+		t.Fatalf("BatchApplier: %v", err)
+	}
+	if !storage.RoleFiresHooks(applierFromTheStore) {
+		t.Fatal("the store's own accessor no longer returns a hook-firing batch applier; this test proves nothing")
+	}
+	// And for the compare-and-set, the FIFTH. It arrived with no precondition of
+	// its own, and its case in the RoleFiresHooks switch spent that time held
+	// only by a comment — which is how a rebase that left the case with an EMPTY
+	// BODY went unnoticed by the compiler, by vet, by lint and by CI. A Go type
+	// switch does not fall through, so `case *hookMetadataCAS:` with nothing
+	// under it answers FALSE, and the Listen refusal this whole test exists to
+	// protect was silently disarmed. Both cases are pinned now.
+	casFromTheStore, err := chained.MetadataCAS()
+	if err != nil {
+		t.Fatalf("MetadataCAS: %v", err)
+	}
+	if !storage.RoleFiresHooks(casFromTheStore) {
+		t.Fatal("the store's own accessor no longer returns a hook-firing compare-and-set; this test proves nothing")
+	}
+
+	// And for the releaser, the SIXTH. Its case in the RoleFiresHooks switch
+	// would otherwise be held only by a comment, which is exactly how the
+	// compare-and-set's case above spent time silently empty.
+	releaserFromTheStore, err := chained.Releaser()
+	if err != nil {
+		t.Fatalf("Releaser: %v", err)
+	}
+	if !storage.RoleFiresHooks(releaserFromTheStore) {
+		t.Fatal("the store's own accessor no longer returns a hook-firing releaser; this test proves nothing")
+	}
 
 	roles, err := serveIssueRoles(chained, false)
 	if err != nil {
 		t.Fatalf("serveIssueRoles: %v", err)
+	}
+	if storage.RoleFiresHooks(roles.releaser) {
+		t.Error("bd serve would run this workspace's hooks on every HTTP release")
+	}
+	if roles.releaser != issueops.Releaser(middle.releaser) {
+		t.Errorf("releaser came from %p, want the layer directly beneath the hooks (%p)", roles.releaser, middle.releaser)
 	}
 	reader, claimer := roles.reader, roles.claimer
 	// The same predicate httpapi.Listen refuses on, so a regression here is a
@@ -173,6 +221,30 @@ func TestServeIssueRolesComeFromBeneathTheHookDecorator(t *testing.T) {
 	if roles.dependencyEditor != issueops.DependencyEditor(middle.dependencies) {
 		t.Errorf("dependency editor came from %p, want the layer directly beneath the hooks (%p)",
 			roles.dependencyEditor, middle.dependencies)
+	}
+
+	// The batch applier is the FOURTH, and the one where the peel is worth the
+	// most: its wrapper fires four hook vocabularies from one call — per landed
+	// item, plus once per distinct edge source — so an unpeeled applier serving
+	// one hundred-item plan is up to a hundred of this workspace's own
+	// subprocesses spawned inside a single HTTP request.
+	if storage.RoleFiresHooks(roles.batchApplier) {
+		t.Error("bd serve would run this workspace's hooks once per item of every HTTP plan")
+	}
+	if roles.batchApplier != issueops.BatchApplier(middle.batchApplier) {
+		t.Errorf("batch applier came from %p, want the layer directly beneath the hooks (%p)",
+			roles.batchApplier, middle.batchApplier)
+	}
+
+	// The compare-and-set is the FIFTH, and a coordination loop is its designed
+	// caller — so an unpeeled one runs this workspace's on_update script once per
+	// contended retry, at whatever rate the clients poll.
+	if storage.RoleFiresHooks(roles.metadataCAS) {
+		t.Error("bd serve would run this workspace's hooks on every HTTP compare-and-set")
+	}
+	if roles.metadataCAS != issueops.MetadataCAS(middle.metadataCAS) {
+		t.Errorf("compare-and-set came from %p, want the layer directly beneath the hooks (%p)",
+			roles.metadataCAS, middle.metadataCAS)
 	}
 
 	t.Run("a workspace with hooks disabled has no layer to peel", func(t *testing.T) {
@@ -268,14 +340,29 @@ type serveRolesStore struct {
 	storage.DoltStorage
 	reader       *serveStubReader
 	claimer      *serveStubClaimer
+	batchCloser  *serveStubBatchCloser
+	readyClaimer *serveStubReadyClaimer
+	releaser     *serveStubReleaser
 	lifecycle    *serveStubLifecycle
 	dependencies *serveStubDependencyEditor
+	batchApplier *serveStubBatchApplier
+	metadataCAS  *serveStubMetadataCAS
+	counter      *serveStubCounter
 	inner        storage.DoltStorage
 }
 
 func (s *serveRolesStore) IssueReader() (issueops.Reader, error)   { return s.reader, nil }
 func (s *serveRolesStore) IssueClaimer() (issueops.Claimer, error) { return s.claimer, nil }
 func (s *serveRolesStore) Unwrap() storage.DoltStorage             { return s.inner }
+
+func (s *serveRolesStore) BatchCloser() (issueops.BatchCloser, error)   { return s.batchCloser, nil }
+func (s *serveRolesStore) ReadyClaimer() (issueops.ReadyClaimer, error) { return s.readyClaimer, nil }
+
+// Releaser carries an identifiable value for the same reason, and it is the
+// SIXTH role the decorator wraps: a peel of the wrong depth would hand bd serve
+// a releaser that runs the workspace's hooks once per claim it frees — which a
+// reaper draining abandoned work does in a tight loop.
+func (s *serveRolesStore) Releaser() (issueops.Releaser, error) { return s.releaser, nil }
 
 // IssueLifecycle carries an identifiable value for the same reason the reader
 // and the claimer do: it is one of the roles the hook decorator wraps, so a peel
@@ -291,6 +378,14 @@ func (s *serveRolesStore) DependencyEditor() (issueops.DependencyEditor, error) 
 	return s.dependencies, nil
 }
 
+// BatchApplier carries an identifiable value for the same reason, and it is the
+// FOURTH the decorator wraps: a peel of the wrong depth would hand bd serve an
+// applier that runs the workspace's hooks once per item of every plan it
+// applies.
+func (s *serveRolesStore) BatchApplier() (issueops.BatchApplier, error) {
+	return s.batchApplier, nil
+}
+
 func (*serveRolesStore) WorkspaceConfig() (issueops.WorkspaceConfig, error)     { return nil, nil }
 func (*serveRolesStore) StatsReporter() (issueops.StatsReporter, error)         { return nil, nil }
 func (*serveRolesStore) CycleDetector() (issueops.CycleDetector, error)         { return nil, nil }
@@ -303,6 +398,39 @@ func (*serveRolesStore) Sweeper() (issueops.Sweeper, error)                     
 func (*serveRolesStore) Deleter() (issueops.Deleter, error)                     { return nil, nil }
 func (*serveRolesStore) BatchCreator() (issueops.BatchCreator, error)           { return nil, nil }
 func (*serveRolesStore) Memories() (memoryops.Memories, error)                  { return nil, nil }
+
+// MetadataCAS carries an identifiable value for the same reason, and it is the
+// FIFTH the decorator wraps: a peel of the wrong depth would hand bd serve a
+// compare-and-set that runs the workspace's on_update script once per contended
+// retry round of every coordination loop pointed at this server.
+func (s *serveRolesStore) MetadataCAS() (issueops.MetadataCAS, error) { return s.metadataCAS, nil }
+
+// Counter is declared for a different reason than every accessor above it, and
+// the reason is the one engdocs/ADDING_AN_ISSUEOPS_ROLE.md calls "the step with
+// no number": a role this stub does NOT declare arrives PROMOTED from the
+// embedded storage.DoltStorage, which is nil here, so the first caller to reach
+// it is a nil dereference in somebody else's test rather than a compile error.
+//
+// The count role is not one the hook decorator wraps — it is a READ, so
+// hook_counter.go recurses and hands back the inner surface unwrapped — which is
+// exactly why it needed this: the recursion lands on this type, and this type
+// had no Counter to land on. It went unnoticed until `bd serve` began binding
+// the role, and then it surfaced on one CI runner as a panic in a test about
+// hook peeling.
+func (s *serveRolesStore) Counter() (issueops.Counter, error) { return s.counter, nil }
+
+// serveStubCounter is the count role's stand-in. It answers ErrUnsupported like
+// every stub here: this file's subject is which LAYER a role comes from, never
+// what the role answers.
+type serveStubCounter struct{}
+
+func (*serveStubCounter) Count(context.Context, issueops.CountRequest) (issueops.CountResult, error) {
+	return issueops.CountResult{}, errors.ErrUnsupported
+}
+
+func (*serveStubCounter) CountByGroup(context.Context, issueops.CountByGroupRequest) (issueops.CountByGroupResult, error) {
+	return issueops.CountByGroupResult{}, errors.ErrUnsupported
+}
 
 type serveStubReader struct{}
 
@@ -322,6 +450,27 @@ type serveStubClaimer struct{}
 
 func (*serveStubClaimer) Claim(context.Context, issueops.ClaimRequest) (issueops.ClaimResult, error) {
 	return issueops.ClaimResult{}, errors.ErrUnsupported
+}
+
+// serveStubReadyClaimer is one of the roles the hook decorator does NOT wrap,
+// so it carries no identifiable-value assertion below: this stub exists so the
+// role set is complete.
+type serveStubBatchCloser struct{}
+
+func (*serveStubBatchCloser) CloseBatch(context.Context, issueops.CloseBatchRequest) (issueops.CloseBatchResult, error) {
+	return issueops.CloseBatchResult{}, errors.ErrUnsupported
+}
+
+type serveStubReadyClaimer struct{}
+
+func (*serveStubReadyClaimer) ClaimNext(context.Context, issueops.ClaimNextRequest) (issueops.ClaimNextResult, error) {
+	return issueops.ClaimNextResult{}, errors.ErrUnsupported
+}
+
+type serveStubReleaser struct{}
+
+func (*serveStubReleaser) Release(context.Context, issueops.ReleaseRequest) (issueops.ReleaseResult, error) {
+	return issueops.ReleaseResult{}, errors.ErrUnsupported
 }
 
 type serveStubLifecycle struct{}
@@ -350,4 +499,16 @@ func (*serveStubDependencyEditor) AddDependencies(context.Context, issueops.AddD
 
 func (*serveStubDependencyEditor) RemoveDependency(context.Context, issueops.RemoveDependencyRequest) (issueops.RemoveDependencyResult, error) {
 	return issueops.RemoveDependencyResult{}, errors.ErrUnsupported
+}
+
+type serveStubMetadataCAS struct{}
+
+func (*serveStubMetadataCAS) CompareAndSetKey(context.Context, issueops.CompareAndSetKeyRequest) (issueops.CompareAndSetKeyResult, error) {
+	return issueops.CompareAndSetKeyResult{}, errors.ErrUnsupported
+}
+
+type serveStubBatchApplier struct{}
+
+func (*serveStubBatchApplier) ApplyBatch(context.Context, issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error) {
+	return issueops.ApplyBatchResult{}, errors.ErrUnsupported
 }

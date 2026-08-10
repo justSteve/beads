@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -114,10 +115,23 @@ type Config struct {
 	// Addr is the host:port to bind. The host must be a numeric IP literal;
 	// see ValidateBindAddr.
 	Addr string
-	// AllowNonLoopback permits a bind beyond loopback. v0 has no
-	// authentication and no TLS, so this is an operator decision that is never
-	// taken by default.
+	// AllowNonLoopback permits a bind beyond loopback. There is no TLS, so
+	// this is an operator decision that is never taken by default, and it
+	// requires either Auth or InsecureNoAuth — see ValidateAuthPosture.
 	AllowNonLoopback bool
+	// Auth verifies bearer credentials. NIL MEANS NO AUTHENTICATION, which is
+	// the pre-existing behavior and stays the default on loopback: a zero
+	// Config serves exactly what it served before this field existed.
+	Auth *TokenFileAuth
+	// InsecureNoAuth is the operator's explicit waiver for serving a
+	// non-loopback bind with no credential. It only ever permits; it never
+	// disables a configured Auth (that combination is refused).
+	InsecureNoAuth bool
+	// AllowedHosts are extra Host header values to answer to, beyond the
+	// loopback spellings and the bind address. In a cluster the client dials a
+	// service DNS name, which the rebinding defense would otherwise refuse;
+	// see newHostPolicy. Empty leaves today's policy exactly as it was.
+	AllowedHosts []string
 	// Provider is where every database-touching handler opens its one unit of
 	// work per request.
 	Provider uow.UnitOfWorkProvider
@@ -172,6 +186,24 @@ type Config struct {
 	// server, so a rebuild would buy nothing.
 	Reader  issueops.Reader
 	Claimer issueops.Claimer
+	// BatchCloser closes many issues as one transaction, behind
+	// POST /v0/beads/issues:batchClose. It is its own field rather than a mode
+	// of Lifecycle for the role's reason: the request is the transaction
+	// boundary, and a loop over Lifecycle.Close is N transactions.
+	BatchCloser issueops.BatchCloser
+	// ReadyClaimer is the atomic take of ready work, behind
+	// POST /v0/beads/issues:claimNext. It is its own field rather than a second
+	// verb on Claimer for the reason the role is its own interface: the caller
+	// names a QUESTION and the implementation picks the answer, so selection is
+	// part of the operation and not a patch.
+	ReadyClaimer issueops.ReadyClaimer
+	// Releaser is the claim's inverse, behind
+	// POST /v0/beads/issues/{id}:release. It is its own field rather than a
+	// method on Claimer for the reason the role is its own interface: a caller
+	// entitled to give its own work back is very often not entitled to take
+	// new work, so a surface carrying both hands out a capability it should not
+	// be able to reach.
+	Releaser issueops.Releaser
 	// Lifecycle is the guarded-mutation role behind the issue lifecycle
 	// operations. Required on the same terms as every field here, and the
 	// hook-firing refusal below bites hardest on it: a store's own
@@ -185,7 +217,13 @@ type Config struct {
 	BlockingAnnotator issueops.BlockingAnnotator
 	TreeWalker        issueops.TreeWalker
 	ReadyCounter      issueops.ReadyCounter
-	Querier           issueops.Querier
+	// Counter is the issue-count role behind GET /v0/beads/issues:count. It is
+	// a SEPARATE field from ReadyCounter because it is a separate role: that
+	// one sizes the ready predicate, this one sizes a filter, and neither can
+	// answer the other's question. Required on the same terms as every field
+	// here.
+	Counter issueops.Counter
+	Querier issueops.Querier
 	// Sweeper is the DESTRUCTIVE one, required on the same terms as every other
 	// role rather than opt-in: whether this build erases beads is a decision
 	// for the operator who chose to run bd serve, not a consequence of whether
@@ -199,6 +237,22 @@ type Config struct {
 	// dependency graph is a decision for the operator who chose to run bd serve,
 	// not a consequence of whether a caller remembered a field.
 	DependencyEditor issueops.DependencyEditor
+	// MetadataCAS is the conditional single-key metadata write behind
+	// POST /v0/beads/issues/{id}:casMetadata. Required on the same terms as
+	// every other role: a Config missing it would bind and nil-dereference on
+	// the first request that reached that handler.
+	MetadataCAS issueops.MetadataCAS
+	// BatchApplier is the ordered, heterogeneous plan behind
+	// POST /v0/beads/issues:batchApply. Required on the same terms as every
+	// other role: a Config missing it would bind and nil-dereference on the
+	// first request that reached that handler.
+	//
+	// It is the field where the hook-firing refusal below bites HARDEST. A
+	// store's own accessor returns an applier that fires on_create, on_update
+	// AND the close hooks — once per landed item, plus once per distinct edge
+	// source — so a single hundred-item request served unpeeled would run a
+	// hundred of the workspace's subprocesses inside one HTTP call.
+	BatchApplier issueops.BatchApplier
 	// Memories is the workspace's persistent memory plane, and the one field
 	// here that is not an issueops role: memories are user data riding in the
 	// config table under their own merge class, not settings, so they have
@@ -267,6 +321,9 @@ type Server struct {
 	// names because a struct cannot carry both.
 	issueReader       issueops.Reader
 	issueClaimer      issueops.Claimer
+	issueBatchCloser  issueops.BatchCloser
+	issueReadyClaimer issueops.ReadyClaimer
+	issueReleaser     issueops.Releaser
 	issueLifecycle    issueops.Lifecycle
 	settings          issueops.WorkspaceConfig
 	issueStats        issueops.StatsReporter
@@ -275,11 +332,14 @@ type Server struct {
 	issueBlocking     issueops.BlockingAnnotator
 	issueTree         issueops.TreeWalker
 	issueReadyCounter issueops.ReadyCounter
+	issueCounter      issueops.Counter
 	issueQuerier      issueops.Querier
 	issueSweeper      issueops.Sweeper
 	issueDeleter      issueops.Deleter
 	issueBatchCreator issueops.BatchCreator
 	issueDependencies issueops.DependencyEditor
+	issueMetadataCAS  issueops.MetadataCAS
+	issueBatchApplier issueops.BatchApplier
 	workspaceMemories memoryops.Memories
 	eventsJournal     storage.EventsJournalCursor
 
@@ -289,13 +349,32 @@ type Server struct {
 	// sem bounds handlers that touch the database. Buffered channel rather
 	// than sync.Semaphore so the acquisition can select on a timer.
 	sem chan struct{}
-	// semTimeout, semWarn and writeStall default to the constants above. They
-	// are fields rather than constants at the point of use so the queueing and
-	// stalled-write behavior can be exercised in milliseconds instead of tens of
-	// seconds.
+	// auth is nil on an unauthenticated server, which is the loopback default.
+	auth *TokenFileAuth
+	// semTimeout, semWarn, writeStall, watchPoll and watchBeat default to the
+	// constants above. They are fields rather than constants at the point of use
+	// so the queueing, stalled-write and streaming behavior can be exercised in
+	// milliseconds instead of tens of seconds.
 	semTimeout time.Duration
 	semWarn    time.Duration
 	writeStall time.Duration
+	watchPoll  time.Duration
+	watchBeat  time.Duration
+
+	// closing is closed when a graceful shutdown begins, and it is the ONLY
+	// notice a streaming handler gets: http.Server.Shutdown waits for active
+	// requests without canceling their contexts, so a stream that watched only
+	// for a client disconnect would hold every shutdown open for the whole drain
+	// timeout and then be killed anyway. Registered on the http.Server (which
+	// calls it exactly once) and guarded so a second call cannot close twice.
+	closing     chan struct{}
+	closingOnce sync.Once
+
+	// watchStreams is the live count of open events:watch streams and
+	// maxWatchStreams mirrors the constant, so a test can saturate the cap
+	// without opening sixty-four of them.
+	watchStreams    atomic.Int64
+	maxWatchStreams int
 
 	log     *log.Logger
 	stdout  io.Writer
@@ -340,7 +419,7 @@ func ValidateBindAddr(addr string, allowNonLoopback bool) (net.IP, error) {
 		return nil, fmt.Errorf("--addr %q: host must be a numeric IP literal, not a name — use 127.0.0.1 rather than localhost", addr)
 	}
 	if !ip.IsLoopback() && !allowNonLoopback {
-		return nil, fmt.Errorf("--addr %q binds beyond loopback; bd serve has no authentication, so this requires --allow-non-loopback", addr)
+		return nil, fmt.Errorf("--addr %q binds beyond loopback, which requires --allow-non-loopback (and, with it, --auth-token-file)", addr)
 	}
 	return ip, nil
 }
@@ -363,6 +442,17 @@ func Listen(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The same posture and allowlist rules the CLI applies, applied again here
+	// so a second caller of this package cannot assemble a Config that serves
+	// the whole surface to a network with no credential.
+	if err := ValidateAuthPosture(cfg.AllowNonLoopback, cfg.Auth != nil, cfg.InsecureNoAuth); err != nil {
+		return nil, err
+	}
+	for _, host := range cfg.AllowedHosts {
+		if err := ValidateAllowedHost(host); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
 	}
@@ -380,6 +470,9 @@ func Listen(cfg Config) (*Server, error) {
 		provider:          cfg.Provider,
 		issueReader:       cfg.Reader,
 		issueClaimer:      cfg.Claimer,
+		issueBatchCloser:  cfg.BatchCloser,
+		issueReadyClaimer: cfg.ReadyClaimer,
+		issueReleaser:     cfg.Releaser,
 		issueLifecycle:    cfg.Lifecycle,
 		settings:          cfg.Settings,
 		issueStats:        cfg.Stats,
@@ -388,11 +481,14 @@ func Listen(cfg Config) (*Server, error) {
 		issueBlocking:     cfg.BlockingAnnotator,
 		issueTree:         cfg.TreeWalker,
 		issueReadyCounter: cfg.ReadyCounter,
+		issueCounter:      cfg.Counter,
 		issueQuerier:      cfg.Querier,
 		issueSweeper:      cfg.Sweeper,
 		issueDeleter:      cfg.Deleter,
 		issueBatchCreator: cfg.BatchCreator,
 		issueDependencies: cfg.DependencyEditor,
+		issueMetadataCAS:  cfg.MetadataCAS,
+		issueBatchApplier: cfg.BatchApplier,
 		workspaceMemories: cfg.Memories,
 		eventsJournal:     cfg.EventsJournal,
 
@@ -400,10 +496,14 @@ func Listen(cfg Config) (*Server, error) {
 		semTimeout: semAcquireTimeout,
 		semWarn:    saturationWarn,
 
+		closing:         make(chan struct{}),
+		maxWatchStreams: maxWatchStreams,
+
 		log:      log.New(cfg.Stderr, "bd serve: ", log.LstdFlags|log.LUTC),
 		stdout:   cfg.Stdout,
 		ctxBody:  contextResponse(cfg.Workspace, cfg.SchemaVersion, Capabilities()),
-		hosts:    newHostPolicy(ip),
+		hosts:    newHostPolicy(ip, cfg.AllowedHosts),
+		auth:     cfg.Auth,
 		idPrefix: prefix,
 		maxConns: maxConns,
 	}
@@ -423,6 +523,11 @@ func Listen(cfg Config) (*Server, error) {
 		ErrorLog:          log.New(cfg.Stderr, "bd serve: http: ", log.LstdFlags|log.LUTC),
 		ConnState:         s.connState,
 	}
+	// Tell the streams to wind up as soon as a drain starts. Without it a
+	// graceful shutdown waits out the whole drain timeout on any open stream and
+	// then reports itself forced, which is the one shutdown signal an operator
+	// is meant to be able to trust.
+	s.http.RegisterOnShutdown(s.closeStreams)
 
 	// Bound what a burst of requests can open on the database. The knob is
 	// optional on the interface, so say so out loud when a provider does not
@@ -490,12 +595,12 @@ func Listen(cfg Config) (*Server, error) {
 // "all or nothing" would turn an honest condition into a special case inside
 // three functions. It is checked once, on its own, below.
 func sourceRoles(cfg Config) []any {
-	return []any{cfg.Reader, cfg.Claimer, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.Memories}
+	return []any{cfg.Reader, cfg.Claimer, cfg.ReadyClaimer, cfg.Releaser, cfg.Lifecycle, cfg.BatchCloser, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Counter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
 }
 
 // roleSourceNames spells sourceRoles for the refusal message, in the same
 // order, so a caller reading the error learns the whole set it must pass.
-const roleSourceNames = "Reader, Claimer, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor and Memories"
+const roleSourceNames = "Reader, Claimer, ReadyClaimer, Releaser, Lifecycle, BatchCloser, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Counter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor, BatchApplier, Memories and MetadataCAS"
 
 func anyRoleSet(cfg Config) bool {
 	return slices.ContainsFunc(sourceRoles(cfg), func(r any) bool { return r != nil })
@@ -687,6 +792,62 @@ func (s *Server) claimer(r *http.Request) (issueops.Claimer, error) {
 	return checkedClaimer{inner: cl}, nil
 }
 
+// batchCloser returns the many-issue close surface for one request, on the same
+// terms as every role above and held by INTERFACE so uow.BatchCloserSource is
+// load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED, like the dependency editor: CloseBatchResult is a
+// VALUE, and the pointer its outcomes carry is forwarded rather than
+// dereferenced — a nil issue on a successful outcome is omitted from that
+// item's body, which is the same absence a refused item produces and is the
+// honest answer either way.
+func (s *Server) batchCloser(r *http.Request) (issueops.BatchCloser, error) {
+	if s.provider == nil {
+		return s.issueBatchCloser, nil
+	}
+	var src uow.BatchCloserSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.BatchCloser()
+}
+
+// readyClaimer returns the take-ready-work surface for one request.
+//
+// Built the same two ways as claimer above and for the same reasons, and held
+// by INTERFACE so uow.ReadyClaimerSource is load-bearing rather than
+// decorative.
+//
+// IT GOES OUT UNWRAPPED, and the difference from checkedClaimer is the whole
+// reason that wrapper exists. That one folds a nil issue because handleClaim
+// DEREFERENCES the pointer the role returned; this handler forwards it, and a
+// nil is not even a fault here — it is the documented answer for an empty ready
+// front. A wrapper would be ceremony that reads like a guarantee.
+func (s *Server) readyClaimer(r *http.Request) (issueops.ReadyClaimer, error) {
+	if s.provider == nil {
+		return s.issueReadyClaimer, nil
+	}
+	var src uow.ReadyClaimerSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.ReadyClaimer()
+}
+
+// releaser returns the claim-release surface for one request.
+//
+// Built the same two ways as claimer above and for the same reasons: the
+// configured role on the roles source, and on the provider source one built per
+// request so its units of work are timed into THIS request's log line, held by
+// INTERFACE so uow.ReleaserSource is load-bearing rather than decorative — and,
+// from either source, wrapped in checkedReleaser, because the handler
+// dereferences the pointer the result carries.
+func (s *Server) releaser(r *http.Request) (issueops.Releaser, error) {
+	if s.provider == nil {
+		return checkedReleaser{inner: s.issueReleaser}, nil
+	}
+	var src uow.ReleaserSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	rel, err := src.Releaser()
+	if err != nil {
+		return nil, err
+	}
+	return checkedReleaser{inner: rel}, nil
+}
+
 // lifecycle returns the guarded issue-mutation surface for one request.
 //
 // Built the same two ways as claimer above and for the same reasons: the
@@ -778,6 +939,24 @@ func (s *Server) readyCounter(r *http.Request) (issueops.ReadyCounter, error) {
 	return src.ReadyCounter()
 }
 
+// counter returns the issue-count surface for one request, on the same terms as
+// readyCounter above and held by INTERFACE so uow.CounterSource is load-bearing
+// rather than decorative.
+//
+// It goes out UNWRAPPED, for readyCounter's reason: both of this role's methods
+// answer with a VALUE, so a checked wrapper would be ceremony that reads like a
+// guarantee. The one pointer-shaped thing in its result is CountByGroupResult's
+// map, and the role promises an empty map rather than nil — a promise the
+// handler does not have to trust, because a nil map ranges and marshals as an
+// empty object either way.
+func (s *Server) counter(r *http.Request) (issueops.Counter, error) {
+	if s.provider == nil {
+		return s.issueCounter, nil
+	}
+	var src uow.CounterSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.Counter()
+}
+
 // querier returns the boolean-query surface for one request, on the same terms
 // as every role above and held by INTERFACE so uow.QuerierSource is
 // load-bearing rather than decorative. It goes out UNWRAPPED, like the counter
@@ -862,6 +1041,41 @@ func (s *Server) dependencyEditor(r *http.Request) (issueops.DependencyEditor, e
 	}
 	var src uow.DependencyEditorSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
 	return src.DependencyEditor()
+}
+
+// metadataCAS returns the conditional metadata write for one request, on the
+// same terms as every role above and held by INTERFACE so
+// uow.MetadataCASSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED: the role's result is a VALUE whose only pointer member
+// is an optional raw value the handler passes through without dereferencing.
+func (s *Server) metadataCAS(r *http.Request) (issueops.MetadataCAS, error) {
+	if s.provider == nil {
+		return s.issueMetadataCAS, nil
+	}
+	var src uow.MetadataCASSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.MetadataCAS()
+}
+
+// batchApplier returns the ordered-plan write surface for one request, on the
+// same terms as every role above and held by INTERFACE so
+// uow.BatchApplierSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED, like the dependency editor: ApplyBatchResult is a
+// VALUE, and the one pointer its items carry — the post-item issue snapshot —
+// never reaches the wire, so no handler dereferences anything this role
+// returned.
+//
+// The role owns every refusal this operation can raise: the ref graph, the
+// as-modified preconditions, the close policy, the assignee fence and the end
+// gate. That is why the Config field it comes from is required rather than
+// optional.
+func (s *Server) batchApplier(r *http.Request) (issueops.BatchApplier, error) {
+	if s.provider == nil {
+		return s.issueBatchApplier, nil
+	}
+	var src uow.BatchApplierSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.BatchApplier()
 }
 
 // memories returns the persistent-memory surface for one request, on the same
@@ -1222,19 +1436,44 @@ func (s *Server) dispatchCustomMethod(rows []route) http.Handler {
 	})
 }
 
+// closeStreams signals every streaming handler that this server is shutting
+// down. Idempotent: http.Server calls its registered hooks once per Shutdown,
+// and a second Shutdown must not panic on an already-closed channel.
+func (s *Server) closeStreams() {
+	s.closingOnce.Do(func() { close(s.closing) })
+}
+
 // route wraps one operation with the limits that apply to it: the per-request
-// deadline, and — unless the operation is exempt — a database slot.
+// deadline, the bearer credential unless the operation is exempt, and — unless
+// the operation is exempt — a database slot.
+//
+// The credential check runs BEFORE the semaphore, which is the load-bearing
+// ordering: a storm of refused requests then costs one SHA-256 each and can
+// never occupy the slots, or the SQL connections pinned to them, that
+// authenticated clients are waiting for. It runs inside withRequestContext, so
+// a 401 gets a request id and a request log line like every other refusal.
 func (s *Server) route(rt route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := requestInfo(r.Context())
 		rec.op = rt.op
 
-		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
-		defer cancel()
-		r = r.WithContext(ctx)
+		// A STREAMING OPERATION GETS NO DEADLINE. For every other row this is
+		// the backstop that stops a request from holding resources forever; on a
+		// held-open response it would do nothing but sever the stream at sixty
+		// seconds. What replaces it is per-read: streamEvents holds no slot
+		// between passes and bounds each read on its own.
+		if !rt.streaming {
+			ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+
+		if !rt.authExempt && s.auth != nil && !s.authorize(w, r, rec) {
+			return
+		}
 
 		if !rt.bypassSemaphore {
-			release, err := s.acquire(ctx, rec)
+			release, err := s.acquire(r.Context(), rec)
 			if err != nil {
 				s.failErr(w, r, err)
 				return
@@ -1244,6 +1483,70 @@ func (s *Server) route(rt route) http.Handler {
 
 		rt.handler(s, w, r)
 	})
+}
+
+// authorize verifies the request's bearer credential, writing the 401 itself
+// and reporting whether the handler may run.
+//
+// The presented credential appears in NO log field and NO response byte. It is
+// deliberately not recorded through rec.refuse, which is defined as an echoed
+// CALLER VALUE and goes on the request line: a Host header or a parameter name
+// is attacker-controlled text worth attributing, and a token is a secret. What
+// the log gets instead is the reason — which of the three client mistakes it
+// was — and the request id that ties it to the response.
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request, rec *reqInfo) bool {
+	token, reason := bearerCredential(r.Header.Get("Authorization"))
+	if reason == "" {
+		ok, reloadErr := s.auth.Verify(token)
+		if reloadErr != nil {
+			// A reload that failed leaves the last-good token set in force, so
+			// this is not a refusal on its own — but it means the file the
+			// operator is rotating is unreadable, and nothing else would say so.
+			s.event("auth_reload_error", "request_id", rec.id, "error", reloadErr.Error())
+		}
+		if ok {
+			return true
+		}
+		reason = "unknown_token"
+	}
+
+	s.event("auth_refused", "request_id", rec.id, "op", rec.op,
+		"reason", reason, "remote_addr", r.RemoteAddr)
+	s.fail(w, r, newResult(CodeUnauthenticated, ""))
+	return false
+}
+
+// bearerCredential extracts the token from an Authorization header value. It
+// returns a non-empty reason instead when there is nothing to verify, so the
+// log can separate a misconfigured client from a wrong or stale token.
+//
+// The scheme is matched case-insensitively, which RFC 9110 requires.
+func bearerCredential(header string) (token, reason string) {
+	if strings.TrimSpace(header) == "" {
+		return "", "missing"
+	}
+	rest, ok := strings.CutPrefix(header, "Bearer ")
+	if !ok {
+		scheme, tail, split := strings.Cut(header, " ")
+		if !split || !strings.EqualFold(scheme, "Bearer") {
+			return "", "malformed"
+		}
+		rest = tail
+	}
+	if token = strings.TrimSpace(rest); token == "" {
+		return "", "malformed"
+	}
+	return token, ""
+}
+
+// authLabel describes the credential posture for the startup line. It names the
+// token FILE, never a token: the path is configuration an operator already
+// knows, and the contents are the secret.
+func (s *Server) authLabel() string {
+	if s.auth == nil {
+		return "none"
+	}
+	return "bearer (" + s.auth.path + ")"
 }
 
 // fail writes a problem response and records what it was for the log line.
@@ -1349,9 +1652,10 @@ type hostPolicy struct {
 	// are the same hosts as ::1 and 127.0.0.1, and a client that spells one of
 	// them the long way is not an attacker.
 	ips []net.IP
-	// names are the allowed non-numeric Host values, lowercased. There is
-	// exactly one, "localhost", and no mechanism to add another: a DNS name in
-	// a Host header is precisely what the rebinding attack carries.
+	// names are the allowed non-numeric Host values, lowercased. "localhost"
+	// is always there; an operator may enumerate more with --allowed-host, and
+	// nothing else can add one. Matching is EXACT — no wildcard and no suffix
+	// syntax — so the allowlist is precisely what was enumerated.
 	names map[string]bool
 	// anyIP additionally allows ANY numeric Host literal. Only a wildcard bind
 	// sets it; see newHostPolicy for why that is still a rebinding defense.
@@ -1374,7 +1678,14 @@ type hostPolicy struct {
 // would instead surrender the defense on the serving host's own loopback
 // interface, which is rebinding's canonical target, and on every LAN browser
 // behind a firewall the attacker cannot otherwise reach.
-func newHostPolicy(bind net.IP) hostPolicy {
+// EXTRA is the operator's enumerated additions (--allowed-host). A deployment
+// where clients dial a service DNS name is refused by the policy above on every
+// single request, so without this the server is unreachable rather than
+// protected. Admitting a name the operator named does not weaken the defense
+// the check exists for: a rebound page still cannot make a browser send that
+// Host to 127.0.0.1, and the in-cluster clients that do send it are not
+// browsers. Numeric values land in ips, so a pod IP can be enumerated too.
+func newHostPolicy(bind net.IP, extra []string) hostPolicy {
 	p := hostPolicy{
 		ips:   []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 		names: map[string]bool{"localhost": true},
@@ -1383,7 +1694,46 @@ func newHostPolicy(bind net.IP) hostPolicy {
 	if !p.anyIP && !containsIP(p.ips, bind) {
 		p.ips = append(p.ips, bind)
 	}
+	for _, host := range extra {
+		h := hostOnly(host)
+		if ip := net.ParseIP(h); ip != nil {
+			if !containsIP(p.ips, ip) {
+				p.ips = append(p.ips, ip)
+			}
+			continue
+		}
+		p.names[h] = true
+	}
 	return p
+}
+
+// ValidateAllowedHost refuses an allowlist entry that is not a bare host.
+//
+// The Host header's port is stripped before matching (hostOnly), so an entry
+// carrying one would silently never match — and an operator who wrote it would
+// reasonably read the startup line as proof that it does. A URL, a path or
+// embedded whitespace is the same mistake in a louder form.
+func ValidateAllowedHost(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return errors.New("--allowed-host is empty; pass the Host header value clients send, such as bd-myproject.beads.svc.cluster.local")
+	}
+	if strings.ContainsAny(v, " \t\r\n") {
+		return fmt.Errorf("--allowed-host %q contains whitespace; it must be a bare host name or IP", v)
+	}
+	if strings.ContainsAny(v, "/@") {
+		return fmt.Errorf("--allowed-host %q looks like a URL; pass just the host, with no scheme and no path", v)
+	}
+	// An IPv6 address is spelled in brackets in a Host header, so an operator
+	// copying one off the wire types it that way. hostOnly strips them before
+	// matching, so the entry works; refusing it here — with a message about a
+	// port it does not have — would be the validation lying about the policy.
+	if net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")) != nil {
+		return nil
+	}
+	if strings.Contains(v, ":") {
+		return fmt.Errorf("--allowed-host %q carries a port; the port is stripped from a request's Host before matching, so an entry with one could never match", v)
+	}
+	return nil
 }
 
 // allows reports whether a Host header value is one this server answers to.
@@ -1451,6 +1801,10 @@ func (s *Server) logStartup() {
 		"database", s.cfg.Workspace.Database,
 		"host_allowlist", s.hosts.label(),
 		"capabilities", strings.Join(s.ctxBody.Capabilities, ","),
+		// Whether this server requires a credential is the first thing an
+		// operator checks after a deploy, and the last thing they should have
+		// to infer from the absence of a flag in a process listing.
+		"auth", s.authLabel(),
 	)
 
 	limits := []any{

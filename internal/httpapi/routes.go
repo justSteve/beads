@@ -98,10 +98,35 @@ type route struct {
 	// ContextResponse.capabilities, or "" for operations outside that
 	// vocabulary. A stub contributes nothing whatever this says.
 	capability string
-	// bypassSemaphore exempts an operation from the database slot limit. Only
-	// legitimate for handlers that touch no database: liveness and identity
-	// must stay answerable while every slot is held by a long scan.
+	// bypassSemaphore exempts an operation from the request-wide database slot.
+	// Legitimate for handlers that touch no database — liveness and identity
+	// must stay answerable while every slot is held by a long scan — and for a
+	// streaming row, which takes a slot around each of its reads instead. It is
+	// never a way to skip the limit while touching the database.
 	bypassSemaphore bool
+	// streaming marks an operation whose response is held open indefinitely
+	// rather than written and finished. Such a row is exempt from
+	// requestDeadline, which for every other operation is the backstop that
+	// stops a request from holding resources forever and here would simply cut
+	// the stream off mid-flight; the handler bounds its own reads and exits on
+	// client disconnect or shutdown (see streamEvents).
+	//
+	// A streaming row must also set bypassSemaphore: holding one of the sixteen
+	// database slots for the life of a connection is the starvation the deadline
+	// used to prevent, so the slot moves to the individual reads.
+	// TestStreamingRowsAreTheDocumentsStreamingOps pins the pair.
+	streaming bool
+	// authExempt serves an operation with no bearer credential on a server
+	// that was configured with one. Only legitimate for liveness: the probe
+	// must answer with no credential, and it discloses nothing but that the
+	// process is up. Identity is NOT exempt — GET /v0/beads/context reveals the
+	// repo root, the beads directory and the database name.
+	//
+	// It is a column rather than a middleware rule for the same reason
+	// bypassSemaphore is: the exemption is a property of the operation, so it
+	// belongs where TestSpecSecurityMatchesRouteTable can compare it against
+	// the document's per-operation `security` declarations.
+	authExempt bool
 	// implemented gates the capability list, so a release between slices never
 	// advertises an operation that does not work. Every v0 operation is
 	// implemented as of the read-endpoints slice; the flag stays because the
@@ -125,8 +150,11 @@ var routeTable = []route{
 		// fail, so it must not queue behind the database. That is exactly
 		// what makes it liveness-only: it stays green while Dolt is wedged.
 		bypassSemaphore: true,
-		implemented:     true,
-		handler:         (*Server).handleHealth,
+		// The one auth-exempt row. A kubelet probe presents no credential, and
+		// a liveness endpoint that 401s is a pod that restarts forever.
+		authExempt:  true,
+		implemented: true,
+		handler:     (*Server).handleHealth,
 	},
 	{
 		op:      OpGetContext,
@@ -194,6 +222,22 @@ var routeTable = []route{
 		capability:  "issues.query",
 		implemented: true,
 		handler:     (*Server).handleQueryIssues,
+	},
+	{
+		op:     OpCountIssues,
+		method: http.MethodGet,
+		// A collection-level custom method on the issue collection, spelled the
+		// way ready:count's is: both segments are LITERAL, so pattern and
+		// specPath agree and the router registers the documented path itself.
+		//
+		// It cannot collide with the claim's wide POST wildcard — that one is
+		// registered under POST and requires the separating slash this path has
+		// none of — nor with the plain collection GET, which ServeMux matches
+		// whole.
+		pattern:     "/v0/beads/issues:count",
+		capability:  "issues.count",
+		implemented: true,
+		handler:     (*Server).handleCountIssues,
 	},
 	{
 		op:          OpGetIssue,
@@ -266,6 +310,24 @@ var routeTable = []route{
 		handler:     (*Server).handleDependencyTree,
 	},
 	{
+		op:     OpCreateIssue,
+		method: http.MethodPost,
+		// THE PLAIN COLLECTION POST, and the row the batch below deliberately
+		// left this path free for: creating one member of the collection a path
+		// names is what POST already means, so a single create needs no custom
+		// method and squatting on the path with a batch would have made this
+		// operation unnameable.
+		//
+		// It shares its pattern with no other row. The claim's wide
+		// /v0/beads/issues/{idop} wildcard requires the separating slash this
+		// path has none of, and every batch beside it is a literal `:verb`
+		// segment ServeMux matches whole.
+		pattern:     "/v0/beads/issues",
+		capability:  "issues.create",
+		implemented: true,
+		handler:     (*Server).handleCreateIssue,
+	},
+	{
 		op:     OpBatchCreateIssues,
 		method: http.MethodPost,
 		// A collection-level custom method, spelled the way ready:count's is.
@@ -274,13 +336,32 @@ var routeTable = []route{
 		// That pattern is /v0/beads/issues/{idop} and requires the separating
 		// slash; this path has none, so the two never match the same request.
 		//
-		// It also leaves POST /v0/beads/issues free. A collection POST is where
-		// a single create belongs when one is published, and squatting on it
-		// with a batch would have made that operation unnameable.
+		// Nor with the single create above, which took the plain collection
+		// POST this row was spelled as a custom method to leave free: ServeMux
+		// prefers the literal `:batchCreate` segment, and the two paths differ
+		// in any case.
 		pattern:     "/v0/beads/issues:batchCreate",
 		capability:  "issues.batchCreate",
 		implemented: true,
 		handler:     (*Server).handleBatchCreate,
+	},
+	{
+		op:     OpApplyBatch,
+		method: http.MethodPost,
+		// A collection-level custom method, spelled the way issues:batchCreate's
+		// is, and preferred over the claim's wildcard for the reason the sweep
+		// row below spells out: that pattern requires a separating slash, this
+		// path has none, and ServeMux prefers the literal in any case.
+		//
+		// A SIBLING of issues:batchCreate rather than a mode of it. The two
+		// answer different questions — one creates N issues, this one applies an
+		// ordered plan of four verbs whose items may reference each other — and a
+		// flag on that operation would have made one operationId carrying two
+		// contracts, two request schemas and two result shapes.
+		pattern:     "/v0/beads/issues:batchApply",
+		capability:  "issues.batchApply",
+		implemented: true,
+		handler:     (*Server).handleApplyBatch,
 	},
 	{
 		op:      OpClaimIssue,
@@ -302,11 +383,32 @@ var routeTable = []route{
 		// segment that ends in no registered suffix, so the wide pattern stays a
 		// routing detail rather than undocumented surface.
 		// TestCustomMethodsNarrowThePOSTSurface pins it.
+		//
+		// That 404 needs no credential, because the split happens before
+		// s.route: an unrouted suffix here is answered exactly as the catch-all
+		// answers any other unrouted path, while a registered one reaches its
+		// row and is refused. Paths are public spec, so the miss discloses
+		// nothing the document does not already publish;
+		// TestUnroutedPathsStayUnauthenticated pins both halves so neither gets
+		// "fixed" into the other.
 		specPath:     "/v0/beads/issues/{id}:claim",
 		customMethod: ":claim",
 		capability:   "issues.claim",
 		implemented:  true,
 		handler:      (*Server).handleClaim,
+	},
+	{
+		op:     OpReleaseIssue,
+		method: http.MethodPost,
+		// The claim's inverse, on the dispatcher the close built. A fifth row on
+		// this pattern is a row; everything the claim row says about the
+		// wildcard's width holds here unchanged.
+		pattern:      customMethodPattern,
+		specPath:     "/v0/beads/issues/{id}:release",
+		customMethod: ":release",
+		capability:   "issues.release",
+		implemented:  true,
+		handler:      (*Server).handleRelease,
 	},
 	{
 		op:     OpCloseIssue,
@@ -322,6 +424,18 @@ var routeTable = []route{
 		handler:      (*Server).handleClose,
 	},
 	{
+		op:     OpCompareAndSetMetadata,
+		method: http.MethodPost,
+		// A fourth row on the shared single-resource dispatcher, spelled the way
+		// the reopen's is.
+		pattern:      customMethodPattern,
+		specPath:     "/v0/beads/issues/{id}:casMetadata",
+		customMethod: ":casMetadata",
+		capability:   "issues.casMetadata",
+		implemented:  true,
+		handler:      (*Server).handleCompareAndSetMetadata,
+	},
+	{
 		op:     OpReopenIssue,
 		method: http.MethodPost,
 		// The close's mirror, on the dispatcher the close built. Nothing new is
@@ -332,6 +446,33 @@ var routeTable = []route{
 		capability:   "issues.reopen",
 		implemented:  true,
 		handler:      (*Server).handleReopen,
+	},
+	{
+		op:     OpBatchCloseIssues,
+		method: http.MethodPost,
+		// A collection-level custom method, spelled the way issues:batchCreate
+		// is — and this operation is that one's deliberate opposite: it is not
+		// all-or-nothing, so its 200 carries per-item refusals.
+		pattern:     "/v0/beads/issues:batchClose",
+		capability:  "issues.batchClose",
+		implemented: true,
+		handler:     (*Server).handleBatchClose,
+	},
+	{
+		op:     OpClaimNextIssue,
+		method: http.MethodPost,
+		// A collection-level custom method, spelled the way issues:sweep is,
+		// and preferred over the claim's wildcard for that row's reason: the
+		// segment is a LITERAL, so the router registers the documented path
+		// itself and ServeMux prefers it over the wildcard for this exact path.
+		//
+		// It names no id BECAUSE IT NAMES NO ROW. The caller asks a question and
+		// the role picks the answer, which is what makes this a sibling of
+		// issues/{id}:claim rather than a mode of it.
+		pattern:     "/v0/beads/issues:claimNext",
+		capability:  "issues.claimNext",
+		implemented: true,
+		handler:     (*Server).handleClaimNext,
 	},
 	{
 		op:     OpSweepIssues,
@@ -432,6 +573,28 @@ var routeTable = []route{
 		capability:  "events.list",
 		implemented: true,
 		handler:     (*Server).handleListEvents,
+	},
+	{
+		op:     OpWatchEvents,
+		method: http.MethodGet,
+		// A collection-level custom method on the journal, spelled the way
+		// ready:count is: both segments are LITERAL, so pattern and specPath
+		// agree and the router registers the documented path itself.
+		//
+		// It cannot collide with the paged read above — ServeMux matches the
+		// whole path and these two differ — and it is a SIBLING of it rather
+		// than a mode of it deliberately: the two answer different media types
+		// with different lifetimes and different limits, and a `follow=true`
+		// parameter would have made one operation that is two contracts.
+		pattern:    "/v0/beads/events:watch",
+		capability: "events.watch",
+		// The stream lives until the client leaves, so the request deadline
+		// does not apply and the database slot moves to the individual reads.
+		// See the field comments above; readWatchBatch is the other half.
+		streaming:       true,
+		bypassSemaphore: true,
+		implemented:     true,
+		handler:         (*Server).handleWatchEvents,
 	},
 	{
 		op:     OpForgetMemory,

@@ -188,6 +188,61 @@ func (c *roleReadyCounter) countRequests() []issueops.ReadyRequest {
 	return append([]issueops.ReadyRequest(nil), c.counts...)
 }
 
+// roleCounter is the issue-count role's double, and it records BOTH requests
+// separately: the operation chooses between the role's two methods on one
+// parameter, so a case has to be able to say which one was called and not only
+// what it was handed.
+type roleCounter struct {
+	total   int64
+	groups  map[string]int
+	err     error
+	groupTo int64
+
+	mu       sync.Mutex
+	counts   []issueops.CountRequest
+	buckets  []issueops.CountByGroupRequest
+	nilGroup bool
+}
+
+func (c *roleCounter) Count(_ context.Context, req issueops.CountRequest) (issueops.CountResult, error) {
+	c.mu.Lock()
+	c.counts = append(c.counts, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CountResult{}, c.err
+	}
+	return issueops.CountResult{Total: c.total}, nil
+}
+
+func (c *roleCounter) CountByGroup(_ context.Context, req issueops.CountByGroupRequest) (issueops.CountByGroupResult, error) {
+	c.mu.Lock()
+	c.buckets = append(c.buckets, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CountByGroupResult{}, c.err
+	}
+	// nilGroup lets a case drive the one thing the role promises and an
+	// implementation could still get wrong: a grouped answer with no buckets is
+	// an EMPTY object on the wire, never null.
+	groups := c.groups
+	if groups == nil && !c.nilGroup {
+		groups = map[string]int{}
+	}
+	return issueops.CountByGroupResult{Groups: groups, Total: c.groupTo}, nil
+}
+
+func (c *roleCounter) countRequests() []issueops.CountRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CountRequest(nil), c.counts...)
+}
+
+func (c *roleCounter) groupRequests() []issueops.CountByGroupRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CountByGroupRequest(nil), c.buckets...)
+}
+
 // roleQuerier is the boolean-query role's double. It records the whole request
 // because the property this surface owes is that the EXPRESSION reaches the
 // role untouched: a handler that parsed it here would be a second
@@ -449,6 +504,91 @@ func (c *roleClaimer) claimRequests() []issueops.ClaimRequest {
 	return append([]issueops.ClaimRequest(nil), c.claims...)
 }
 
+// roleBatchCloser is the store-shaped source's many-issue close role. The
+// batchClose tests drive it directly, and it is the fake that matters most on
+// this surface: the per-item outcome projection is the one place where a role
+// result and a 200 body can disagree without any status saying so.
+type roleBatchCloser struct {
+	result issueops.CloseBatchResult
+	err    error
+
+	mu       sync.Mutex
+	requests []issueops.CloseBatchRequest
+}
+
+func (c *roleBatchCloser) CloseBatch(_ context.Context, req issueops.CloseBatchRequest) (issueops.CloseBatchResult, error) {
+	c.mu.Lock()
+	c.requests = append(c.requests, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CloseBatchResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleBatchCloser) closeBatchRequests() []issueops.CloseBatchRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CloseBatchRequest(nil), c.requests...)
+}
+
+// roleReadyClaimer is the store-shaped source's take-ready-work role. The
+// claimNext tests drive it directly: the wire edge — the filter decode, the
+// `limit` refusal, the body vocabulary and the absent-row answer — is provable
+// against a fake, and the atomicity that makes the operation worth having
+// belongs to the role's own contract.
+type roleReadyClaimer struct {
+	result issueops.ClaimNextResult
+	err    error
+
+	mu     sync.Mutex
+	claims []issueops.ClaimNextRequest
+}
+
+func (c *roleReadyClaimer) ClaimNext(_ context.Context, req issueops.ClaimNextRequest) (issueops.ClaimNextResult, error) {
+	c.mu.Lock()
+	c.claims = append(c.claims, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.ClaimNextResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleReadyClaimer) claimNextRequests() []issueops.ClaimNextRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.ClaimNextRequest(nil), c.claims...)
+}
+
+// roleReleaser is the store-shaped source's claim-release role. The release
+// tests drive it directly, for the reason roleLifecycle exists: the wire edge —
+// the body vocabulary, the guard pair, the refusal mapping — is provable
+// against a fake, and the transition itself belongs to the role's own contract.
+type roleReleaser struct {
+	result issueops.ReleaseResult
+	err    error
+
+	mu       sync.Mutex
+	releases []issueops.ReleaseRequest
+}
+
+func (c *roleReleaser) Release(_ context.Context, req issueops.ReleaseRequest) (issueops.ReleaseResult, error) {
+	c.mu.Lock()
+	c.releases = append(c.releases, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.ReleaseResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleReleaser) releaseRequests() []issueops.ReleaseRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.ReleaseRequest(nil), c.releases...)
+}
+
 // roleLifecycle is the store-shaped source's guarded-mutation role. Every case
 // hands Listen a COMPLETE source, so this exists partly to be a placeholder —
 // but the close tests drive it directly, which is what the claim precedent
@@ -456,6 +596,8 @@ func (c *roleClaimer) claimRequests() []issueops.ClaimRequest {
 // rules and the problem shapes, with the transaction and the policy left to the
 // integration test against real Dolt.
 type roleLifecycle struct {
+	createResult issueops.CreateResult
+	createErr    error
 	closeResult  issueops.CloseResult
 	closeErr     error
 	reopenResult issueops.ReopenResult
@@ -464,13 +606,28 @@ type roleLifecycle struct {
 	updateErr    error
 
 	mu      sync.Mutex
+	creates []issueops.CreateRequest
 	closes  []issueops.CloseRequest
 	reopens []issueops.ReopenRequest
 	updates []issueops.UpdateRequest
 }
 
-func (l *roleLifecycle) Create(_ context.Context, _ issueops.CreateRequest) (issueops.CreateResult, error) {
-	return issueops.CreateResult{}, errors.New("create is not published on this surface")
+func (l *roleLifecycle) Create(_ context.Context, req issueops.CreateRequest) (issueops.CreateResult, error) {
+	l.mu.Lock()
+	l.creates = append(l.creates, req)
+	l.mu.Unlock()
+	if l.createErr != nil {
+		return issueops.CreateResult{}, l.createErr
+	}
+	return l.createResult, nil
+}
+
+// createRequests is closeRequests' twin, and the one the create tests read the
+// whole projection off: an empty list means nothing reached the role.
+func (l *roleLifecycle) createRequests() []issueops.CreateRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]issueops.CreateRequest(nil), l.creates...)
 }
 
 func (l *roleLifecycle) Update(_ context.Context, req issueops.UpdateRequest) (issueops.UpdateResult, error) {
@@ -621,6 +778,15 @@ func rolesConfig(cfg Config) Config {
 	if cfg.Claimer == nil {
 		cfg.Claimer = &roleClaimer{}
 	}
+	if cfg.BatchCloser == nil {
+		cfg.BatchCloser = &roleBatchCloser{}
+	}
+	if cfg.ReadyClaimer == nil {
+		cfg.ReadyClaimer = &roleReadyClaimer{}
+	}
+	if cfg.Releaser == nil {
+		cfg.Releaser = &roleReleaser{}
+	}
 	if cfg.Lifecycle == nil {
 		cfg.Lifecycle = &roleLifecycle{}
 	}
@@ -645,6 +811,9 @@ func rolesConfig(cfg Config) Config {
 	if cfg.ReadyCounter == nil {
 		cfg.ReadyCounter = &roleReadyCounter{}
 	}
+	if cfg.Counter == nil {
+		cfg.Counter = &roleCounter{}
+	}
 	if cfg.Querier == nil {
 		cfg.Querier = &roleQuerier{}
 	}
@@ -659,6 +828,12 @@ func rolesConfig(cfg Config) Config {
 	}
 	if cfg.DependencyEditor == nil {
 		cfg.DependencyEditor = &roleDependencyEditor{}
+	}
+	if cfg.MetadataCAS == nil {
+		cfg.MetadataCAS = &roleMetadataCAS{}
+	}
+	if cfg.BatchApplier == nil {
+		cfg.BatchApplier = &roleBatchApplier{}
 	}
 	if cfg.Memories == nil {
 		cfg.Memories = &roleMemories{}
@@ -703,6 +878,60 @@ func (d *roleCycleDetector) DetectCycles(_ context.Context, req issueops.DetectC
 // hands Listen a COMPLETE source for a reason that bites hardest here: the
 // alternative is a server that binds and then nil-dereferences on the one
 // request that deletes beads.
+// roleMetadataCAS is the store-shaped source's conditional metadata write, the
+// same shape as roleSweeper and for the same reason.
+type roleMetadataCAS struct {
+	result issueops.CompareAndSetKeyResult
+	err    error
+
+	mu    sync.Mutex
+	calls []issueops.CompareAndSetKeyRequest
+}
+
+func (c *roleMetadataCAS) CompareAndSetKey(_ context.Context, req issueops.CompareAndSetKeyRequest) (issueops.CompareAndSetKeyResult, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, req)
+	c.mu.Unlock()
+	if c.err != nil {
+		return issueops.CompareAndSetKeyResult{}, c.err
+	}
+	return c.result, nil
+}
+
+func (c *roleMetadataCAS) requests() []issueops.CompareAndSetKeyRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]issueops.CompareAndSetKeyRequest(nil), c.calls...)
+}
+
+// roleBatchApplier is the store-shaped source's ordered-plan write, the same
+// shape as roleSweeper and for the same reason. It records the whole request
+// because this operation's wire edge is a four-level projection and a case
+// asserting on one member of it has to be able to reach every other.
+type roleBatchApplier struct {
+	result issueops.ApplyBatchResult
+	err    error
+
+	mu    sync.Mutex
+	calls []issueops.ApplyBatchRequest
+}
+
+func (a *roleBatchApplier) ApplyBatch(_ context.Context, req issueops.ApplyBatchRequest) (issueops.ApplyBatchResult, error) {
+	a.mu.Lock()
+	a.calls = append(a.calls, req)
+	a.mu.Unlock()
+	if a.err != nil {
+		return issueops.ApplyBatchResult{}, a.err
+	}
+	return a.result, nil
+}
+
+func (a *roleBatchApplier) requests() []issueops.ApplyBatchRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]issueops.ApplyBatchRequest(nil), a.calls...)
+}
+
 type roleSweeper struct {
 	result issueops.SweepResult
 	err    error
@@ -847,6 +1076,14 @@ func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 			wantErr: "no database source",
 		},
 		{
+			// The issue count is a SEPARATE role from the ready count beside
+			// it: missing it, the server binds, advertises issues.count, and
+			// nil-dereferences on the first request that sizes a filter.
+			name:    "no counter",
+			cfg:     rolesConfigWithout(func(c *Config) { c.Counter = nil }),
+			wantErr: "no database source",
+		},
+		{
 			name:    "no querier",
 			cfg:     rolesConfigWithout(func(c *Config) { c.Querier = nil }),
 			wantErr: "no database source",
@@ -909,6 +1146,36 @@ func TestListenRequiresExactlyOneDatabaseSource(t *testing.T) {
 		{
 			name:    "a provider and a batch creator",
 			cfg:     Config{Provider: &fakeProvider{}, BatchCreator: &roleBatchCreator{}},
+			wantErr: "exactly one database source",
+		},
+		{
+			name:    "no metadata cas role",
+			cfg:     rolesConfigWithout(func(c *Config) { c.MetadataCAS = nil }),
+			wantErr: "no database source",
+		},
+		{
+			name:    "a metadata cas role alone",
+			cfg:     Config{MetadataCAS: &roleMetadataCAS{}},
+			wantErr: "no database source",
+		},
+		{
+			name:    "a provider and a metadata cas role",
+			cfg:     Config{Provider: &fakeProvider{}, MetadataCAS: &roleMetadataCAS{}},
+			wantErr: "exactly one database source",
+		},
+		{
+			name:    "no batch applier",
+			cfg:     rolesConfigWithout(func(c *Config) { c.BatchApplier = nil }),
+			wantErr: "no database source",
+		},
+		{
+			name:    "a batch applier alone",
+			cfg:     Config{BatchApplier: &roleBatchApplier{}},
+			wantErr: "no database source",
+		},
+		{
+			name:    "a provider and a batch applier",
+			cfg:     Config{Provider: &fakeProvider{}, BatchApplier: &roleBatchApplier{}},
 			wantErr: "exactly one database source",
 		},
 		{
@@ -1021,13 +1288,14 @@ func TestConfiguredRolesServeTheSameReadyBytesAsAProvider(t *testing.T) {
 // work here, because there is no provider to open one.
 //
 // NOT ALL OF THEM, despite the name: the subtests below drive ten of the
-// sixteen capability-bearing operations in routes.go. The other six —
+// seventeen capability-bearing operations in routes.go. The other seven —
 // dependencies/cycles, dependencies/blocking, dependencies/tree,
-// issues:batchCreate, issues:sweep and issues:delete — are exercised against a
-// roles source in their own files (cycles_test.go, blocking_test.go,
-// tree_test.go, batch_create_test.go, sweep_test.go, delete_test.go). Either
-// add the six here or keep this paragraph accurate; do not generalize the
-// sentence again.
+// issues:batchCreate, issues:sweep, issues:delete, issues/{id}:casMetadata and
+// issues:batchApply — are exercised against a roles source in their own files
+// (cycles_test.go, blocking_test.go, tree_test.go, batch_create_test.go,
+// sweep_test.go, delete_test.go, metadata_cas_test.go, batch_apply_test.go).
+// Either add the eight here or keep this
+// paragraph accurate; do not generalize the sentence again.
 func TestConfiguredRolesAnswerEveryDatabaseRoute(t *testing.T) {
 	details := &issueops.IssueDetails{Issue: *seededIssue("bd-1", "alice", types.StatusOpen)}
 	reader := &roleReader{page: issueops.IssuePage{Items: countedPage(), HasMore: true}, details: details}

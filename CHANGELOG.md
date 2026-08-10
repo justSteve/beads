@@ -173,6 +173,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The settings plane no longer serves the KV plane by any read** (bd-rfwtv,
+  bd-klko9). `bd kv` keys and the `bd remember` memories nested under them are
+  user data stored as config rows; they ride in the settings table without being
+  settings. Listing them was already excluded, but a caller naming an exact key
+  still got the value — and since `bd remember` derives its key from the content
+  it stores, the keys are guessable, so `bd config get kv.memory.<slug>` and
+  `GET /v0/beads/config/kv.memory.<slug>` (a surface with no authentication,
+  whose redaction decides on the key NAME while a memory's secret is in the
+  VALUE) walked around the exclusion.
+
+  A point read of a `kv.` key now answers exactly as a key nothing ever stored
+  does — the echoed key, an empty value, a nil error — so a caller cannot tell a
+  refusal from an absence. `bd config show` no longer prints those rows under
+  `source=database` either; it reads the table raw and prints values in full, so
+  it had inherited neither filter.
+
+  **Nothing is deleted and nothing becomes unreachable.** The rows are
+  untouched, and the surfaces that own them — `bd kv get`, `bd kv list`,
+  `bd recall`, `bd memories` — read the store directly and are unaffected.
+  `bd config set` and `bd config unset` still take a verbatim `kv.` key, which
+  keeps the escape hatch for a wedged memory. What is gone is reading memory
+  contents through `bd config get`, `bd config list` and `bd config show`.
+
+  **This is plane hygiene, not a confidentiality boundary.** `bd serve` has no
+  authentication, and it serves every memory in full through
+  `/v0/beads/memories` by design — anyone who can reach the server can still
+  read them. What this closes is the settings plane's habit of handing user
+  data to callers that asked for configuration: the routes that get republished
+  into agent transcripts and pasted into issues. Do not read it as a fix that
+  makes memories secret from someone who can already reach the port.
+
 - **`bd search` now includes closed issues by default** (bd-t5yex). The
   dominant real-world search query is "was this already found/filed/fixed?" —
   exactly the query where silently excluding closed issues produced a false
@@ -188,6 +219,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones — use `--status open` or raise `--limit` when hunting live work. And
   `bd query` (plus the HTTP `q=` endpoint) deliberately keeps its closed-
   exclusion default with opt-in `--all`; only `bd search` changed.
+
+### Removed
+
+- **BREAKING (published `backend` package): orphan handling is gone** (bd-gwryr).
+  `BatchCreateOptions.OrphanHandling` and its four modes never did anything
+  except cost a query. Removed symbols: `backend.OrphanHandling`,
+  `backend.OrphanAllow`, `backend.OrphanResurrect`, `backend.OrphanSkip`,
+  `backend.OrphanStrict`, and the `storage` originals they aliased
+  (`storage.OrphanHandling` and the same four constants), the
+  `BatchCreateOptions.OrphanHandling` field, and `issueops.CheckOrphan`.
+
+  **Migration for out-of-tree consumers: delete the option.** Every call site
+  in bd passed `OrphanAllow` (or left the field at its zero value, which took
+  the same branch), and `OrphanAllow` is exactly what the code still does —
+  a hierarchical create whose parent is missing is accepted, and the child's
+  auxiliary counter row is skipped because it would have no owner. Only
+  `OrphanStrict` (reject the create) and `OrphanSkip` (silently drop it)
+  behaved differently, and nothing but one conformance case ever passed them;
+  a consumer that relied on either must now check for the parent itself before
+  calling. `OrphanResurrect` was never implemented — it shared a branch with
+  `OrphanAllow`, and the resurrect-a-deleted-parent behavior its doc comment
+  described left with the JSONL sync layer long ago.
+
+  Every hierarchical-ID create paid a `SELECT COUNT(*)` parent-existence probe
+  to feed a switch whose only reachable arm ignored the answer. That query is
+  now gone from the create path.
 
 ### Fixed
 

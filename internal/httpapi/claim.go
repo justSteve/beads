@@ -311,6 +311,9 @@ type timedProvider struct {
 var (
 	_ uow.IssueReaderSource         = timedProvider{}
 	_ uow.IssueClaimerSource        = timedProvider{}
+	_ uow.BatchCloserSource         = timedProvider{}
+	_ uow.ReadyClaimerSource        = timedProvider{}
+	_ uow.ReleaserSource            = timedProvider{}
 	_ uow.IssueLifecycleSource      = timedProvider{}
 	_ uow.WorkspaceConfigSource     = timedProvider{}
 	_ uow.StatsReporterSource       = timedProvider{}
@@ -319,11 +322,14 @@ var (
 	_ uow.BlockingAnnotatorSource   = timedProvider{}
 	_ uow.TreeWalkerSource          = timedProvider{}
 	_ uow.ReadyCounterSource        = timedProvider{}
+	_ uow.CounterSource             = timedProvider{}
 	_ uow.QuerierSource             = timedProvider{}
 	_ uow.SweeperSource             = timedProvider{}
 	_ uow.DeleterSource             = timedProvider{}
 	_ uow.BatchCreatorSource        = timedProvider{}
 	_ uow.DependencyEditorSource    = timedProvider{}
+	_ uow.MetadataCASSource         = timedProvider{}
+	_ uow.BatchApplierSource        = timedProvider{}
 	_ uow.MemoriesSource            = timedProvider{}
 	_ uow.EventsJournalCursorSource = timedProvider{}
 )
@@ -363,6 +369,32 @@ func (p timedProvider) IssueReader() (issueops.Reader, error) {
 // instead of the recursion looking correct.
 func (p timedProvider) IssueClaimer() (issueops.Claimer, error) {
 	return uow.NewIssueClaimer(p)
+}
+
+// BatchCloser builds the many-issue close role OVER THIS WRAPPER, for the same
+// reason as the roles above. Like BatchApplier it opens one of the longest
+// write units of work on this surface — up to a hundred closes plus their
+// blocked-state maintenance in one transaction — so a recursion here would
+// report uow_ms=0.000 for exactly the requests whose timing matters most.
+func (p timedProvider) BatchCloser() (issueops.BatchCloser, error) {
+	return uow.NewBatchCloser(p)
+}
+
+// ReadyClaimer builds the take-ready-work role OVER THIS WRAPPER, for the same
+// reason and with the same hazard as IssueClaimer: it opens a write unit of
+// work per call, and its scan is the longest read on this surface — it walks
+// the whole ready order past rows other agents took — so a recursion here would
+// report uow_ms=0.000 for exactly the requests whose timing matters most.
+func (p timedProvider) ReadyClaimer() (issueops.ReadyClaimer, error) {
+	return uow.NewReadyClaimer(p)
+}
+
+// Releaser builds the claim-release role OVER THIS WRAPPER, for the same reason
+// and with the same hazard as IssueClaimer: a release opens a write transaction
+// per call, so a recursion here would report uow_ms=0.000 for every one of
+// them.
+func (p timedProvider) Releaser() (issueops.Releaser, error) {
+	return uow.NewReleaser(p)
 }
 
 // IssueLifecycle builds the guarded-mutation role OVER THIS WRAPPER, for the
@@ -415,6 +447,11 @@ func (p timedProvider) ReadyCounter() (issueops.ReadyCounter, error) {
 	return uow.NewReadyCounter(p)
 }
 
+// Counter builds the issue counter OVER THIS WRAPPER, for ReadyCounter's reason.
+func (p timedProvider) Counter() (issueops.Counter, error) {
+	return uow.NewCounter(p)
+}
+
 // Querier builds the boolean-query role OVER THIS WRAPPER, for the same reason
 // and with the same hazard as IssueReader.
 func (p timedProvider) Querier() (issueops.Querier, error) {
@@ -445,6 +482,20 @@ func (p timedProvider) BatchCreator() (issueops.BatchCreator, error) {
 // a WRITE unit of work per call.
 func (p timedProvider) DependencyEditor() (issueops.DependencyEditor, error) {
 	return uow.NewDependencyEditor(p)
+}
+
+// MetadataCAS builds the conditional metadata write OVER THIS WRAPPER, for the
+// same reason and with the same hazard as IssueReader.
+func (p timedProvider) MetadataCAS() (issueops.MetadataCAS, error) {
+	return uow.NewMetadataCAS(p)
+}
+
+// BatchApplier builds the ordered-plan write role OVER THIS WRAPPER, for the
+// same reason as the roles above. It opens the LONGEST write unit of work on
+// this surface — up to a hundred items in one transaction — so a recursion here
+// would report uow_ms=0.000 for exactly the requests whose timing matters most.
+func (p timedProvider) BatchApplier() (issueops.BatchApplier, error) {
+	return uow.NewBatchApplier(p)
 }
 
 // Memories builds the persistent-memory role OVER THIS WRAPPER, for the same

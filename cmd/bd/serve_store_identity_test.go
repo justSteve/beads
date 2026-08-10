@@ -182,6 +182,13 @@ func (s *serveIdentityStore) Close() error { return nil }
 // They hand back serveIdentityRole, which satisfies each interface by
 // EMBEDDING it rather than implementing it: non-nil, so the set is complete,
 // while an actual call panics naming the method it reached.
+func (*serveIdentityStore) BatchCloser() (issueops.BatchCloser, error) {
+	return serveIdentityRole{}, nil
+}
+func (*serveIdentityStore) ReadyClaimer() (issueops.ReadyClaimer, error) {
+	return serveIdentityRole{}, nil
+}
+func (*serveIdentityStore) Releaser() (issueops.Releaser, error) { return serveIdentityRole{}, nil }
 func (*serveIdentityStore) IssueLifecycle() (issueops.Lifecycle, error) {
 	return serveIdentityRole{}, nil
 }
@@ -202,6 +209,7 @@ func (*serveIdentityStore) TreeWalker() (issueops.TreeWalker, error) { return se
 func (*serveIdentityStore) ReadyCounter() (issueops.ReadyCounter, error) {
 	return serveIdentityRole{}, nil
 }
+func (*serveIdentityStore) Counter() (issueops.Counter, error) { return serveIdentityRole{}, nil }
 func (*serveIdentityStore) Querier() (issueops.Querier, error) { return serveIdentityRole{}, nil }
 func (*serveIdentityStore) Sweeper() (issueops.Sweeper, error) { return serveIdentityRole{}, nil }
 func (*serveIdentityStore) Deleter() (issueops.Deleter, error) { return serveIdentityRole{}, nil }
@@ -211,7 +219,13 @@ func (*serveIdentityStore) BatchCreator() (issueops.BatchCreator, error) {
 func (*serveIdentityStore) DependencyEditor() (issueops.DependencyEditor, error) {
 	return serveIdentityRole{}, nil
 }
+func (*serveIdentityStore) BatchApplier() (issueops.BatchApplier, error) {
+	return serveIdentityRole{}, nil
+}
 func (*serveIdentityStore) Memories() (memoryops.Memories, error) {
+	return serveIdentityRole{}, nil
+}
+func (*serveIdentityStore) MetadataCAS() (issueops.MetadataCAS, error) {
 	return serveIdentityRole{}, nil
 }
 
@@ -221,6 +235,10 @@ func (*serveIdentityStore) Memories() (memoryops.Memories, error) {
 // being promoted and the build would say so.
 type serveIdentityRole struct {
 	issueops.Lifecycle
+	issueops.Releaser
+	issueops.ReadyClaimer
+	issueops.BatchCloser
+	issueops.MetadataCAS
 	issueops.WorkspaceConfig
 	issueops.StatsReporter
 	issueops.CycleDetector
@@ -228,11 +246,13 @@ type serveIdentityRole struct {
 	issueops.BlockingAnnotator
 	issueops.TreeWalker
 	issueops.ReadyCounter
+	issueops.Counter
 	issueops.Querier
 	issueops.Sweeper
 	issueops.Deleter
 	issueops.BatchCreator
 	issueops.DependencyEditor
+	issueops.BatchApplier
 	memoryops.Memories
 }
 
