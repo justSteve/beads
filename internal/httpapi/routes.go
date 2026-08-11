@@ -24,6 +24,21 @@ const (
 	customMethodIDValue = "id"
 )
 
+// ProjectIDHeader names the optional per-request workspace-identity stamp. A
+// client that knows which workspace it means to address puts that workspace's
+// project id here; checkProjectStamp (server.go) refuses the request when the id
+// it names is not the one this server serves, so a misdirected read or write is
+// turned away before it can touch the wrong workspace. The header is optional and
+// absent by default: an older client that never sends it is served exactly as
+// before, which is what keeps enforcement additive rather than a new precondition.
+const ProjectIDHeader = "Bd-Project-Id"
+
+// CapProjectEnforce is the behavior capability that advertises this enforcement.
+// Unlike the per-operation tokens it names no route: it tells a client that a
+// stamped request WILL be checked here, so the client can rely on the refusal
+// instead of discovering an older server silently ignored its stamp.
+const CapProjectEnforce = "project.enforce"
+
 // customMethodTarget splits the custom method off the segment the router
 // matched, and reports the row that claims it.
 //
@@ -127,6 +142,17 @@ type route struct {
 	// belongs where TestSpecSecurityMatchesRouteTable can compare it against
 	// the document's per-operation `security` declarations.
 	authExempt bool
+	// projectExempt exempts an operation from the Bd-Project-Id stamp check
+	// (checkProjectStamp). Legitimate only for liveness and the identity
+	// handshake: liveness must answer whatever workspace the caller thinks it
+	// reached, and the handshake is where a client LEARNS the project id to
+	// stamp with — gating it on a matching stamp would make the project id
+	// undiscoverable to a client that does not already have it. It is NOT
+	// coupled to bypassSemaphore: a bypassSemaphore row such as events:watch
+	// carries journal data and stays project-stamp-ENFORCED, so exactly the two
+	// reads that touch no workspace data are exempt and every other route —
+	// streaming or not — is enforced.
+	projectExempt bool
 	// implemented gates the capability list, so a release between slices never
 	// advertises an operation that does not work. Every v0 operation is
 	// implemented as of the read-endpoints slice; the flag stays because the
@@ -152,9 +178,13 @@ var routeTable = []route{
 		bypassSemaphore: true,
 		// The one auth-exempt row. A kubelet probe presents no credential, and
 		// a liveness endpoint that 401s is a pod that restarts forever.
-		authExempt:  true,
-		implemented: true,
-		handler:     (*Server).handleHealth,
+		authExempt: true,
+		// And it answers whatever workspace the caller believed it reached: a
+		// liveness probe gated on a matching project stamp would go dark on a
+		// misconfigured client exactly when an operator needs it most.
+		projectExempt: true,
+		implemented:   true,
+		handler:       (*Server).handleHealth,
 	},
 	{
 		op:      OpGetContext,
@@ -164,8 +194,12 @@ var routeTable = []route{
 		// staying observable under saturation is half of how an operator
 		// tells one wedged server from another.
 		bypassSemaphore: true,
-		implemented:     true,
-		handler:         (*Server).handleContext,
+		// It is also where a client LEARNS this server's project id, so it
+		// cannot itself require a matching stamp: the handshake that hands out
+		// the id must answer before the client has one to send.
+		projectExempt: true,
+		implemented:   true,
+		handler:       (*Server).handleContext,
 	},
 	{
 		op:          OpListReadyWork,
@@ -264,6 +298,50 @@ var routeTable = []route{
 		handler:     (*Server).handleUpdate,
 	},
 	{
+		op:     OpListRelatedIssues,
+		method: http.MethodGet,
+		// A SUB-RESOURCE of the issue-detail path, and the surface's first. The
+		// segment is a LITERAL after a single-segment wildcard, so pattern and
+		// specPath agree and the router registers the documented path itself —
+		// no declaration is needed and the claim row's exception does not apply.
+		//
+		// It collides with nothing. `/v0/beads/issues/{id}` is a different whole
+		// path, which is what ServeMux matches on, and the custom-method
+		// dispatcher's `/v0/beads/issues/{idop}` is registered under POST and is
+		// one segment shorter besides.
+		pattern:     "/v0/beads/issues/{id}/related",
+		capability:  "issues.related",
+		implemented: true,
+		handler:     (*Server).handleListRelatedIssues,
+	},
+	{
+		op:     OpAddComment,
+		method: http.MethodPost,
+		// The second SUB-RESOURCE row and the first that writes, spelled the way
+		// the neighbor read above is: a LITERAL segment after a single-segment
+		// wildcard, so pattern and specPath agree, the router registers the
+		// documented path itself, and the claim row's exception does not apply.
+		//
+		// A PLAIN collection POST rather than a custom method, for the single
+		// create's reason: this creates one member of the collection the path
+		// names. It is the one place a sub-resource earns the method outright.
+		//
+		// It collides with nothing, and the POST wildcard is the collision worth
+		// checking rather than assuming: `/v0/beads/issues/{idop}` matches ONE
+		// segment after `/issues/`, and this path has two, so the dispatcher
+		// never sees a request for it. TestCustomMethodsNarrowThePOSTSurface and
+		// TestAddCommentPathReachesItsHandler pin the two halves.
+		//
+		// The collection has no GET row and must not grow one by reflex: no role
+		// answers a comment page, and the thread is read through
+		// `GET /v0/beads/issues/{id}?include_comments=true`. A GET here lands on
+		// the catch-all, which answers 404 — this surface has no 405.
+		pattern:     "/v0/beads/issues/{id}/comments",
+		capability:  "issues.addComment",
+		implemented: true,
+		handler:     (*Server).handleAddComment,
+	},
+	{
 		op:          OpListSettings,
 		method:      http.MethodGet,
 		pattern:     "/v0/beads/config",
@@ -280,12 +358,56 @@ var routeTable = []route{
 		handler:     (*Server).handleGetSetting,
 	},
 	{
+		op:     OpSetSetting,
+		method: http.MethodPut,
+		// THE SURFACE'S FIRST PUT, and the method is what the operation means
+		// rather than a preference: the caller names the resource by path and
+		// sends the value that becomes its whole state, which is what PUT
+		// already means, and the write is idempotent in the strict sense.
+		//
+		// It shares its pattern with the read above and the delete below and
+		// differs only in method, which ServeMux registers together — the same
+		// arrangement the memory key already has, so the three rows cannot
+		// collide.
+		pattern:     "/v0/beads/config/{key}",
+		capability:  "config.set",
+		implemented: true,
+		handler:     (*Server).handleSetSetting,
+	},
+	{
+		op:     OpUnsetSetting,
+		method: http.MethodDelete,
+		// The surface's second DELETE, and forgetMemory's argument unchanged:
+		// one named resource, no body, no flags.
+		pattern:     "/v0/beads/config/{key}",
+		capability:  "config.unset",
+		implemented: true,
+		handler:     (*Server).handleUnsetSetting,
+	},
+	{
 		op:          OpListDependencies,
 		method:      http.MethodGet,
 		pattern:     "/v0/beads/dependencies",
 		capability:  "dependencies.list",
 		implemented: true,
 		handler:     (*Server).handleListDependencies,
+	},
+	{
+		op:     OpCountDependencyEdges,
+		method: http.MethodGet,
+		// A collection-level custom method on the dependency collection,
+		// spelled the way ready:count and issues:count are: both segments are
+		// LITERAL, so pattern and specPath agree and the router registers the
+		// documented path itself.
+		//
+		// It collides with nothing. The three literal paths under this
+		// collection — /cycles, /blocking, /tree — all carry a separating
+		// slash, and the plain collection GET is a different whole segment,
+		// which is what ServeMux matches on.
+		pattern:     "/v0/beads/dependencies:count",
+		capability:  "dependencies.count",
+		implemented: true,
+		handler:     (*Server).handleCountDependencyEdges,
 	},
 	{
 		op:     OpListBlockingAnnotations,
@@ -619,11 +741,21 @@ func (r route) specPathOf() string {
 	return r.pattern
 }
 
-// Capabilities lists the operations this build actually implements, which is
-// what ContextResponse.capabilities carries. Derived from the route table and
-// gated on `implemented`, so a stub can never advertise itself: a client that
-// checks capabilities before calling gets a truthful answer from every release,
-// including one cut halfway through the endpoint slices.
+// behaviorCapabilities are advertised tokens that name a server-wide BEHAVIOR
+// rather than an operation. They ride in the same ContextResponse.capabilities
+// list as the per-operation tokens — a client checks the one list — but they are
+// not derived from the route table, because the behavior they announce is not a
+// route. project.enforce announces per-request Bd-Project-Id enforcement
+// (checkProjectStamp): a stamped client reads it to know the refusal is available
+// rather than silently dropped by an older server.
+var behaviorCapabilities = []string{CapProjectEnforce}
+
+// Capabilities lists what this build advertises in ContextResponse.capabilities:
+// the operations it actually implements, gated on `implemented` so a stub can
+// never advertise itself, PLUS the behavior tokens for server-wide behaviors this
+// build enforces. A client that checks capabilities before calling gets a
+// truthful answer from every release, including one cut halfway through the
+// endpoint slices.
 func Capabilities() []string {
 	var out []string
 	for _, rt := range routeTable {
@@ -631,6 +763,7 @@ func Capabilities() []string {
 			out = append(out, rt.capability)
 		}
 	}
+	out = append(out, behaviorCapabilities...)
 	slices.Sort(out)
 	return out
 }

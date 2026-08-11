@@ -307,6 +307,9 @@ func runServe() error {
 			Stats:             roles.stats,
 			CycleDetector:     roles.cycles,
 			EdgeReader:        roles.edges,
+			GraphCounter:      roles.edgeCounter,
+			Relations:         roles.relations,
+			Commenter:         roles.commenter,
 			BlockingAnnotator: roles.blocking,
 			TreeWalker:        roles.tree,
 			ReadyCounter:      roles.readyCounter,
@@ -617,6 +620,54 @@ func errServeEmbedded() error {
 		&storage.ErrUnsupported{Op: "serve", Backend: "embedded-dolt"})
 }
 
+// serveRoleSource is the surface serveIssueRoles reaches on the store, spelled
+// out rather than taken as a whole storage.DoltStorage.
+//
+// THE POINT IS THE TEST STUBS. A stub that stands in for a store has to satisfy
+// whatever this function asks for, and the only affordable way to satisfy a
+// hundred-method interface is to embed it and leave it nil — which answers every
+// accessor the stub forgot with a promoted method on a nil interface. That is a
+// segfault inside the loop below rather than a compile error, and it has landed
+// twice: once on GraphCounter in serve_source_test.go, and once on the same role
+// in serve_store_identity_test.go, where no local -run pattern named the test
+// and only a full-package CI shard found it.
+//
+// Named narrowly, a stub can DECLARE this set and assert it, so the next role
+// added to the loop below is a build failure in the file that has to grow a
+// method — with the method's name in the error.
+//
+// A whole store is one of these, which is what the assertion beneath it pins:
+// the production call site passes exactly what it always did.
+type serveRoleSource interface {
+	IssueReader() (issueops.Reader, error)
+	IssueClaimer() (issueops.Claimer, error)
+	BatchCloser() (issueops.BatchCloser, error)
+	ReadyClaimer() (issueops.ReadyClaimer, error)
+	Releaser() (issueops.Releaser, error)
+	IssueLifecycle() (issueops.Lifecycle, error)
+	WorkspaceConfig() (issueops.WorkspaceConfig, error)
+	StatsReporter() (issueops.StatsReporter, error)
+	CycleDetector() (issueops.CycleDetector, error)
+	EdgeReader() (issueops.EdgeReader, error)
+	GraphCounter() (issueops.GraphCounter, error)
+	IssueRelations() (issueops.Relations, error)
+	Commenter() (issueops.Commenter, error)
+	BlockingAnnotator() (issueops.BlockingAnnotator, error)
+	TreeWalker() (issueops.TreeWalker, error)
+	ReadyCounter() (issueops.ReadyCounter, error)
+	Counter() (issueops.Counter, error)
+	Querier() (issueops.Querier, error)
+	Sweeper() (issueops.Sweeper, error)
+	Deleter() (issueops.Deleter, error)
+	BatchCreator() (issueops.BatchCreator, error)
+	DependencyEditor() (issueops.DependencyEditor, error)
+	MetadataCAS() (issueops.MetadataCAS, error)
+	BatchApplier() (issueops.BatchApplier, error)
+	Memories() (memoryops.Memories, error)
+}
+
+var _ serveRoleSource = storage.DoltStorage(nil)
+
 // serveIssueRoles takes the roles this server answers from off the store the
 // root command already opened.
 //
@@ -636,7 +687,7 @@ func errServeEmbedded() error {
 // It returns the WHOLE set httpapi.Config requires; Listen refuses a partial
 // set (see checkDatabaseSource), so a role missing here is a startup failure
 // rather than a nil dereference on the first request that reaches it.
-func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, error) {
+func serveIssueRoles(src serveRoleSource, journalEnabled bool) (serveRoles, error) {
 	var roles serveRoles
 	if src == nil {
 		// A set of nil roles would reach Listen as "no database source" —
@@ -664,6 +715,9 @@ func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, 
 		{"stats reporter", func() (err error) { roles.stats, err = src.StatsReporter(); return }},
 		{"cycle detector", func() (err error) { roles.cycles, err = src.CycleDetector(); return }},
 		{"edge reader", func() (err error) { roles.edges, err = src.EdgeReader(); return }},
+		{"graph counter", func() (err error) { roles.edgeCounter, err = src.GraphCounter(); return }},
+		{"issue relations", func() (err error) { roles.relations, err = src.IssueRelations(); return }},
+		{"commenter", func() (err error) { roles.commenter, err = src.Commenter(); return }},
 		{"blocking annotator", func() (err error) { roles.blocking, err = src.BlockingAnnotator(); return }},
 		{"tree walker", func() (err error) { roles.tree, err = src.TreeWalker(); return }},
 		{"ready counter", func() (err error) { roles.readyCounter, err = src.ReadyCounter(); return }},
@@ -684,7 +738,17 @@ func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, 
 			// assertion has to reach the concrete store or it finds nothing at
 			// all. Nothing is skipped by going the whole way: there is no
 			// journal decorator to peel past.
-			cursor, ok := storage.UnwrapStore(src).(storage.EventsJournalCursor)
+			//
+			// A ROLE REACHED BY ASSERTION IS NOT A ROLE OUTSIDE THE RULES.
+			// journalops.Journal is a facade role with a contract tier and a
+			// per-leg lock like every other; what it has no accessor for is
+			// the reason issueops.Importer has none either — the capability is
+			// not on storage.DoltStorage's published surface, so the census
+			// that would otherwise miss it reads SOURCE rather than reflecting
+			// over accessors (backend/conformance/role_coverage_scan_test.go).
+			// The assertion below is what a front door does with such a role,
+			// not a shortcut around one.
+			cursor, ok := serveJournalCursor(src)
 			if ok {
 				roles.eventsJournal = cursor
 				return nil
@@ -706,6 +770,28 @@ func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, 
 		}
 	}
 	return roles, nil
+}
+
+// serveJournalCursor is storage.UnwrapStore reached from serveRoleSource, which
+// is narrower than the whole store UnwrapStore takes. A source that is not a
+// store has no decorator to peel — the test stubs are exactly that — so it is
+// asked for the seam as it stands.
+//
+// It survives the journal's promotion to a facade role (journalops.Journal,
+// which storage.EventsJournalCursor aliases) unchanged, and deliberately: a
+// role with no accessor is reached exactly this way. issueops.Importer set the
+// precedent — one accessor, none on the store interface — and the apparatus
+// that keeps such a role honest is the conformance census, which parses the
+// facade packages for declarations instead of reflecting over the accessors a
+// store hands out. There is no accessor for this function to have been
+// replaced by.
+func serveJournalCursor(src serveRoleSource) (storage.EventsJournalCursor, bool) {
+	raw := any(src)
+	if store, ok := src.(storage.DoltStorage); ok {
+		raw = storage.UnwrapStore(store)
+	}
+	cursor, ok := raw.(storage.EventsJournalCursor)
+	return cursor, ok
 }
 
 // serveRoles is the store-shaped database source, assembled once before Listen.
@@ -736,6 +822,9 @@ type serveRoles struct {
 	stats        issueops.StatsReporter
 	cycles       issueops.CycleDetector
 	edges        issueops.EdgeReader
+	edgeCounter  issueops.GraphCounter
+	relations    issueops.Relations
+	commenter    issueops.Commenter
 	blocking     issueops.BlockingAnnotator
 	tree         issueops.TreeWalker
 	readyCounter issueops.ReadyCounter
@@ -769,10 +858,14 @@ type serveRoles struct {
 	memories memoryops.Memories
 	// eventsJournal is the only role here that comes from a TYPE ASSERTION
 	// rather than an accessor, because the journal is not part of DoltStorage's
-	// published surface: it is engine state on a dolt_ignored table that the two
-	// concrete stores implement and a backend may not. Missing it is a startup
-	// error rather than a route that 500s, which is the same deal every other
-	// role here takes.
+	// published surface: it is a replay feed over engine state on a
+	// dolt_ignored table that the two concrete stores implement and a backend
+	// may not. Missing it is a startup error rather than a route that 500s,
+	// which is the same deal every other role here takes.
+	//
+	// It IS a role — journalops.Journal, which storage.EventsJournalCursor
+	// aliases — with its own contract tier and per-leg lock. Accessorless is
+	// the issueops.Importer shape, not an exemption; see serveJournalCursor.
 	eventsJournal storage.EventsJournalCursor
 }
 

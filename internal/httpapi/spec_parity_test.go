@@ -386,6 +386,36 @@ func TestSpecDefaultsMatchSharedConstants(t *testing.T) {
 			t.Errorf("%s: limit description does not document the non-loopback refusal of limit=0", tc.opID)
 		}
 	}
+
+	// The anchor bound on ALL THREE dependency-collection reads. Each bounds
+	// the same thing — how many issues one call may ask about — from the same
+	// maxDependencyAnchors, and each says so in prose. Nothing kept the
+	// document's number and the constant together until this: the bound is
+	// enforced in the handler, so a spec that drifted to a different maxItems
+	// would be refused by the server it documents, at a number no reader could
+	// have predicted.
+	//
+	// THE THIRD ROW IS THE POINT. listBlockingAnnotations enforces the same
+	// constant (blocking.go) and declares the same maxItems, and it predates
+	// this gate — so a two-operation loop would have pinned the copies that
+	// happened to be in the slice that wrote it and left the oldest one free
+	// to drift. Every operation reading maxDependencyAnchors belongs here, and
+	// the next one to do so must be added.
+	for _, opID := range []string{OpListDependencies, OpCountDependencyEdges, OpListBlockingAnnotations} {
+		so, ok := ops[opID]
+		if !ok {
+			t.Fatalf("operation %q missing from the spec", opID)
+		}
+		schema := mapAt(t, specParam(t, so, "issue_id"), "schema")
+		if got, ok := schema["maxItems"].(int); !ok || got != maxDependencyAnchors {
+			t.Errorf("%s: issue_id maxItems = %v, want the shared bound %d", opID, schema["maxItems"], maxDependencyAnchors)
+		}
+		// At least one is required on both, and the schema is where a
+		// generated client learns it.
+		if got, ok := schema["minItems"].(int); !ok || got != 1 {
+			t.Errorf("%s: issue_id minItems = %v, want 1", opID, schema["minItems"])
+		}
+	}
 }
 
 // capabilityToken matches one backticked capability token in the
@@ -879,9 +909,17 @@ func TestClaimNextRequestMembersMatchTheHandler(t *testing.T) {
 // admit one set: a claim answering a different question than the listing shows
 // would hand an agent work the listing never offered it.
 //
-// `limit` is the one deliberate difference, and it is asserted as an absence
-// rather than merely not listed, because it is the parameter this operation
-// refuses BY VALUE.
+// The deliberate differences are the listing's own PAGE knobs, which are not
+// filters: they bound or shape what one request returns rather than selecting
+// which rows are eligible, so a claim has no use for them.
+// issueops.ValidateClaimNextRequest refuses each one by VALUE, and because
+// readyFilters does not decode them, the HTTP door refuses them earlier still
+// as an unknown parameter. Each is asserted as an absence from claimNext rather
+// than merely left off the comparison, because a documented parameter that is
+// always a 400 is a trap either way.
+//
+// `sort` is deliberately NOT on that list. It picks WHICH row comes first, so
+// it changes which one a claim takes, and both operations must admit it.
 func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	doc := loadSpec(t)
 	names := func(path, method string) map[string]bool {
@@ -898,10 +936,19 @@ func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	listing := names("/v0/beads/ready", "get")
 	claimNext := names("/v0/beads/issues:claimNext", "post")
 
-	if !listing["limit"] {
-		t.Fatal("the listing no longer publishes `limit`; this test's one exception is stale")
+	pageKnobs := map[string]string{
+		"limit": "bounds the page; a claim takes one row however large the pool it scanned",
+		"brief": "projects the rows a page returns; a claim refetches its winning row whole, so there is nothing to project",
 	}
-	delete(listing, "limit")
+	for name, why := range pageKnobs {
+		if !listing[name] {
+			t.Fatalf("the listing no longer publishes `%s`; this test's exception for it is stale (%s)", name, why)
+		}
+		delete(listing, name)
+		if claimNext[name] {
+			t.Errorf("claimNext publishes `%s`; it refuses one by value (%s), and a documented parameter that is always a 400 is a trap", name, why)
+		}
+	}
 
 	if extra := diff(claimNext, listing); len(extra) > 0 {
 		t.Errorf("claimNext publishes parameters the ready listing does not: %v\n"+
@@ -909,10 +956,8 @@ func TestClaimNextAdmitsExactlyTheListingsFilters(t *testing.T) {
 	}
 	if missing := diff(listing, claimNext); len(missing) > 0 {
 		t.Errorf("the ready listing publishes parameters claimNext does not: %v\n"+
-			"the handler decodes them through readyFilters either way, so the document is understating what it accepts", missing)
-	}
-	if claimNext["limit"] {
-		t.Error("claimNext publishes `limit`; it refuses one, and a documented parameter that is always a 400 is a trap")
+			"the handler decodes them through readyFilters either way, so the document is understating what it accepts.\n"+
+			"If one of these is a page knob rather than a filter, add it to pageKnobs above with its reason", missing)
 	}
 }
 
@@ -944,6 +989,102 @@ func TestReleaseRequestMembersMatchTheHandler(t *testing.T) {
 	}
 	if missing := diff(accepted, specProps); len(missing) > 0 {
 		t.Errorf("the release handler accepts members the ReleaseIssueRequest schema does not document: %v", missing)
+	}
+}
+
+// TestSetSettingRequestMembersMatchTheHandler is the release's gate for the
+// settings write body.
+//
+// The member this is really guarding is the one that is NOT there. The key is
+// the path's, and a `key` member arriving in the body — documented or honored —
+// would give one request two anchors, so both halves of the check matter: the
+// handler refuses it as unknown, and the schema must not promise it.
+func TestSetSettingRequestMembersMatchTheHandler(t *testing.T) {
+	accepted := map[string]bool{}
+	for _, name := range setSettingRequestMembers {
+		accepted[name] = true
+	}
+
+	goFields := jsonTagNames(t, reflect.TypeOf(apigen.SetSettingRequest{}))
+	if extra := diff(goFields, accepted); len(extra) > 0 {
+		t.Errorf("generated SetSettingRequest declares members the settings write refuses as unknown: %v", extra)
+	}
+	if missing := diff(accepted, goFields); len(missing) > 0 {
+		t.Errorf("the settings write accepts members SetSettingRequest does not declare: %v", missing)
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "SetSettingRequest")
+	specProps := schemaProperties(t, doc, schema)
+	if extra := diff(specProps, accepted); len(extra) > 0 {
+		t.Errorf("the SetSettingRequest schema documents members the settings write refuses: %v", extra)
+	}
+	if missing := diff(accepted, specProps); len(missing) > 0 {
+		t.Errorf("the settings write accepts members the SetSettingRequest schema does not document: %v", missing)
+	}
+
+	if accepted["key"] || specProps["key"] {
+		t.Error("SetSettingRequest publishes `key`; the anchor is the path parameter and must have one spelling")
+	}
+}
+
+// TestRemovedSettingPublishesNothingButTheKey pins the removal's response shape
+// against the document from the SERVER's side, which the schema alone cannot do:
+// `RemovedSetting` is unpinned, so nothing else fails when a member is added to
+// the Go type and to the schema together.
+//
+// Both absences are the contract. `removed` cannot be honest — the storage seam
+// discards the affected-row count on every implementation — and `value` would
+// publish, on the one settings operation that withholds nothing, exactly the
+// credential `GET /v0/beads/config/{key}` redacts.
+func TestRemovedSettingPublishesNothingButTheKey(t *testing.T) {
+	if got := jsonTagNames(t, reflect.TypeOf(apigen.RemovedSetting{})); len(got) != 1 || !got["key"] {
+		t.Errorf("RemovedSetting declares %v, want `key` alone", got)
+	}
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "RemovedSetting")
+	if got := schemaProperties(t, doc, schema); len(got) != 1 || !got["key"] {
+		t.Errorf("the RemovedSetting schema documents %v, want `key` alone", got)
+	}
+}
+
+// TestAddCommentRequestMembersMatchTheHandler is the release's gate for the
+// comment body.
+//
+// The member it is really guarding is `author`. Every other body on this surface
+// spells its provenance `actor`, so `author` is the one member here a reflex
+// edit would "fix" — and the two are not interchangeable: `actor` attributes a
+// mutation and `author` IS part of the row, echoed back by every read of the
+// thread. Renamed on either side alone, this fails.
+func TestAddCommentRequestMembersMatchTheHandler(t *testing.T) {
+	accepted := map[string]bool{}
+	for _, name := range addCommentRequestMembers {
+		accepted[name] = true
+	}
+
+	goFields := jsonTagNames(t, reflect.TypeOf(apigen.AddCommentRequest{}))
+	if extra := diff(goFields, accepted); len(extra) > 0 {
+		t.Errorf("generated AddCommentRequest declares members the add-comment handler refuses as unknown: %v", extra)
+	}
+	if missing := diff(accepted, goFields); len(missing) > 0 {
+		t.Errorf("the add-comment handler accepts members AddCommentRequest does not declare: %v", missing)
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "AddCommentRequest")
+	specProps := schemaProperties(t, doc, schema)
+	if extra := diff(specProps, accepted); len(extra) > 0 {
+		t.Errorf("the AddCommentRequest schema documents members the add-comment handler refuses: %v", extra)
+	}
+	if missing := diff(accepted, specProps); len(missing) > 0 {
+		t.Errorf("the add-comment handler accepts members the AddCommentRequest schema does not document: %v", missing)
+	}
+
+	// The issue is the PATH's, and the schema must not publish a second spelling
+	// of it: a body carrying `issue_id` beside a path `{id}` is one request with
+	// two anchors and a question about what to do when they disagree.
+	if accepted["issue_id"] || specProps["issue_id"] {
+		t.Error("AddCommentRequest publishes `issue_id`; the anchor is the path parameter and must have one spelling")
 	}
 }
 

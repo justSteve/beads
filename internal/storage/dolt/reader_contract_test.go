@@ -152,6 +152,12 @@ func TestReaderGetOptionalRowListsAreOffByDefault(t *testing.T) {
 	conformance.RunReaderGetOptionalRowListsAreOffByDefault(t, ctx, fixture)
 }
 
+func TestReaderGetBriefDepsProjectsTheDependencyRows(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderGetBriefDepsProjectsTheDependencyRows(t, ctx, fixture)
+}
+
 func TestReaderGetDetailShapeMatchesTheSeededIssue(t *testing.T) {
 	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
 	defer cleanup()
@@ -238,6 +244,18 @@ func TestReaderListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt(t *testi
 	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
 	defer cleanup()
 	conformance.RunReaderListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt(t, ctx, fixture)
+}
+
+func TestReaderListBriefDropsTheFreeFormTextAndNothingElse(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderListBriefDropsTheFreeFormTextAndNothingElse(t, ctx, fixture)
+}
+
+func TestReaderReadyBriefDropsTheFreeFormTextAndNothingElse(t *testing.T) {
+	fixture, ctx, cleanup := newDoltReaderFixture(t, "rdr")
+	defer cleanup()
+	conformance.RunReaderReadyBriefDropsTheFreeFormTextAndNothingElse(t, ctx, fixture)
 }
 
 // newDoltReaderFixture composes the shared role kit with the reader accessor.

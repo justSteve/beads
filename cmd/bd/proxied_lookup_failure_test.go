@@ -109,16 +109,6 @@ func showViewCmd(view string) *cobra.Command {
 	return cmd
 }
 
-// cmdWithStringFlag registers one string flag so the command under test does
-// not fall back to an environment lookup for it - `bd comment add` shells out
-// to git for the author when --author is empty, which has nothing to do with
-// what is being tested here.
-func cmdWithStringFlag(name, value string) *cobra.Command {
-	cmd := &cobra.Command{}
-	cmd.Flags().String(name, value, "")
-	return cmd
-}
-
 // closeReasonCmd registers the reason flags `bd close` reads before it resolves
 // anything. collectCloseReasonFlags returns an error for an unregistered one,
 // which would abort the command ahead of the lookup under test.
@@ -182,7 +172,7 @@ var proxiedLookupCommands = []struct {
 	{
 		name: "state",
 		run: func(ctx context.Context) error {
-			return runStateProxiedServer(ctx, stubMissingID, "phase")
+			return inProxiedRoute(func() error { return runState(ctx, stubMissingID, "phase") })
 		},
 		wantNotFound: "Error: resolving bd-missing: not found",
 		wantHardErr:  "Error: resolving bd-missing: connection reset by peer",
@@ -311,9 +301,14 @@ var proxiedLookupCommands = []struct {
 	{
 		name: "set state",
 		run: func(ctx context.Context) error {
-			return runSetStateProxiedServer(ctx, stubMissingID, "phase", "done", "")
+			return inProxiedRoute(func() error { return runSetState(ctx, stubMissingID, "phase", "done", "") })
 		},
-		wantNotFound: "Error: issue bd-missing not found",
+		// Both routes now resolve through resolveLabelTarget, so this is the
+		// direct route's message rather than the retired proxied twin's
+		// "issue bd-missing not found" — the same alignment `bd label`'s
+		// migration made, and for the same reason: resolution happens before
+		// the role is asked for anything, so the failure is not about state.
+		wantNotFound: "Error: resolving bd-missing: not found",
 		wantHardErr:  "Error: resolving bd-missing: connection reset by peer",
 	},
 	{
@@ -336,10 +331,26 @@ var proxiedLookupCommands = []struct {
 	{
 		name: "comment add",
 		run: func(ctx context.Context) error {
-			return runCommentsAddProxiedServer(cmdWithStringFlag("author", "tester"), ctx, []string{stubMissingID, "hello"})
+			return runCommentsAddProxiedServer(ctx, stubMissingID, "tester", "hello")
 		},
 		wantNotFound: "Error: issue bd-missing not found",
 		wantHardErr:  "Error: resolving bd-missing: connection reset by peer",
+	},
+	{
+		name: "human respond",
+		run: func(ctx context.Context) error {
+			return runHumanRespondProxiedServer(ctx, stubMissingID, "Response: resp")
+		},
+		wantNotFound: "Error: issue not found: bd-missing",
+		wantHardErr:  "Error: resolving issue ID bd-missing: connection reset by peer",
+	},
+	{
+		name: "human dismiss",
+		run: func(ctx context.Context) error {
+			return runHumanDismissProxiedServer(ctx, stubMissingID, "Dismissed")
+		},
+		wantNotFound: "Error: issue not found: bd-missing",
+		wantHardErr:  "Error: resolving issue ID bd-missing: connection reset by peer",
 	},
 }
 

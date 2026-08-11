@@ -54,9 +54,23 @@ const (
 	// not a client bug.
 	CodeInvalidCursor Code = "invalid_cursor"
 	CodeNotFound      Code = "not_found"
-	// CodeAlreadyClaimed carries the holder in the `assignee` extension
-	// member, read inside the same transaction — never parsed out of the
-	// sentinel's message text.
+	// CodeAlreadyClaimed reports a live foreign holder. Where the `assignee`
+	// extension member is present it is the holder, read inside the same
+	// transaction and never parsed out of the sentinel's message text — but
+	// PRESENCE IS PER PRODUCER, and there are four:
+	//
+	//   - claimIssue always attaches it: the claim's conflict path reads the
+	//     row it lost to, so it has the holder in hand.
+	//   - updateIssue and applyBatch attach it CONDITIONALLY, when the refusing
+	//     error carried one. The assignee fence
+	//     (AuthorizeAssigneeTransferWithPools) refuses without naming the
+	//     holder, so an implementation that reported none leaves it absent.
+	//   - releaseIssue NEVER attaches it. It is the same fence pointed the
+	//     other way and it names nobody.
+	//
+	// A client therefore treats the member as optional on every operation but
+	// the claim, and re-reads the row when it is absent. Absence means "this
+	// refusal could not name the holder", never "nobody holds it".
 	CodeAlreadyClaimed Code = "already_claimed"
 	CodeNotClaimable   Code = "not_claimable"
 	// CodeNotReleasable is a row refusing to give up a claim, and it covers
@@ -271,6 +285,13 @@ const (
 	// recovery is always to send something different, never to retry; the
 	// detail says which case it was.
 	ReasonInvalidValue Reason = "invalid_value"
+	// ReasonProjectMismatch means the request stamped a Bd-Project-Id that is
+	// not the project this server serves. Like the Host-header refusal it is a
+	// document-level 400 reachable on every enforced route rather than
+	// per-operation behavior, and it is the one refusal that carries
+	// `server_project_id`. The recovery is to stop stamping this server with
+	// another workspace's id, never to retry the same request.
+	ReasonProjectMismatch Reason = "project_mismatch"
 )
 
 // staticDetail is the set of codes whose `detail` is FIXED, whatever the
@@ -391,11 +412,47 @@ const (
 	OpListSettings         = "listSettings"
 	OpGetSetting           = "getSetting"
 	OpListDependencyCycles = "listDependencyCycles"
+	// OpSetSetting stores one setting, replacing whatever was there. It is the
+	// surface's first PUT, and the method IS the argument: the caller names the
+	// resource by path and sends the value that becomes its whole state.
+	// rememberMemory posts to a COLLECTION because its key may be derived from
+	// the content; here the caller can always name what it is writing.
+	OpSetSetting = "setSetting"
+	// OpUnsetSetting removes one setting. It is the second DELETE on this
+	// surface and the one that does NOT 404 on a key nothing stored: this role
+	// reports no affected-row count, so the operation states an intended end
+	// state rather than an act performed. See its operationCodes row.
+	OpUnsetSetting = "unsetSetting"
 	// OpListDependencies reads STORED EDGE ROWS for several issues at once.
 	// It is a separate operation from getIssue's embedded `dependencies`
 	// member because it answers per named issue, reports the ids that named
 	// nothing, and returns edges whose target this database holds no row for.
 	OpListDependencies = "listDependencies"
+	// OpCountDependencyEdges sizes each anchor's edge set in ONE named
+	// direction, behind issueops.GraphCounter. It is NOT listDependencies
+	// counted: that operation is outgoing-only and takes no direction, this one
+	// REQUIRES one and answers about either end, so the two agree on a number
+	// only at direction=out. It is also not a third Counter method — that role
+	// answers about a set of ISSUES described by a predicate, and this one about
+	// EDGES anchored on ids, per anchor.
+	OpCountDependencyEdges = "countDependencyEdges"
+	// OpListRelatedIssues reads ONE issue's neighbors in a named direction,
+	// behind issueops.Relations. It is NOT listDependencies narrowed to one
+	// anchor: that operation answers the stored edge ROWS with their targets
+	// spelled as stored, and this one answers the ISSUES on the far end — so an
+	// edge whose target this database holds no row for is a row there and no
+	// neighbor here, and the two answer different arities of question.
+	//
+	// It is a SUB-RESOURCE OF THE ISSUE rather than a member of the dependency
+	// collection, and the argument is ELEMENT IDENTITY rather than a claim about
+	// what that collection answers with — getDependencyTree answers hydrated
+	// TreeNodes, so "everything under /dependencies is about edges" would be
+	// false. What decides it is narrower and checkable: the rows here are the
+	// SAME pinned struct getIssue already carries under `dependencies` and
+	// `dependents`, so this operation is that pair, standalone,
+	// direction-parameterized and type-filterable — and it belongs on the
+	// resource whose members it publishes.
+	OpListRelatedIssues = "listRelatedIssues"
 	// OpListBlockingAnnotations reads the DERIVED blocking decoration for
 	// several issues at once — open blockers, issues blocked, and the parent.
 	// It is separate from listDependencies because it answers a summary over
@@ -452,6 +509,17 @@ const (
 	// codes come from: an occupied id, and the graph refusing the edges the
 	// request asked for.
 	OpCreateIssue = "createIssue"
+	// OpAddComment appends one comment to the thread an issue owns, behind
+	// issueops.Commenter. It is the surface's first write on a SUB-RESOURCE
+	// COLLECTION, and a plain collection POST for OpCreateIssue's reason:
+	// creating one member of the collection a path names is what POST means.
+	//
+	// The row it creates is the same pinned Comment getIssue already carries
+	// under `comments`, which is what puts the operation on the issue rather
+	// than on a collection of its own. The collection publishes no GET,
+	// deliberately: no role answers a comment PAGE, and inventing one here
+	// would be this surface deciding a paging contract the role declined.
+	OpAddComment = "addComment"
 	// OpBatchCreateIssues creates many issues as one transaction, or none.
 	OpBatchCreateIssues = "batchCreateIssues"
 	// OpApplyBatch applies an ORDERED, heterogeneous plan — creates, updates,
@@ -565,6 +633,29 @@ var operationCodes = map[string][]Code{
 	// answer on this surface, so the only refusal a key can earn is the 400
 	// that says it was not a key.
 	OpGetSetting: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// getSetting's row PLUS the ROLE's refusals, which is the whole difference
+	// between the read half and the write half. Two of the role's three are
+	// reachable — `issue_prefix` in either spelling, and a `status.custom` that
+	// does not parse — and both arrive as the 400 they are, on the sentinel,
+	// through the shared ErrValidation line every role-backed handler here draws.
+	//
+	// NO 404 and no conflict code, both inherited from the read beside it. A key
+	// nothing stored and a key stored empty are one answer on this plane, so
+	// there is no resource this write can fail to address; and the write is an
+	// unconditional replace, so there is no state for it to lose a race against.
+	// A `revision` guard would need a row version this plane does not hold.
+	OpSetSetting: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// getSetting's row EXACTLY, and that is this operation's whole error story:
+	// it takes the same parameter, judges it the same way, and reaches a role
+	// whose only refusal — an empty key — the path bound has already made
+	// unreachable. Its 400 is therefore entirely the transport's.
+	//
+	// THE ABSENT 404 IS THE DIVERGENCE FROM forgetMemory, which addresses the
+	// same shape of resource with the same method and answers 404 for a key it
+	// held nothing under. That role reports Found; this one cannot — the storage
+	// seam discards the affected-row count on all three legs — so a 404 here
+	// would publish a distinction this server would have to invent.
+	OpUnsetSetting: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// The 400 here is this operation's own, not the document-level
 	// unknown-parameter rule: a malformed `skip_blocked`, and the EMPTY
 	// `assignee` the document refuses rather than answering with the rows that
@@ -577,10 +668,40 @@ var operationCodes = map[string][]Code{
 	// the response's `missing` member, so a batch keeps the answers for the ids
 	// that were found. A 404 would discard them.
 	OpListDependencies: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The stored-edge read's vocabulary exactly, and no not_found for its
+	// reason: an id that names nothing is reported on its own anchor, so a
+	// batch keeps the answers for the ids that were found. The role has no
+	// ErrNotFound at all, which its doc states.
+	//
+	// Its 400 is BOTH the transport's and the ROLE's, which is what separates
+	// this row from GET /v0/beads/issues:count beside it. That operation
+	// refuses its one enum at the edge and reaches no role refusal; here
+	// ValidateEdgeCountRequest runs inside the single shared body — the role
+	// has one body on all three legs, so the check could not belong to an
+	// accessor — and four of its refusals are reachable over the wire: a
+	// missing or unrecognized direction, a status beside direction=out, an
+	// empty id, and a dependency type no edge could carry. Each reaches the
+	// client as the 400 it is, on the sentinel, with the parameter named in the
+	// validator's own order.
+	OpCountDependencyEdges: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// The same vocabulary as the stored-edge read beside it, and no not_found
 	// for a stronger version of the same reason: this operation probes no id's
 	// existence at all, so there is nothing it could 404 on.
 	OpListBlockingAnnotations: {CodeInvalidArgument, CodeUnauthenticated, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// getDependencyTree's row exactly, and for its reasons: ONE anchor, so a
+	// miss is the 404 it is rather than a per-anchor flag — there is no other
+	// answer to preserve by reporting it in the body, and an empty neighbor
+	// list is the common case, so a typo answered with one would never surface.
+	//
+	// Its 400 is BOTH the transport's and the ROLE's. The transport owns the
+	// unknown key and the repeated single-valued parameter; ValidateRelatedRequest
+	// owns the two that are about this request's MEANING — a missing or
+	// unrecognized direction, and a dependency type no edge could carry — and each
+	// reaches the client as the 400 it is, on the sentinel, with the parameter
+	// named. The validator's third refusal, an empty anchor id, is unreachable
+	// here: the id is a PATH segment this handler bounds before the role is
+	// asked, and an id that fails that bound is the 404 a real miss gets.
+	OpListRelatedIssues: {CodeInvalidArgument, CodeUnauthenticated, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// The 404 is the difference from the row above: this operation has ONE
 	// anchor, so there is no other answer to preserve by reporting the miss in
 	// the body. Its 400 is its own — an empty root, a direction outside the
@@ -795,6 +916,25 @@ var operationCodes = map[string][]Code{
 		CodeDependencyCycle, CodeDependencyExists,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
+	// getDependencyTree's row, and it is the same shape for the same two
+	// reasons: ONE anchor, so an id that names nothing is the 404 it is rather
+	// than a per-item flag, and a 400 that is BOTH the transport's and the
+	// ROLE's.
+	//
+	// NO CONFLICT CODE, and the absence is the operation's contract. A thread is
+	// append-only and this write touches no field of the issue, so there is no
+	// row state a guard could be stale about and no concurrent comment for this
+	// one to collide with — which is also why there is no `expected_version`
+	// member to earn a precondition_failed with.
+	//
+	// Of the role's three ErrValidation refusals exactly ONE is reachable here.
+	// An empty author is refused at the edge under `actor`'s rules, which are
+	// strictly stronger, and an empty issue id cannot arrive at all — a ServeMux
+	// wildcard does not match an empty segment, and an id that fails the path
+	// bound is the 404 a real miss gets. So the blank body is the whole of what
+	// the role can refuse over this wire, which is why failAddComment names one
+	// parameter rather than re-asking the validator's questions.
+	OpAddComment: {CodeInvalidArgument, CodeUnauthenticated, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// No 404 and no conflict code: this is an UPSERT with a server-derivable
 	// key, so there is no resource it can fail to address and no row it can
 	// collide with. Its 400 is the body vocabulary plus the ROLE's two
@@ -1104,6 +1244,25 @@ func InvalidArgument(param string, reason Reason, detail string) Result {
 	}
 	r := string(reason)
 	res.Problem.Reason = &r
+	return res
+}
+
+// ProjectMismatch builds the 400 for a request whose Bd-Project-Id header names
+// a workspace this server does not serve. got is the id the client stamped; own
+// is this server's own project id, disclosed in the `server_project_id`
+// extension member so a stamped client can tell a wrong-server refusal from a
+// malformed one without parsing `detail`.
+//
+// This is the ONLY refusal on the surface that sets `server_project_id`, and it
+// is raised only after the request has cleared the Host gate (and, in a
+// deployment that adds one, its authentication layer): a request turned away by
+// an earlier gate is answered before the stamp is ever compared, so it never
+// discloses the server's identity. Presence of the member is therefore the
+// signal that this specific check — and nothing earlier — fired.
+func ProjectMismatch(got, own string) Result {
+	res := InvalidArgument(ProjectIDHeader, ReasonProjectMismatch,
+		"the "+ProjectIDHeader+" header names project "+strconv.Quote(got)+", which this server does not serve")
+	res.Problem.ServerProjectId = &own
 	return res
 }
 

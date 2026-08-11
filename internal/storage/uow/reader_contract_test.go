@@ -98,6 +98,9 @@ func TestReaderContract(t *testing.T) {
 	t.Run("GetOptionalRowListsAreOffByDefault", func(t *testing.T) {
 		conformance.RunReaderGetOptionalRowListsAreOffByDefault(t, ctx, fixture)
 	})
+	t.Run("GetBriefDepsProjectsTheDependencyRows", func(t *testing.T) {
+		conformance.RunReaderGetBriefDepsProjectsTheDependencyRows(t, ctx, fixture)
+	})
 	t.Run("GetDetailShapeMatchesTheSeededIssue", func(t *testing.T) {
 		conformance.RunReaderGetDetailShapeMatchesTheSeededIssue(t, ctx, fixture)
 	})
@@ -152,6 +155,12 @@ func TestReaderContract(t *testing.T) {
 	})
 	t.Run("ListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt", func(t *testing.T) {
 		conformance.RunReaderListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt(t, ctx, fixture)
+	})
+	t.Run("ListBriefDropsTheFreeFormTextAndNothingElse", func(t *testing.T) {
+		conformance.RunReaderListBriefDropsTheFreeFormTextAndNothingElse(t, ctx, fixture)
+	})
+	t.Run("ReadyBriefDropsTheFreeFormTextAndNothingElse", func(t *testing.T) {
+		conformance.RunReaderReadyBriefDropsTheFreeFormTextAndNothingElse(t, ctx, fixture)
 	})
 	// Last on purpose: the backend-failure half runs a request on a dead
 	// context, and this backend's provider is shared by every case above it.
