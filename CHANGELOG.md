@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-11
+
+(Released as 1.2.1: the v1.2.0 tag burned pre-publish on a freebsd
+cross-compile failure in the release build — fixed below — and a burned tag is
+never reused, per the v1.1.1 precedent.)
+
 ### Added
 
 - **`--brief` on `bd list` and `bd ready`, and `brief` on the two HTTP
@@ -445,6 +451,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now gone from the create path.
 
 ### Fixed
+
+- **FreeBSD builds compile again** (#5661). The dbproxy process-identity arc
+  (procid, unverified-process) shipped linux/darwin/windows implementations
+  with no fallback, breaking `GOOS=freebsd` compilation — caught only by the
+  release build's cross-compile (GH#5662 tracks the CI gap). Unsupported
+  platforms now get stubs that fail proxied-mode spawns with a clean,
+  actionable error; classic (non-proxied) bd is unaffected, matching what
+  v1.1.2 shipped on freebsd.
+- **Telemetry no longer taxes every bd invocation.** Two startup costs paid on
+  every command, measured during the post-wave startup audit, are gone. First,
+  the machine-scoped distinct ID was recomputed on every invocation — a fork
+  of the platform machine-id probe (`ioreg` on macOS, 20.2±1.2ms) — even with
+  `BD_DISABLE_METRICS=1` and even for `bd --version`. The ID is now resolved
+  only when metrics are enabled and cached at `~/.beads/machine-id` (0600), so
+  the probe runs at most once per machine; a probe failure is retried next run
+  rather than cached. Second, every invocation unconditionally spawned a
+  detached `bd send-metrics` child — a full re-exec of the binary plus an
+  HTTPS upload attempt, with no check that anything was queued. The spawn now
+  requires at least one queued event batch and is throttled to one attempt per
+  5 minutes (marker: `eventsData/.last-flush`); queued events still upload,
+  just batched. Telemetry content, opt-out semantics, and the sanctioned
+  endpoint pinning are all unchanged.
+
+- **A long or multi-paragraph close reason renders as body text in `bd show`**
+  ([#5595](https://github.com/gastownhall/beads/pull/5595)). Every other
+  free-text field — description, design, notes, acceptance criteria, comments —
+  reaches the terminal through the markdown renderer, which word wraps and
+  indents. The close reason did not: it was formatted into the metadata block
+  beside `Owner:` and `Created:`, so it never wrapped and its second and later
+  lines read as separate metadata entries, a blank line and a bare `- bullet`
+  sitting directly under `Created:`. `bd close --reason-file` exists so agents
+  can write structured close reports, and those were exactly the reasons that
+  came out corrupted. A reason that still fits one metadata line — nearly all
+  of them, including one-liners that arrive from a file with a trailing
+  newline — is unchanged; anything larger now gets a `CLOSE REASON` section
+  rendered by the same call the other body fields make. The JSON payload is
+  untouched. The compaction savings line moved into the metadata block at the
+  same time, so it can no longer be stranded below that section, and all five
+  `bd show` render paths now report it alike.
 
 - **Script hooks now fire on both write plumbings** (bd-opisf). bd has two write
   plumbings and only one of them ran the workspace's hook scripts. The
